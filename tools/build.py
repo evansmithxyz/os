@@ -173,10 +173,14 @@ def qemu_args(image: Path = IMAGE, *, headless: bool = False, net: bool = True, 
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    build(fresh=args.fresh)
     extra = []
     if args.kvm:
+        if not os.access("/dev/kvm", os.R_OK | os.W_OK):
+            raise BuildError("--kvm needs read/write access to /dev/kvm. On Linux/WSL run\n"
+                             "  sudo usermod -aG kvm $USER\n"
+                             "then restart the shell (on WSL: `wsl --shutdown` from Windows), or drop --kvm.")
         extra += ["-accel", "kvm", "-cpu", "host"]
+    build(fresh=args.fresh)
     cmd = qemu_args(headless=args.headless, net=not args.no_net, memory=args.memory, extra=extra)
     if args.headless:
         print("Serial console below. Quit QEMU with Ctrl+A then X.")

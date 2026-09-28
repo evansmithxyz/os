@@ -263,7 +263,12 @@ def build_image(
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(out.suffix + ".tmp")
     tmp.write_bytes(image)
-    os.replace(tmp, out)
+    try:
+        os.replace(tmp, out)
+    except PermissionError as exc:
+        tmp.unlink(missing_ok=True)
+        raise ImageError(f"cannot replace {out}: it is in use. Is QEMU still running with this image? "
+                         "(A QEMU started from Windows locks the file for WSL too.)") from exc
 
     names = [i.name for i in fs_read_inodes(image, layout) if i.flags & AFS_FLAG_ALLOC]
     return BuildResult(out, len(k), k_sectors, layout.kernel_max_sectors, preserved, names)
