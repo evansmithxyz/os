@@ -47,6 +47,9 @@ jsi_setter:             db "[Setter]", 0
 jsi_getter_setter:      db "[Getter/Setter]", 0
 jsi_async_function:     db "[AsyncFunction: ", 0
 jsi_async_anonymous:    db "[AsyncFunction (anonymous)]", 0
+jsi_gen_function:       db "[GeneratorFunction: ", 0
+jsi_gen_anonymous:      db "[GeneratorFunction (anonymous)]", 0
+jsi_generator:          db "Object [Generator] {}", 0
 jsi_pending:            db "<pending>", 0
 jsi_rejected:           db "<rejected> ", 0
 
@@ -543,6 +546,8 @@ jsi_value:
     je .special
     cmp ebx, JS_TAG_STRING
     je .string
+    cmp ebx, JS_TAG_SYMBOL
+    je .symbol
     mov ebx, eax                    ; object
     movzx esi, byte [rbx + JH_KIND]
     cmp esi, JK_FUNC
@@ -627,7 +632,7 @@ jsi_value:
     jne .fn_name
     mov rax, [rbx + JFN_CODE]
     mov edi, [rax + JCODE_FLAGS2]
-    and edi, JCF2_ASYNC
+    and edi, JCF2_ASYNC | JCF2_GENERATOR
 .fn_name:
     mov rax, JS_OBJ_BITS
     or rax, rbx
@@ -640,6 +645,9 @@ jsi_value:
     test edi, edi
     jz .fn_prefix
     lea rsi, [jsi_async_function]
+    test edi, JCF2_ASYNC
+    jnz .fn_prefix
+    lea rsi, [jsi_gen_function]
 .fn_prefix:
     call jsout_cstr
     call jsout_str
@@ -651,10 +659,19 @@ jsi_value:
     test edi, edi
     jz .cstr
     lea rsi, [jsi_async_anonymous]
+    test edi, JCF2_ASYNC
+    jnz .cstr
+    lea rsi, [jsi_gen_anonymous]
     jmp .cstr
 .iterator:
     lea rsi, [jsi_iterator]
     jmp .cstr
+.symbol:
+    mov eax, eax
+    call jsy_describe
+    mov eax, eax
+    call jsout_str
+    jmp .out
 .out:
     pop rdi
     pop rsi
@@ -741,6 +758,8 @@ jsi_key:
     push rbx
     push rcx
     push rsi
+    cmp byte [rax + JH_KIND], JK_SYMBOL
+    je .symbol
     mov ecx, [rax + JSTR_LEN]
     lea rsi, [rax + JSTR_DATA]
     test ecx, ecx
@@ -774,6 +793,18 @@ jsi_key:
     pop rcx
     pop rbx
     ret
+.symbol:
+    ; [Symbol(description)]
+    push rax
+    mov al, '['
+    call jsout_byte
+    pop rax
+    call jsy_describe
+    mov eax, eax
+    call jsout_str
+    mov al, ']'
+    call jsout_byte
+    jmp .out
 
 ; jsi_separator: EBX = items so far -> ", " before all but the first
 jsi_separator:
@@ -906,6 +937,14 @@ jsi_object:
     push rcx
     push rdi
     mov rdi, rbx
+    cmp dword [rdi + JOBJ_CLASS], JC_REGEXP
+    je .regexp
+    cmp dword [rdi + JOBJ_CLASS], JC_DATE
+    je .date
+    cmp dword [rdi + JOBJ_CLASS], JC_MAP
+    je .collection
+    cmp dword [rdi + JOBJ_CLASS], JC_SET
+    je .collection
     call jsi_class_name
     cmp dword [rdi + JOBJ_CLASS], JC_PROMISE
     je .promise
@@ -936,6 +975,17 @@ jsi_object:
     pop rbx
     pop rax
     ret
+.collection:
+    call jscol_inspect
+    jmp .out
+.regexp:
+    mov rbx, rdi
+    call jsre_text
+    call jsout_str
+    jmp .out
+.date:
+    call jsdate_inspect
+    jmp .out
 .promise:
     ; Promise { 1 }, Promise { <pending> }, Promise { <rejected> Error: x }
     push rsi
@@ -1042,16 +1092,26 @@ jsi_props:
     push rdx
     push rsi
     push rdi
-    mov edi, [rax + JOBJ_COUNT]
-    mov rsi, [rax + JOBJ_PROPS]
+    push r8
+    push r9
+    mov r9, rax
+    xor r8d, r8d                    ; pass 0: string keys, pass 1: symbol keys
+.pass:
+    mov edi, [r9 + JOBJ_COUNT]
+    mov rsi, [r9 + JOBJ_PROPS]
 .loop:
     test edi, edi
-    jz .done
+    jz .pass_done
     mov rax, [rsi + JPE_KEY]
     test eax, eax
     jz .next
     bt rax, 32
     jc .next
+    mov edx, eax
+    cmp byte [rdx + JH_KIND], JK_SYMBOL
+    sete dl
+    cmp dl, r8b
+    jne .next
     call jsi_separator
     mov eax, eax
     call jsi_key
@@ -1086,7 +1146,12 @@ jsi_props:
     add rsi, JPE_SIZE
     dec edi
     jmp .loop
-.done:
+.pass_done:
+    inc r8d
+    cmp r8d, 2
+    jb .pass
+    pop r9
+    pop r8
     pop rdi
     pop rsi
     pop rdx

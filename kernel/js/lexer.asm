@@ -182,6 +182,87 @@ peek_nl:                resb 1
 section .text
 
 ; ------------------------------------------------------------------------------
+; jslex_regex: the current token is the '/' (or '/=') that starts a regular
+; expression literal -> RAX = its pattern, RDX = its flags (atoms); the lexer
+; goes on after it (the parser knows when a '/' starts one)
+; ------------------------------------------------------------------------------
+jslex_regex:
+    push rcx
+    push rsi
+    push rdi
+    push r8
+    mov rsi, [tok_start]
+    inc rsi                         ; past the '/'
+    mov rdi, rsi
+    xor r8d, r8d                    ; 1 = inside [ ]
+.char:
+    cmp rsi, [jslex_end]
+    jae .unterminated
+    mov al, [rsi]
+    cmp al, 10
+    je .unterminated
+    cmp al, 13
+    je .unterminated
+    inc rsi
+    cmp al, '\'
+    jne .not_escape
+    cmp rsi, [jslex_end]
+    jae .unterminated
+    inc rsi
+    jmp .char
+.not_escape:
+    test r8d, r8d
+    jnz .in_class
+    cmp al, '['
+    jne .not_class
+    mov r8d, 1
+    jmp .char
+.not_class:
+    cmp al, '/'
+    jne .char
+    ; the pattern
+    lea rcx, [rsi - 1]
+    sub rcx, rdi
+    push rsi
+    mov rsi, rdi
+    call jsstr_atom
+    pop rsi
+    mov r8, rax
+    ; the flags: letters after it
+    mov rdi, rsi
+.flag:
+    cmp rsi, [jslex_end]
+    jae .flags
+    mov al, [rsi]
+    or al, 0x20
+    sub al, 'a'
+    cmp al, 25
+    ja .flags
+    inc rsi
+    jmp .flag
+.flags:
+    mov rcx, rsi
+    sub rcx, rdi
+    mov [jslex_pos], rsi
+    mov rsi, rdi
+    call jsstr_atom
+    mov rdx, rax
+    mov rax, r8
+    pop r8
+    pop rdi
+    pop rsi
+    pop rcx
+    ret
+.in_class:
+    cmp al, ']'
+    jne .char
+    xor r8d, r8d
+    jmp .char
+.unterminated:
+    lea rsi, [jsmsg_rx_slash]
+    jmp jslex_error
+
+; ------------------------------------------------------------------------------
 ; jslex_init: RSI = source, RCX = length; reads the first token
 ; ------------------------------------------------------------------------------
 jslex_init:

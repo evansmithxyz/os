@@ -28,6 +28,8 @@ JS_TRUE                 equ 0xFFF9000000000003
 JS_HOLE                 equ 0xFFF9000000000004  ; missing array element
 JS_STR_BITS             equ 0xFFFA000000000000
 JS_OBJ_BITS             equ 0xFFFB000000000000
+JS_TAG_SYMBOL           equ 0xFFFC      ; a symbol: a permanent JK_SYMBOL block (iter.asm)
+JS_SYM_BITS             equ 0xFFFC000000000000
 JS_NAN                  equ 0x7FF8000000000000
 JS_INF                  equ 0x7FF0000000000000
 JS_ONE                  equ 0x3FF0000000000000
@@ -46,7 +48,8 @@ JK_ENV                  equ 6           ; captured variables of a scope
 JK_CODE                 equ 7           ; compiled function (template)
 JK_ITER                 equ 8           ; for-in / for-of state
 JK_ACCESSOR             equ 9           ; a getter/setter pair (JPA_ACCESSOR properties)
-JK_CORO                 equ 10          ; a suspended async function (async.asm)
+JK_CORO                 equ 10          ; a suspended async function or generator (async.asm)
+JK_SYMBOL               equ 11          ; a symbol (iter.asm); usable as a property key
 
 ; Strings: bytes (UTF-8 passes through), NUL-terminated for convenience
 JSTR_LEN                equ 4           ; dword
@@ -69,6 +72,14 @@ JC_GLOBAL               equ 3
 JC_CONSOLE              equ 4
 JC_ERROR                equ 5           ; made by Error / TypeError / ... (or thrown by the engine)
 JC_PROMISE              equ 6           ; a Promise (JPROM_* fields, async.asm)
+JC_ITERATOR             equ 7           ; an array / string / Map / Set iterator (JIO_*, iter.asm)
+JC_GENERATOR            equ 8           ; a generator object (JGEN_*, iter.asm)
+JC_MAP                  equ 9           ; Map (JMAP_*, collections.asm)
+JC_SET                  equ 10
+JC_WEAKMAP              equ 11
+JC_WEAKSET              equ 12
+JC_REGEXP               equ 13          ; a RegExp (JRE_*, regexp2.asm)
+JC_DATE                 equ 14          ; a Date (JDATE_TIME, date.asm)
 JC_HOST                 equ 16          ; classes from here on are host objects (jsdom.asm)
 JC_NODE                 equ 16          ; a DOM node (JSD_NODE = its index)
 JC_STYLE                equ 17          ; element.style
@@ -137,15 +148,18 @@ JCF_REST                equ 32          ; has a ...rest parameter
 JCF_CLASSCTOR           equ 64          ; a class constructor (only with new)
 JCF_DERIVED             equ 128         ; ... of a class that extends another
 JCF2_ASYNC              equ 1           ; an async function (JCODE_FLAGS2)
+JCF2_GENERATOR          equ 2           ; a generator function
 
 ; Iterators (for-in / for-of)
 JIT_MODE                equ 1           ; byte: JIM_*
 JIT_POS                 equ 4           ; dword
-JIT_SRC                 equ 8           ; qword value
-JIT_SIZE                equ 16
+JIT_SRC                 equ 8           ; qword value (JIM_PROTOCOL: the iterator)
+JIT_NEXT                equ 16          ; JIM_PROTOCOL: the iterator's next method
+JIT_SIZE                equ 24
 JIM_ARRAY               equ 0           ; values of an array (live length)
 JIM_STRING              equ 1           ; characters of a string
 JIM_KEYS                equ 2           ; values of a key array made by for-in
+JIM_PROTOCOL            equ 3           ; iterator.next() (anything with [Symbol.iterator])
 
 ; --- Call frames (JS_FRAMES_ADDR) ---------------------------------------------
 JFR_PC                  equ 0           ; caller's pc
@@ -160,6 +174,7 @@ JFR_SIZE                equ 56
 JFRF_BOUNDARY           equ 1           ; return leaves vm_run (js_call)
 JFRF_CONSTRUCT          equ 2           ; `new`: a non-object result becomes `this`
 JFRF_ASYNC              equ 4           ; an async function: returns settle its promise
+JFRF_GEN                equ 8           ; a generator: returning finishes it
 
 ; --- Errors (js_throw) --------------------------------------------------------
 JE_ERROR                equ 0
@@ -341,6 +356,13 @@ JSVM_MAX_HANDLERS       equ 256
     OPC ASYNCSTART
     OPC ASYNCREJECT
     OPC AWAIT
+    OPC TOARRAY
+    OPC GETITER
+    OPC GENSTART
+    OPC YIELD
+    OPC YIELDSTAR
+    OPC GENTHROW
+    OPC REGEXP
 %endmacro
 
 %assign js_opc_n 0

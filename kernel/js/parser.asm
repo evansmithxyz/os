@@ -89,12 +89,15 @@ NT_CLASSMEM             equ 57          ; OP = CM_*, A = key atom (or expression
 NT_SUPERCALL            equ 58          ; super(B...), C = argument count
 NT_SUPERMEMBER          equ 59          ; super.B (B = atom)
 NT_AWAIT                equ 60          ; await A
+NT_YIELD                equ 61          ; yield A (A = 0: undefined); OP = 1: yield*
+NT_REGEX                equ 62          ; /A/B (pattern and flags atoms)
 CM_STATIC               equ 1
 CM_GET                  equ 2
 CM_SET                  equ 4
 CM_FIELD                equ 8
 CM_COMPUTED             equ 16
 CM_ASYNC                equ 32
+CM_GEN                  equ 64
 
 JNF_PATTERN             equ 1           ; NT_DECL: A is a pattern node
 JNF_OPTIONAL            equ 2           ; member / index / call after ?.
@@ -159,6 +162,7 @@ FIF_PARAMCODE           equ 32          ; defaults or patterns in its parameters
 FIF_CLASSCTOR           equ 64          ; a class's constructor
 FIF_DERIVED             equ 128         ; ... of a class that extends another
 FIF_ASYNC               equ 256         ; an async function
+FIF_GENERATOR           equ 512         ; a generator function
 
 JSP_MAX_DEPTH           equ 1500        ; nesting limit (~250 bytes of kernel stack each)
 
@@ -189,7 +193,8 @@ jsp_func:               resq 1          ; current function info
 jsp_scope:              resq 1          ; current scope
 jsp_depth:              resd 1
 jsp_no_in:              resq 1          ; 1 = `in` is not an operator (for-init; saved as a qword)
-jsp_next_async:         resd 1          ; 1 = the next function made is async
+jsp_next_async:         resq 1          ; 1 = the next function made is async
+jsp_next_gen:           resq 1          ; 1 = the next function made is a generator
 jsp_ahead_tpl:          resd 32         ; jsp_arrow_ahead: depths of open ${
 jsp_ahead_saved:        resb 64
 
@@ -205,7 +210,6 @@ jsmsg_unsupported:      db "% is not supported yet", 0
 jsmsg_need_name:        db "Function statements require a function name", 0
 jsmsg_default_twice:    db "More than one default clause in switch statement", 0
 jsmsg_try_alone:        db "Missing catch or finally after try", 0
-jsfeat_regex:           db "/regular expressions/", 0
 jsfeat_destructuring:   db "destructuring", 0
 jsfeat_module:          db "import/export", 0
 jsfeat_with:            db "with", 0
@@ -302,6 +306,11 @@ jsp_new_func:
     mov dword [jsp_next_async], 0
     or dword [rbx + JFI_FLAGS], FIF_ASYNC
 .sync:
+    cmp dword [jsp_next_gen], 0
+    je .plain
+    mov dword [jsp_next_gen], 0
+    or dword [rbx + JFI_FLAGS], FIF_GENERATOR
+.plain:
     mov [jsp_func], rbx
     mov al, SK_FUNC
     call jsp_push_scope
@@ -1168,7 +1177,10 @@ jsp_function_declaration:
     mov rbx, rax
     call jslex_next                 ; `function`
     AT_PUNCT P_STAR
-    je .generator
+    jne .named
+    mov dword [jsp_next_gen], 1     ; function*
+    call jslex_next
+.named:
     cmp dword [tok_type], TK_NAME
     jne .no_name
     call jsp_ident
@@ -1186,9 +1198,6 @@ jsp_function_declaration:
 .no_name:
     lea rsi, [jsmsg_need_name]
     jmp jslex_error
-.generator:
-    lea rdi, [jsfeat_generator]
-    jmp jsp_unsupported
 
 ; jsp_function_rest: RDX = name atom (or 0), ECX = 1 for a function expression;
 ; the current token is '('. -> RAX = function info
@@ -1709,16 +1718,38 @@ jsp_arrow_ahead:
     push rdx
     push rsi
     push rdi
+    push r8
     lea rsi, [jslex_state]
     lea rdi, [jsp_ahead_saved]
     mov ecx, JSLEX_STATE_SIZE
     rep movsb
     xor edx, edx                    ; bracket depth
     xor ecx, ecx                    ; open ${ (their depths on jsp_ahead_tpl)
+    xor r8d, r8d                    ; 1 = a '/' here starts a regular expression
 .token:
     mov eax, [tok_type]
     cmp eax, TK_EOF
     je .no
+    ; a regular expression literal: skipped whole (its \ and quotes are not tokens)
+    test r8d, r8d
+    jz .not_regex
+    cmp eax, TK_PUNCT
+    jne .not_regex
+    mov rax, [tok_val]
+    cmp eax, P_SLASH
+    je .regex
+    cmp eax, P_DIV_ASSIGN
+    jne .not_regex
+.regex:
+    push rdx
+    call jslex_regex
+    pop rdx
+    xor r8d, r8d
+    call jslex_next
+    jmp .token
+.not_regex:
+    call .regex_after
+    mov eax, [tok_type]
     cmp eax, TK_TEMPLATE
     jne .punct
     cmp byte [tok_tail], 0
@@ -1780,6 +1811,7 @@ jsp_arrow_ahead:
     call .restore
     clc
 .out:
+    pop r8
     pop rdi
     pop rsi
     pop rdx
@@ -1793,6 +1825,52 @@ jsp_arrow_ahead:
     mov ecx, JSLEX_STATE_SIZE
     rep movsb
     pop rcx
+    ret
+; .regex_after: R8D = 1 if a '/' after the current token starts a regular
+; expression (it does not end an expression: not a name, number, string,
+; ')' ']' '}' ++ --)
+.regex_after:
+    push rax
+    xor r8d, r8d
+    mov eax, [tok_type]
+    cmp eax, TK_NUM
+    je .ends
+    cmp eax, TK_STR
+    je .ends
+    cmp eax, TK_TEMPLATE
+    je .ends
+    cmp eax, TK_NAME
+    jne .punct_after
+    mov eax, [tok_kw]
+    test eax, eax
+    jz .ends                        ; a name
+    cmp eax, KW_THIS
+    je .ends
+    cmp eax, KW_NULL
+    je .ends
+    cmp eax, KW_TRUE
+    je .ends
+    cmp eax, KW_FALSE
+    je .ends
+    cmp eax, KW_SUPER
+    je .ends
+    jmp .starts                     ; return, typeof, in, ...
+.punct_after:
+    mov rax, [tok_val]
+    cmp eax, P_RPAREN
+    je .ends
+    cmp eax, P_RBRACK
+    je .ends
+    cmp eax, P_RBRACE
+    je .ends
+    cmp eax, P_INC
+    je .ends
+    cmp eax, P_DEC
+    je .ends
+.starts:
+    mov r8d, 1
+.ends:
+    pop rax
     ret
 
 ; ------------------------------------------------------------------------------
@@ -1873,6 +1951,54 @@ jsp_assign:
     call jsp_enter
     push rbx
     push rcx
+    ; yield inside a generator
+    cmp dword [tok_type], TK_NAME
+    jne .not_yield
+    mov rcx, [tok_val]
+    cmp rcx, [atom_yield]
+    jne .not_yield
+    mov rcx, [jsp_func]
+    test dword [rcx + JFI_FLAGS], FIF_GENERATOR
+    jz .not_yield
+    mov al, NT_YIELD
+    call jsp_node
+    mov rbx, rax
+    call jslex_next
+    cmp byte [tok_nl], 0
+    jne .yield_done                 ; `yield` alone on its line
+    AT_PUNCT P_STAR
+    jne .yield_operand
+    mov byte [rbx + JN_OP], 1       ; yield*
+    call jslex_next
+    jmp .yield_value
+.yield_operand:
+    cmp dword [tok_type], TK_EOF
+    je .yield_done
+    cmp dword [tok_type], TK_PUNCT
+    jne .yield_value
+    mov rcx, [tok_val]
+    cmp ecx, P_RPAREN
+    je .yield_done
+    cmp ecx, P_RBRACK
+    je .yield_done
+    cmp ecx, P_RBRACE
+    je .yield_done
+    cmp ecx, P_COMMA
+    je .yield_done
+    cmp ecx, P_SEMI
+    je .yield_done
+    cmp ecx, P_COLON
+    je .yield_done
+.yield_value:
+    call jsp_assign
+    mov [rbx + JN_A], rax
+.yield_done:
+    mov rax, rbx
+    pop rcx
+    pop rbx
+    call jsp_leave
+    ret
+.not_yield:
     call jsp_conditional
     cmp dword [tok_type], TK_PUNCT
     jne .done
@@ -2578,7 +2704,10 @@ jsp_primary:
 .function:
     call jslex_next
     AT_PUNCT P_STAR
-    je .generator
+    jne .function_name
+    mov dword [jsp_next_gen], 1     ; function*
+    call jslex_next
+.function_name:
     xor edx, edx
     cmp dword [tok_type], TK_NAME
     jne .anonymous
@@ -2627,8 +2756,14 @@ jsp_primary:
     call jsp_template
     jmp .done
 .regex:
-    lea rdi, [jsfeat_regex]
-    jmp jsp_unsupported
+    call jslex_regex
+    push rax
+    mov al, NT_REGEX
+    call jsp_node
+    pop rcx
+    mov [rax + JN_A], rcx
+    mov [rax + JN_B], rdx
+    jmp .next_done
 .class:
     xor ecx, ecx
     call jsp_class
@@ -2656,9 +2791,6 @@ jsp_primary:
     jmp .done
 .decorator:
     lea rdi, [jsfeat_decorator]
-    jmp jsp_unsupported
-.generator:
-    lea rdi, [jsfeat_generator]
     jmp jsp_unsupported
 
 ; jsp_async_function: current token a name -> ZF=1 (and `async` consumed,
@@ -2854,7 +2986,7 @@ jsp_class:
     mov rcx, rax
     ; static
     cmp dword [tok_type], TK_NAME
-    jne .key
+    jne .accessor
     mov rax, [tok_val]
     cmp rax, [atom_static]
     jne .accessor
@@ -2871,6 +3003,12 @@ jsp_class:
     or byte [rcx + JN_OP], CM_STATIC
     call jslex_next
 .accessor:
+    AT_PUNCT P_STAR
+    jne .not_star
+    or byte [rcx + JN_OP], CM_GEN
+    call jslex_next
+    jmp .key
+.not_star:
     cmp dword [tok_type], TK_NAME
     jne .key
     mov rax, [tok_val]
@@ -2935,7 +3073,7 @@ jsp_class:
     AT_PUNCT P_LPAREN
     jne .field
     ; the constructor?
-    test byte [rcx + JN_OP], CM_STATIC | CM_GET | CM_SET | CM_COMPUTED | CM_ASYNC
+    test byte [rcx + JN_OP], CM_STATIC | CM_GET | CM_SET | CM_COMPUTED | CM_ASYNC | CM_GEN
     jnz .method
     mov rax, [rcx + JN_A]
     cmp rax, [atom_constructor]
@@ -2968,6 +3106,10 @@ jsp_class:
     jz .method_sync
     mov dword [jsp_next_async], 1
 .method_sync:
+    test byte [rcx + JN_OP], CM_GEN
+    jz .method_plain
+    mov dword [jsp_next_gen], 1
+.method_plain:
     mov al, NT_FUNC
     call jsp_node
     push rax
@@ -3129,6 +3271,12 @@ jsp_object:
     mov [rbx + JN_A], rax
 .linked:
     mov r8, rax
+    AT_PUNCT P_STAR
+    jne .not_star
+    or esi, 2                       ; *method() {}
+    call jslex_next
+    jmp .key
+.not_star:
     AT_PUNCT P_ELLIPSIS
     jne .key
     ; ...spread: its own enumerable properties
@@ -3151,13 +3299,17 @@ jsp_object:
 .key_name:
     ; async methods: `async name(` ...
     mov rdx, [tok_val]
-    test esi, esi
+    test esi, 1
     jnz .not_async
     cmp rdx, [atom_async]
     jne .not_async
     call jsp_modifier_ahead
     jnc .not_async
-    mov esi, 1
+    or esi, 1
+    call jslex_next
+    AT_PUNCT P_STAR
+    jne .key
+    or esi, 2
     call jslex_next
     jmp .key
 .not_async:
@@ -3236,7 +3388,12 @@ jsp_object:
     mov al, NT_FUNC
     call jsp_node
     push rax
-    mov [jsp_next_async], esi
+    mov eax, esi
+    and eax, 1
+    mov [jsp_next_async], eax
+    mov eax, esi
+    shr eax, 1
+    mov [jsp_next_gen], eax
     xor ecx, ecx                    ; a method does not bind its own name
     call jsp_function_rest
     mov rcx, rax

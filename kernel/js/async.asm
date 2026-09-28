@@ -46,6 +46,7 @@ JCO_ENV                 equ 40
 JCO_FUNC                equ 48
 JCO_HANDLERS            equ 56          ; its try handlers (JTH_SP relative), raw block
 JCO_LINE                equ 64          ; dword
+JCO_FLAGS               equ 68          ; dword: the frame's JFRF_ASYNC or JFRF_GEN
 JCO_SIZE                equ 72
 
 ; a timer: raw array [id, function, due tick, interval (0 = once), arguments]
@@ -1733,15 +1734,23 @@ jsev_loop:
 jsco_new:
     push rcx
     push rdx
-    mov ecx, JCO_SIZE
-    call js_alloc
-    mov byte [rax + JH_KIND], JK_CORO
+    call jsco_new_bare
+    mov dword [rax + JCO_FLAGS], JFRF_ASYNC
     mov rdx, rax
     call jsprom_new
     BOX rax, rcx, JS_OBJ_BITS
     mov [rdx + JCO_PROMISE], rax
     mov rax, rdx
     pop rdx
+    pop rcx
+    ret
+
+; jsco_new_bare: -> RAX = an empty coroutine (raw)
+jsco_new_bare:
+    push rcx
+    mov ecx, JCO_SIZE
+    call js_alloc
+    mov byte [rax + JH_KIND], JK_CORO
     pop rcx
     ret
 
@@ -1816,6 +1825,43 @@ jsco_suspend:
     mov r10, rax
     mov rdx, [vm_fp]
     mov rbx, [rdx + JFR_CORO]
+    call jsco_save
+.wait:
+    ; resume when the value settles
+    mov rax, r10
+    call jsa_promise_of
+    xor ecx, ecx
+    xor r8d, r8d
+    mov r9, rbx
+    push r11
+    mov r11d, JR_AWAIT
+    call jsprom_then
+    pop r11
+    mov rax, [rbx + JCO_PROMISE]
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; ------------------------------------------------------------------------------
+; jsco_save: (interpreter) RBX = the frame's coroutine -> the frame (its stack
+; slots [f][this][locals...] up to R12, its try handlers, RSI / R14 / R15 /
+; line) saved in it; the handlers leave the handler stack
+; ------------------------------------------------------------------------------
+jsco_save:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    mov rdx, [vm_fp]
     mov [rbx + JCO_PC], rsi
     mov [rbx + JCO_ENV], r14
     mov [rbx + JCO_FUNC], r15
@@ -1851,7 +1897,7 @@ jsco_suspend:
 .counted:
     mov [rbx + JCO_NHANDLERS], r9d
     test r9d, r9d
-    jz .wait
+    jz .saved
     mov [vm_handler_count], ecx     ; (they leave the stack)
     push rcx
     imul ecx, r9d, JTH_SIZE
@@ -1871,26 +1917,14 @@ jsco_suspend:
     add rdi, JTH_SIZE
     dec r9d
     jnz .relative
-.wait:
-    ; resume when the value settles
-    mov rax, r10
-    call jsa_promise_of
-    xor ecx, ecx
-    xor r8d, r8d
-    mov r9, rbx
-    push r11
-    mov r11d, JR_AWAIT
-    call jsprom_then
-    pop r11
-    mov rax, [rbx + JCO_PROMISE]
-    pop r10
+.saved:
     pop r9
     pop r8
     pop rdi
     pop rsi
     pop rdx
     pop rcx
-    pop rbx
+    pop rax
     ret
 
 ; ------------------------------------------------------------------------------
@@ -1942,7 +1976,9 @@ jsco_resume:
     mov [rdx + JFR_FUNC], r15
     mov [rdx + JFR_ENV], r14
     mov [rdx + JFR_RESULT], r9
-    mov dword [rdx + JFR_FLAGS], JFRF_BOUNDARY | JFRF_ASYNC
+    mov eax, [rbx + JCO_FLAGS]
+    or eax, JFRF_BOUNDARY
+    mov [rdx + JFR_FLAGS], eax
     mov eax, [vm_line]
     mov [rdx + JFR_LINE], eax
     mov [rdx + JFR_CORO], rbx

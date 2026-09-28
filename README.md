@@ -35,10 +35,10 @@ windowed desktop with i3-style workspaces.
 - **Shell:** about 30 commands, Tab completion, history (Up/Down) and Ctrl+C.
 - **JavaScript:** an engine written in assembly (`kernel/js/`): a parser,
   a bytecode compiler, an interpreter and a garbage collector, with
-  classes, closures, exceptions, destructuring, promises, `async`/`await`,
-  timers, `fetch`, the everyday standard library (array and string methods,
-  `Object.*`, `JSON`, `Math`) and correctly rounded number formatting. Run it
-  with `js`; web pages run it too.
+  classes, closures, exceptions, destructuring, generators, promises,
+  `async`/`await`, timers, `fetch`, regular expressions, `Map`/`Set`,
+  `Symbol`, `Date`, the everyday standard library and correctly rounded
+  number formatting. Run it with `js`; web pages run it too.
 - **Desktop:**
   - 1024×768×32 graphics through the Bochs/QEMU display adapter.
   - Movable and resizable windows with minimize and maximize, and 4
@@ -266,6 +266,14 @@ optimising compilers:
    function's promise; a promise job copies it all back and carries on
    after the `await`. `jsnet.asm` has `fetch` and `XMLHttpRequest`, whose
    requests run as tasks on the event loop (GET only, for now).
+8. `iter.asm` has symbols (a value tag of their own; a symbol works as a
+   property key), the iteration protocol that `for-of`, spread and
+   destructuring use, and generators (on the same coroutines as `await`).
+   `collections.asm` has `Map` and `Set` (insertion-ordered entries and a
+   hash table). `regexp.asm` compiles regular expressions into a small
+   program and matches with backtracking on its own stack; `regexp2.asm`
+   has `RegExp` and the string methods that take one. `date.asm` has
+   `Date`.
 
 The language: `var`/`let`/`const`, functions, arrow functions, closures,
 default and rest parameters, `arguments`, `this`, `new`, prototypes,
@@ -304,16 +312,22 @@ handles), `async` functions, arrows and methods with `await`,
 `requestAnimationFrame`, `performance.now()`, `fetch` (a `Response` with
 `status`, `ok`, `headers.get()`, `text()`, `json()`) and
 `XMLHttpRequest` (asynchronous or not, `onload` and friends,
-`addEventListener`, `responseType = 'json'`). Not yet: regular
-expressions, `Date`, `Map`/`Set`, generators (the next steps).
+`addEventListener`, `responseType = 'json'`).
 
-Not yet (the parser says so): arrow functions, classes, `try`/`catch`,
-template literals, destructuring, spread, getters/setters, optional
-chaining, regular expressions, generators and `async`; in the browser,
-timers (`setTimeout`), `fetch` and typing into form fields. Real sites'
-scripts mostly stop at the first of these, and the page shows without
-them. Strings are UTF-8 bytes, so `length` counts bytes. Memory isn't
-reclaimed while a page is open (the heap is 64 MB).
+And: `Symbol` (with `Symbol.for`, `description` and the well-known
+symbols), iterators (`[Symbol.iterator]`, `entries()` / `keys()` /
+`values()`), generators (`function*`, generator methods, `yield`,
+`yield*`, `next` / `return` / `throw`), `Map`, `Set`, `WeakMap`,
+`WeakSet`, regular expressions (literals and `RegExp`: classes, groups,
+named groups, backreferences, lookahead and lookbehind, lazy and counted
+quantifiers, the `g i m s u y` flags; `exec`, `test`, `match`,
+`matchAll`, `search`, `replace` / `replaceAll` with `$1` / `$<name>` or a
+function, `split`) and `Date` (parsing ISO and the usual English forms;
+the local time zone is UTC).
+
+Not yet: tagged templates, private `#fields`, `with`, modules, async
+generators; in the browser, `localStorage`, many DOM methods and typing
+into form fields. Strings are UTF-8 bytes, so `length` counts bytes.
 
 ## Project layout
 
@@ -342,6 +356,8 @@ kernel/
                         heap (strings, atoms), gc (allocator, collector), object, number,
                         builtins + stdlib (the standard library), async (promises,
                         async functions, timers, event loop), jsnet (fetch, XHR),
+                        iter (symbols, iterators, generators), collections (Map, Set),
+                        regexp + regexp2 (regular expressions), date (Date),
                         jsdom (the DOM API), js (API, printing)
   gfx/                  clipped 2D drawing, font, back buffer, mouse pointer
   gui/                  window manager + event loop, taskbar/footer, theme colours
@@ -396,7 +412,7 @@ docs/                   CONVENTIONS.md, screenshots
 | `0x400000` / `0x500000` | last HTTP(S) response / the browser's page (1 MB each) |
 | `0x600000` / `0xA00000` / `0xC00000` | DOM nodes / CSS rules / layout display list |
 | `0x1000000` | GUI back buffer, wallpaper, canvas (3 MB each) |
-| `0x2000000` | JavaScript: value stack, call frames, source, compiler scratch, syntax tree |
+| `0x2000000` | JavaScript: value stack, call frames, source, compiler scratch, syntax tree, regular expression matching |
 | `0x3000000` | JavaScript heap (62 MB) |
 | `0x6E00000` / `0x6F00000` | the garbage collector's start bitmap / mark stack |
 | `0xFD000000` | framebuffer (from the display adapter's PCI BAR0) |

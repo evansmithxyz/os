@@ -86,7 +86,9 @@ JS_SRC_SIZE             equ 0x00100000
 JS_CODEBUF_ADDR         equ 0x02300000  ; bytecode scratch while compiling
 JS_CODEBUF_SIZE         equ 0x00100000
 JS_AST_ADDR             equ 0x02400000  ; syntax tree, scopes (freed after compiling)
-JS_AST_SIZE             equ 0x00C00000
+JS_AST_SIZE             equ 0x00B00000
+JS_RX_ADDR              equ 0x02F00000  ; regular expression matching: captures, backtracking
+JS_RX_SIZE              equ 0x00100000
 JS_HEAP_ADDR            equ 0x03000000  ; strings, objects, bytecode
 JS_HEAP_SIZE            equ 0x03E00000
 JS_GC_BITMAP_ADDR       equ 0x06E00000  ; heap block starts, 1 bit per 8 bytes

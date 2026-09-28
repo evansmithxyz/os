@@ -24,7 +24,7 @@ suite and the reviewers (human or not) assume them.
 - **XMM registers and the x87 stack are scratch** everywhere: nothing keeps
   a value in them across a call, and interrupt handlers never touch them
   (`fpu_init` turns them on; the JavaScript engine uses them for doubles).
-- **JavaScript** (`kernel/js/`) has four more rules:
+- **JavaScript** (`kernel/js/`) has five more rules:
   - opcode handlers in `vm.asm` keep the interpreter's registers (RSI = pc,
     R12 = value stack, R13 = frame base, R14 = environment, R15 = function,
     RBP = opcode table) and store R12 in `vm_sp` before calling anything
@@ -45,7 +45,10 @@ suite and the reviewers (human or not) assume them.
     `jsev_drain` afterwards, so promise jobs run before anything else
     happens; work that waits (a network request) goes on the event loop as
     a task (`jsev_add_timer`) instead of inside the native that asked for
-    it (a synchronous XMLHttpRequest is the exception, as in browsers).
+    it (a synchronous XMLHttpRequest is the exception, as in browsers);
+  - a property key is an atom or a symbol (both are permanent heap blocks,
+    compared as pointers): check `JH_KIND` for `JK_SYMBOL` before treating
+    a key as a string.
 
 ## Sections and memory
 

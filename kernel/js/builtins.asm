@@ -258,6 +258,10 @@ js_init_builtins:
     ; methods
     lea r8, [jsb_natives]
     call jsb_define_natives
+    call jsy_init
+    call jscol_init
+    call jsre_init
+    call jsdate_init
     call jsl_init
     call jsa_init
     call jsn_init
@@ -875,8 +879,17 @@ jsb_string:
     jz .empty
     xor eax, eax
     call jsb_arg
+    push rcx
+    mov rcx, rax
+    shr rcx, 48
+    cmp ecx, JS_TAG_SYMBOL
+    pop rcx
+    je .symbol
     call js_to_string
     jmp jsb_box_string
+.symbol:
+    mov eax, eax                    ; String(symbol): "Symbol(description)"
+    jmp jsy_describe
 .empty:
     mov rax, [atom_empty]
     jmp jsb_box_string

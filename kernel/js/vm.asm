@@ -388,6 +388,8 @@ js_to_number:
     je .special
     cmp edx, JS_TAG_STRING
     je .string
+    cmp edx, JS_TAG_SYMBOL
+    je js_symbol_error_number
     mov edx, 1                      ; hint: number
     call js_to_primitive
     jmp .again
@@ -486,6 +488,8 @@ js_to_string:
     je .special
     cmp edx, JS_TAG_STRING
     je .string
+    cmp edx, JS_TAG_SYMBOL
+    je js_symbol_error_string
     mov edx, 2                      ; hint: string
     call js_to_primitive
     jmp .again
@@ -547,8 +551,14 @@ js_to_key:
     shr rdx, 48
     cmp edx, JS_TAG_SPECIAL
     jb .number
+    cmp edx, JS_TAG_SYMBOL
+    je .symbol
     call js_to_string
     call jsstr_intern
+    pop rdx
+    ret
+.symbol:
+    mov eax, eax                    ; the symbol itself is the key
     pop rdx
     ret
 .number:
@@ -600,6 +610,8 @@ js_typeof:
     je .special
     cmp edx, JS_TAG_STRING
     je .string
+    cmp edx, JS_TAG_SYMBOL
+    je .symbol
     mov edx, eax
     mov rax, [atom_function]
     cmp byte [rdx + JH_KIND], JK_FUNC
@@ -613,6 +625,9 @@ js_typeof:
     jmp .out
 .string:
     mov rax, [atom_string]
+    jmp .out
+.symbol:
+    mov rax, [atom_symbol_t]
     jmp .out
 .special:
     mov rdx, rax
@@ -738,6 +753,11 @@ js_loose_equal:
     cmp r8d, JS_TAG_SPECIAL
     jb .strict
 .mixed:
+    ; a symbol only equals itself
+    cmp ecx, JS_TAG_SYMBOL
+    je .no
+    cmp r8d, JS_TAG_SYMBOL
+    je .no
     ; null/undefined only equal each other
     call .is_nullish
     jc .no
@@ -1054,6 +1074,8 @@ js_get:
     je .object
     cmp ecx, JS_TAG_STRING
     je .string
+    cmp ecx, JS_TAG_SYMBOL
+    je .symbol
     cmp ecx, JS_TAG_SPECIAL
     jb .number
     cmp eax, 2
@@ -1073,6 +1095,9 @@ js_get:
     jmp .lookup
 .boolean:
     mov rax, [js_boolean_proto]
+    jmp .lookup
+.symbol:
+    mov rax, [js_symbol_proto]
     jmp .lookup
 .string:
     cmp rdx, [atom_length]
@@ -1525,6 +1550,9 @@ js_forin_keys:
     jz .next_prop
     bt rax, 32                      ; JPA_HIDDEN
     jc .next_prop
+    mov edi, eax
+    cmp byte [rdi + JH_KIND], JK_SYMBOL
+    je .next_prop                   ; (symbol keys are not listed)
     mov eax, eax
     call .add_key
 .next_prop:
@@ -1603,10 +1631,10 @@ js_spread_into:
     cmp ecx, JS_TAG_STRING
     je .string
     cmp ecx, JS_TAG_OBJECT
-    jne .not_iterable
+    jne .protocol
     mov ebx, edx
     cmp byte [rbx + JH_KIND], JK_ARRAY
-    jne .not_iterable
+    jne .protocol
     xor edi, edi
 .item:
     cmp edi, [rbx + JARR_LEN]
@@ -1628,14 +1656,20 @@ js_spread_into:
 .char:
     cmp edi, [rbx + JSTR_LEN]
     jae .done
-    movzx eax, byte [rbx + JSTR_DATA + rdi]
-    call jsstr_char
+    push rdx
+    mov edx, ebx
+    mov ecx, edi
+    call jsit_char_at
+    add edi, ecx
+    pop rdx
     mov rcx, rax
-    BOX rcx, rax, JS_STR_BITS
     mov rax, rsi
     call jsarr_push
-    inc edi
     jmp .char
+.protocol:
+    mov rax, rsi
+    call jsit_collect
+    jmp .done
 .done:
     pop rsi
     pop rdi
@@ -2793,9 +2827,14 @@ vmop_RET:
     POPV rax
 vm_return:
     mov rdx, [vm_fp]
+    test dword [rdx + JFR_FLAGS], JFRF_GEN
+    jnz .generator
     test dword [rdx + JFR_FLAGS], JFRF_ASYNC
     jz vm_return_rdx
     VMCALL jsco_finish              ; the async function's promise resolves
+    jmp vm_return_plain
+.generator:
+    VMCALL jsgen_finish
 vm_return_plain:                    ; RAX = the value, no async bookkeeping
     mov rdx, [vm_fp]
 vm_return_rdx:
@@ -3267,17 +3306,25 @@ vmop_FOROF:
     cmp edx, JS_TAG_STRING
     je vm_new_iter
     cmp edx, JS_TAG_OBJECT
-    jne .not_iterable
+    jne .protocol
     mov edx, eax
     mov bl, JIM_ARRAY
     cmp byte [rdx + JH_KIND], JK_ARRAY
     je vm_new_iter
-.not_iterable:
-    mov [vm_sp], r12
-    call js_to_string
-    mov rdi, rax
-    lea rsi, [jsmsg_not_iterable]
-    jmp js_throw_type
+.protocol:
+    ; value[Symbol.iterator]() and its next()
+    VMCALL js_get_iterator
+    mov rdi, rdx
+    mov rdx, rax
+    mov ecx, JIT_SIZE
+    call js_alloc
+    mov byte [rax + JH_KIND], JK_ITER
+    mov byte [rax + JIT_MODE], JIM_PROTOCOL
+    mov [rax + JIT_SRC], rdx
+    mov [rax + JIT_NEXT], rdi
+    BOX rax, rdx, JS_OBJ_BITS
+    PUSHV rax
+    NEXT
 
 ; vm_new_iter: RAX = source value, BL = JIM_* -> pushes the iterator
 vm_new_iter:
@@ -3297,6 +3344,8 @@ vmop_ITERNEXT:
     mov edx, [rbx + JIT_SRC]        ; array or string
     cmp byte [rbx + JIT_MODE], JIM_STRING
     je .string
+    cmp byte [rbx + JIT_MODE], JIM_PROTOCOL
+    je .protocol
     cmp ecx, [rdx + JARR_LEN]
     jae vm_jump
     mov rdi, [rdx + JARR_ELEMS]
@@ -3307,11 +3356,22 @@ vmop_ITERNEXT:
     mov rax, JS_UNDEF
     jmp .value
 .string:
+    ; a character: a whole UTF-8 sequence
     cmp ecx, [rdx + JSTR_LEN]
     jae vm_jump
-    movzx eax, byte [rdx + JSTR_DATA + rcx]
-    call jsstr_char
-    BOX rax, rdi, JS_STR_BITS
+    call jsit_char_at
+    add [rbx + JIT_POS], ecx
+    PUSHV rax
+    add rsi, 4
+    NEXT
+.protocol:
+    mov rax, [rbx + JIT_SRC]
+    mov rdx, [rbx + JIT_NEXT]
+    VMCALL js_iter_step
+    jc vm_jump
+    PUSHV rax
+    add rsi, 4
+    NEXT
 .value:
     inc dword [rbx + JIT_POS]
     PUSHV rax
@@ -3708,6 +3768,81 @@ vmop_ASYNCREJECT:
     POPV rax
     VMCALL jsco_reject
     jmp vm_return_plain
+
+; --- iteration and generators (iter.asm) ----------------------------------------------
+; TOARRAY v -> v, or an array of its values if it is another iterable
+; (array destructuring)
+vmop_TOARRAY:
+    mov rax, [r12 - 8]
+    mov rdx, rax
+    shr rdx, 48
+    cmp edx, JS_TAG_STRING
+    je .keep
+    cmp edx, JS_TAG_OBJECT
+    jne .collect
+    mov edx, eax
+    cmp byte [rdx + JH_KIND], JK_ARRAY
+    je .keep
+.collect:
+    mov rdx, rax
+    xor ecx, ecx
+    call jsarr_new
+    VMCALL jsit_collect
+    BOX rax, rdx, JS_OBJ_BITS
+    mov [r12 - 8], rax
+.keep:
+    NEXT
+
+; GETITER v -> iterator next (yield*)
+vmop_GETITER:
+    POPV rax
+    VMCALL js_get_iterator
+    PUSHV rax
+    PUSHV rdx
+    NEXT
+
+; GENSTART: first in a generator function: saved, a generator returned
+vmop_GENSTART:
+    VMCALL jsgen_start
+    jmp vm_return_plain
+
+; YIELD v -> (later) what next(x) sends
+vmop_YIELD:
+    POPV rax
+    VMCALL jsgen_yield
+    jmp vm_return_plain
+
+; YIELDSTAR: [iterator next received] -> each value of the iterator yielded
+; (the generator comes back to this instruction), then [its return value]
+vmop_YIELDSTAR:
+    POPV rcx
+    mov rax, [r12 - 16]
+    mov rdx, [r12 - 8]
+    VMCALL jsgen_delegate
+    jc .done
+    dec rsi                         ; resume here, with what next() sends
+    VMCALL jsgen_yield
+    jmp vm_return_plain
+.done:
+    sub r12, 16
+    PUSHV rax
+    NEXT
+
+; REGEXP pattern32 flags32 -> a new RegExp (each time the literal is reached)
+vmop_REGEXP:
+    mov eax, [rsi]
+    mov edx, [rsi + 4]
+    add rsi, 8
+    VMCALL jsre_new
+    PUSHV rax
+    NEXT
+
+; GENTHROW e: where the implicit try of a generator lands: it is finished,
+; the error goes on to whoever resumed it
+vmop_GENTHROW:
+    POPV rax
+    VMCALL jsgen_finish
+    jmp js_throw_value
 
 vmop_CONSTERR:
     lea rsi, [jsmsg_const]

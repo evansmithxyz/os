@@ -159,8 +159,7 @@ class JavaScriptTest(OSTestCase):
         self.assertJs("var x = )", "Uncaught SyntaxError: Unexpected token ')' (line 1)")
         self.assertJs("function deep(n) { return deep(n + 1) } deep(0)",
                       "Uncaught RangeError: Maximum call stack size exceeded (line 1)")
-        self.assertJs("/ab+c/.test('abbc')",
-                      "Uncaught SyntaxError: /regular expressions/ is not supported yet (line 1)")
+        self.assertJs("String.raw`x`", "Uncaught SyntaxError: tagged templates is not supported yet (line 1)")
 
     # --- step 3: everyday JavaScript ---------------------------------------------
     def test_exceptions(self):
@@ -347,6 +346,108 @@ class JavaScriptTest(OSTestCase):
         self.vm.send("\x03")
         self.vm.expect(PROMPT, timeout=10)
         self.assertEqual(self.js("1 + 1"), "2")
+
+    # --- step 5: the big built-ins ----------------------------------------------------
+    def test_symbols_and_iterators(self):
+        self.assertJs("var s = Symbol('x'); [typeof s, s.toString(), s.description, String(s), Symbol('x') === s, "
+                      "Symbol.for('a') === Symbol.for('a'), Symbol.keyFor(Symbol.for('a'))]",
+                      "[ 'symbol', 'Symbol(x)', 'x', 'Symbol(x)', false, true, 'a' ]")
+        self.assertJs("var o = {}; var k = Symbol('k'); o[k] = 1; o.a = 2; "
+                      "[Object.keys(o), o[k], k in o, Object.getOwnPropertySymbols(o).length, o]",
+                      "[ [ 'a' ], 1, true, 1, { a: 2, [Symbol(k)]: 1 } ]")
+        self.assertJs("try { `${Symbol()}` } catch (e) { e.message }", "'Cannot convert a Symbol value to a string'")
+        self.assertJs("var it = [1, 2][Symbol.iterator](); [it.next(), it.next(), it.next()]",
+                      "[ { value: 1, done: false }, { value: 2, done: false }, { value: undefined, done: true } ]")
+        self.assertJs("[[...[1, 2].entries()], [...'ab\\u00e9c'].length, Array.from({length: 2}, (v, i) => i * 2)]",
+                      "[ [ [ 0, 1 ], [ 1, 2 ] ], 4, [ 0, 2 ] ]")
+        self.assertJs("class Tree { constructor() { this.items = [3, 1] } *[Symbol.iterator]() { yield* this.items } } "
+                      "var t = new Tree(); var out = []; for (const x of t) out.push(x); [out, [...t], Array.from(t)]",
+                      "[ [ 3, 1 ], [ 3, 1 ], [ 3, 1 ] ]")
+
+    def test_generators(self):
+        self.assertJs("function* g() { yield 1; var x = yield 2; yield x * 10; return 'end' } var it = g(); "
+                      "[it.next(), it.next(), it.next(5), it.next(), it.next()]",
+                      "[ { value: 1, done: false }, { value: 2, done: false }, { value: 50, done: false }, "
+                      "{ value: 'end', done: true }, { value: undefined, done: true } ]")
+        self.assertJs("function* nat() { let i = 0; while (true) yield i++ } var out = []; "
+                      "for (const n of nat()) { if (n > 4) break; out.push(n) } out", "[ 0, 1, 2, 3, 4 ]")
+        self.assertJs("function* inner() { yield 'a'; yield 'b'; return 'r' } "
+                      "function* outer() { var r = yield* inner(); yield r; yield* [1, 2] } [...outer()]",
+                      "[ 'a', 'b', 'r', 1, 2 ]")
+        self.assertJs("function* e() { try { yield 1 } catch (err) { yield 'caught ' + err } } var it = e(); "
+                      "[it.next().value, it.throw('boom').value, it.next().done]", "[ 1, 'caught boom', true ]")
+        self.assertJs("function* f() { throw new Error('inside') } var it = f(); "
+                      "try { it.next() } catch (e) { [e.message, it.next().done] }", "[ 'inside', true ]")
+        self.assertJs("var o = {*gen() { yield this.v }, v: 3}; var [a, b, ...rest] = new Set([1, 2, 3, 4]); "
+                      "[[...o.gen()], a, b, rest, function* named() {}]",
+                      "[ [ 3 ], 1, 2, [ 3, 4 ], [GeneratorFunction: named] ]")
+
+    def test_map_and_set(self):
+        self.assertJs("var m = new Map([['a', 1], ['b', 2]]); m.set('c', 3).set('a', 10); "
+                      "[m.get('a'), m.size, m.has('b'), m.delete('b'), m.size, [...m.keys()], m]",
+                      "[ 10, 3, true, true, 2, [ 'a', 'c' ], Map(2) { 'a' => 10, 'c' => 3 } ]")
+        self.assertJs("var s = new Set([1, 2, 2, 3, NaN, NaN, 0, -0]); [s.size, s.has(NaN), s.has(-0), [...s], s]",
+                      "[ 5, true, true, [ 1, 2, 3, NaN, 0 ], Set(5) { 1, 2, 3, NaN, 0 } ]")
+        self.assertJs("var m = new Map(); var key = {}; m.set(key, 'obj'); m.set('1', 'str'); m.set(1, 'num'); "
+                      "[m.get(key), m.get('1'), m.get(1), m.get({})]", "[ 'obj', 'str', 'num', undefined ]")
+        self.assertJs("var m = new Map([[1, 'x'], [2, 'y']]); var out = []; m.forEach((v, k) => out.push(k + v)); "
+                      "for (const [k, v] of m) out.push(v + k); out", "[ '1x', '2y', 'x1', 'y2' ]")
+        self.assertJs("var m = new Map(); for (let i = 0; i < 1000; i++) m.set('k' + i, i); "
+                      "for (let i = 0; i < 500; i++) m.delete('k' + i); [m.size, m.get('k999'), m.get('k1')]",
+                      "[ 500, 999, undefined ]")
+        self.assertJs("var wm = new WeakMap(); var o = {}; wm.set(o, 5); var ws = new WeakSet([o]); "
+                      "[wm.get(o), wm.has({}), ws.has(o)]", "[ 5, false, true ]")
+
+    def test_regular_expressions(self):
+        self.assertJs("[/ab+c/.test('xabbbc'), /^ab+c$/.test('xabbbc'), /[a-z]+/i.test('HELLO'), "
+                      "/^\\w+@\\w+\\.\\w{2,3}$/.test('me@ex.com'), /a{2,3}/.exec('aaaa')[0]]",
+                      "[ true, false, true, true, 'aaa' ]")
+        self.assertJs("/(\\d+)-(\\d+)/.exec('call 555-1234 now')",
+                      "[ '555-1234', '555', '1234', index: 5, input: 'call 555-1234 now', groups: undefined ]")
+        self.assertJs("['a1b22c333'.match(/\\d+/g), 'Hello World'.replace(/o/g, '0'), "
+                      "'2024-01-15'.replace(/(\\d+)-(\\d+)-(\\d+)/, '$3/$2/$1'), 'a, b,c ,d'.split(/\\s*,\\s*/)]",
+                      "[ [ '1', '22', '333' ], 'Hell0 W0rld', '15/01/2024', [ 'a', 'b', 'c', 'd' ] ]")
+        self.assertJs("/(?<year>\\d{4})-(?<month>\\d{2})/.exec('on 2024-03').groups", "{ year: '2024', month: '03' }")
+        self.assertJs("[/^(a|b)*c$/.test('ababc'), /(x+x+)+y/.test('xxxxxxxxxxy'), /\\bfoo\\b/.test('afoob'), "
+                      "/(?=.*\\d)(?=.*[a-z]).{6,}/.test('abc123'), /^(?!test)/.test('testing')]",
+                      "[ true, true, false, true, false ]")
+        self.assertJs("[/(\\w)\\1/.exec('hello')[0], /(?<=\\$)\\d+/.exec('cost $42')[0], /(?<!\\$)\\b\\d+/.exec('$5 and 7')[0]]",
+                      "[ 'll', '42', '7' ]")
+        self.assertJs("var re = /o/g; [re.exec('foo').index, re.lastIndex, re.exec('foo').index, re.exec('foo'), re.lastIndex]",
+                      "[ 1, 2, 2, null, 0 ]")
+        self.assertJs("[...'a1b2c3'.matchAll(/[a-z](\\d)/g)].map(m => m[1] + '@' + m.index)", "[ '1@0', '2@2', '3@4' ]")
+        self.assertJs("['x'.search(/y/), new RegExp('a+', 'gi').flags, /x/gim.source, String(/a\\/b/g), /x/y.sticky, "
+                      "'aaa'.replace(/a*?/g, '-'), 'abc'.replace(/(?:)/g, '.'), 'x-y_z'.split(/([-_])/)]",
+                      "[ -1, 'gi', 'x', '/a\\\\/b/g', true, '-a-a-a-', '.a.b.c.', [ 'x', '-', 'y', '_', 'z' ] ]")
+        self.assertJs("'The Quick'.replace(/(?<first>\\w)(\\w*)/g, (m, a, b, off, s, g) => g.first.toLowerCase() + b.toUpperCase())",
+                      "'tHE qUICK'")
+        self.assertJs("[/./s.test('\\n'), /^b/m.test('a\\nb'), /^b/.test('a\\nb'), /\\u{1F600}/u.test('\\u{1F600}')]",
+                      "[ true, true, false, true ]")
+        self.assertJs("new RegExp('(a')",
+                      "Uncaught SyntaxError: Invalid regular expression: /(a/: Unterminated group (line 1)")
+
+    def test_date(self):
+        self.assertJs("var d = new Date(Date.UTC(2024, 0, 15, 10, 30, 5, 7)); [d.getTime(), d.toISOString(), "
+                      "d.getFullYear(), d.getMonth(), d.getDate(), d.getDay(), d.getHours(), d.getMilliseconds()]",
+                      "[ 1705314605007, '2024-01-15T10:30:05.007Z', 2024, 0, 15, 1, 10, 7 ]")
+        self.assertJs("[new Date(0), new Date('2024-03-10T12:00:00Z').getTime(), new Date('2024-03-10').getTime(), "
+                      "Date.parse('2024-03-10T12:00:00+02:00')]",
+                      "[ 1970-01-01T00:00:00.000Z, 1710072000000, 1710028800000, 1710064800000 ]")
+        self.assertJs("var d = new Date(2024, 1, 29); [d.toString(), d.toDateString(), d.toUTCString(), d.toLocaleString()]",
+                      "[ 'Thu Feb 29 2024 00:00:00 GMT+0000 (Coordinated Universal Time)', 'Thu Feb 29 2024', "
+                      "'Thu, 29 Feb 2024 00:00:00 GMT', '2/29/2024, 12:00:00 AM' ]")
+        self.assertJs("var d = new Date(2024, 0, 31); d.setMonth(1); var e = new Date(2024, 11, 31, 23, 59, 59); "
+                      "e.setSeconds(e.getSeconds() + 1); [d.getMonth(), d.getDate(), e.toISOString(), "
+                      "new Date(2020, 5, 15) - new Date(2020, 5, 14)]",
+                      "[ 2, 2, '2025-01-01T00:00:00.000Z', 86400000 ]")
+        self.assertJs("[new Date('garbage').getTime(), String(new Date(NaN)), JSON.stringify({d: new Date(0)}), "
+                      "new Date(-1).toISOString()]",
+                      """[ NaN, 'Invalid Date', '{"d":"1970-01-01T00:00:00.000Z"}', '1969-12-31T23:59:59.999Z' ]""")
+        self.assertJs("[Date.parse('Jan 15, 2024'), Date.parse('Mon, 15 Jan 2024 10:30:00 GMT'), "
+                      "Date.parse('15 January 2024 10:30 PM'), Date.parse('1/15/2024')]",
+                      "[ 1705276800000, 1705314600000, 1705357800000, 1705276800000 ]")
+        self.assertJs("var n = Date.now(); [typeof n, n > 1.7e12, new Date().getFullYear() >= 2024, typeof Date()]",
+                      "[ 'number', true, true, 'string' ]")
 
     def test_ctrl_c_stops_a_runaway_script(self):
         self.vm.send("js for (;;) {}\r")

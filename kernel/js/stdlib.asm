@@ -1581,6 +1581,13 @@ jsl_array_from:
     mov ecx, eax
     cmp byte [rcx + JH_KIND], JK_ARRAY
     je .spread
+    ; an iterable (Map, Set, a generator...)?
+    mov rax, rsi
+    mov edx, [sym_iterator]
+    call js_get
+    call js_is_callable
+    jc .spread
+    mov rax, rsi
     ; array-like: { length: n, 0: ..., 1: ... }
     mov rdx, [atom_length]
     call js_get
@@ -1974,6 +1981,10 @@ jsl_search:
 
 ; split(separator, limit)
 jsl_string_split:
+    xor eax, eax
+    call jsb_arg
+    call jsre_is
+    jc jsre_split
     push rbx
     push rcx
     push rdx
@@ -2075,6 +2086,16 @@ jsl_string_split:
 ; expressions come later); the replacement is a function or a string where
 ; $$, $&, $` and $' stand for "$", the match, and the text before / after it
 jsl_string_replace_all:
+    xor eax, eax
+    call jsb_arg
+    call jsre_is
+    jnc .text
+    push r11
+    mov r11d, 1
+    call jsre_replace
+    pop r11
+    ret
+.text:
     push rbx
     push rcx
     push rdx
@@ -2088,6 +2109,16 @@ jsl_string_replace_all:
     mov r11d, 1                     ; bit 0: all, bit 1: function
     jmp jsl_replace
 jsl_string_replace:
+    xor eax, eax
+    call jsb_arg
+    call jsre_is
+    jnc .text
+    push r11
+    xor r11d, r11d
+    call jsre_replace
+    pop r11
+    ret
+.text:
     push rbx
     push rcx
     push rdx

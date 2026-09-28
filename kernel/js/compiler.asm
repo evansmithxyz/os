@@ -314,9 +314,22 @@ jsc_function:
     mov eax, [rbx + JFI_FLAGS]
     and eax, FIF_CLASSCTOR | FIF_DERIVED
     cmp eax, FIF_CLASSCTOR
-    jne .hoist
+    jne .generator
     mov rax, rbx
     call jsc_fields
+.generator:
+    ; a generator: made (and left) here, the body runs on next()
+    mov eax, [rbx + JFI_FLAGS]
+    and eax, FIF_GENERATOR | FIF_ASYNC
+    cmp eax, FIF_GENERATOR
+    jne .hoist
+    mov al, OP_GENSTART
+    call jsc_op
+    mov al, OP_POP                  ; (what the first next() sends)
+    call jsc_op
+    mov al, OP_TRY
+    call jsc_jump
+    mov [rbx + JFI_ASYNCTRY], rax
 .hoist:
     ; function declarations first (hoisting), then the statements
     mov rax, [rbx + JFI_BODY]
@@ -332,11 +345,16 @@ jsc_function:
 .plain_end:
     mov al, OP_RETUNDEF
     call jsc_op
-    test dword [rbx + JFI_FLAGS], FIF_ASYNC
+    mov eax, [rbx + JFI_FLAGS]
+    test eax, FIF_ASYNC | FIF_GENERATOR
     jz .template
     mov rax, [rbx + JFI_ASYNCTRY]
     call jsc_patch_here
     mov al, OP_ASYNCREJECT
+    test dword [rbx + JFI_FLAGS], FIF_ASYNC
+    jnz .catch_op
+    mov al, OP_GENTHROW
+.catch_op:
     call jsc_op
 .template:
     mov ecx, JCODE_SIZE
@@ -386,6 +404,10 @@ jsc_function:
     jz .f7
     or eax, JCF2_ASYNC
 .f7:
+    test dword [rbx + JFI_FLAGS], FIF_GENERATOR
+    jz .f8
+    or eax, JCF2_GENERATOR
+.f8:
     mov [rdi + JCODE_FLAGS2], eax
     mov eax, [rbx + JFI_NPARAMS]
     mov [rdi + JCODE_NPARAMS], ax
@@ -1853,6 +1875,10 @@ jsc_expr:
     je .chain
     cmp ecx, NT_AWAIT
     je .await
+    cmp ecx, NT_YIELD
+    je .yield
+    cmp ecx, NT_REGEX
+    je .regex
     ; NT_HOLE outside an array: undefined
     mov al, OP_UNDEF
     call jsc_op
@@ -1976,6 +2002,36 @@ jsc_expr:
     mov rax, [rbx + JN_A]
     call jsc_expr
     mov al, OP_AWAIT
+    call jsc_op
+    jmp .out
+.regex:
+    mov rdx, [rbx + JN_A]
+    mov al, OP_REGEXP
+    call jsc_op_u32
+    mov rax, [rbx + JN_B]
+    call jsc_u32
+    jmp .out
+.yield:
+    mov rax, [rbx + JN_A]
+    test rax, rax
+    jz .yield_undefined
+    call jsc_expr
+    jmp .yield_op
+.yield_undefined:
+    mov al, OP_UNDEF
+    call jsc_op
+.yield_op:
+    cmp byte [rbx + JN_OP], 1
+    je .yield_star
+    mov al, OP_YIELD
+    call jsc_op
+    jmp .out
+.yield_star:
+    mov al, OP_GETITER
+    call jsc_op
+    mov al, OP_UNDEF
+    call jsc_op
+    mov al, OP_YIELDSTAR
     call jsc_op
     jmp .out
 .update:
@@ -2907,6 +2963,8 @@ jsc_destructure:
     call jsc_store_top
     jmp .out
 .array:
+    mov al, OP_TOARRAY              ; (other iterables: their values)
+    call jsc_op
     xor ecx, ecx                    ; index
     mov rsi, [rbx + JN_A]
 .item:
