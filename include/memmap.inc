@@ -17,6 +17,9 @@
 ;   0x00300000  NIC DMA         RTL8139 RX ring + TX buffers
 ;   0x00400000  HTTP response   the last HTTP(S) response (1 MB)
 ;   0x00500000  browser page    the page the browser shows (1 MB)
+;   0x00600000  DOM             element and text nodes of the page (4 MB)
+;   0x00A00000  CSS             style sheet text, rules, declarations (2 MB)
+;   0x00C00000  layout          display list and its text (4 MB)
 ;   0x01000000  GUI buffers     back buffer, wallpaper cache, canvas
 ; ==============================================================================
 
@@ -57,6 +60,12 @@ HTTP_RESP_ADDR          equ 0x00400000  ; response of the last GET (headers + bo
 HTTP_RESP_SIZE          equ 0x00100000
 BROWSER_PAGE_ADDR       equ 0x00500000  ; the browser's current page (HTML or text)
 BROWSER_PAGE_SIZE       equ 0x00100000
+DOM_ADDR                equ 0x00600000  ; DOM nodes (kernel/web/dom.asm)
+DOM_SIZE                equ 0x00400000
+CSS_ADDR                equ 0x00A00000  ; style sheets and rules (kernel/web/css.asm)
+CSS_SIZE                equ 0x00200000
+LAYOUT_ADDR             equ 0x00C00000  ; display list (kernel/web/layout.asm)
+LAYOUT_SIZE             equ 0x00400000
 
 ; --- GUI (each 1024 x 768 x 4 bytes = 3 MB) -----------------------------------
 GUI_BACKBUFFER_ADDR     equ 0x01000000  ; everything is composed here, then copied to the LFB

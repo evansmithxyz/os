@@ -239,13 +239,14 @@ mouse_poll:
     in al, 0x60
     mov bl, al                  ; BL = raw byte
 
-    ; A packet's bytes come together: after a pause, this is a new packet
-    ; (gets back in step if a byte was ever lost)
+    ; A packet's bytes come together: after a long pause, this is a new
+    ; packet (gets back in step if a byte was ever lost). Long, because the
+    ; desktop only polls between frames, and a frame can take a while.
     mov rax, [timer_ticks]
     mov rdx, rax
     sub rax, [mouse_last_byte]
     mov [mouse_last_byte], rdx
-    cmp rax, TICKS(20)
+    cmp rax, TICKS(300)
     jb .in_packet
     mov byte [mouse_cycle], 0
 .in_packet:

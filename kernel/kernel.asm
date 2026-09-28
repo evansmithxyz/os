@@ -186,7 +186,9 @@ kernel_report_boot:
 %include "apps/sysmon.asm"
 %include "apps/canvas.asm"
 %include "apps/browser.asm"
-%include "apps/browser_html.asm"
+%include "web/dom.asm"
+%include "web/css.asm"
+%include "web/layout.asm"
 %include "apps/shell/shell.asm"
 %include "apps/shell/commands.asm"
 

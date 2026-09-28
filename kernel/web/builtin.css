@@ -1,0 +1,14 @@
+/* Antigravity OS browser: the dark look of its own pages (http://antigravity.os/,
+   afs:// files and error pages). Loaded after ua.css for those pages only. */
+
+html, body { background-color: #070a0f; color: #cbd5e1 }
+body { margin: 12px 24px }
+h1 { color: #00f0ff }
+h2 { color: #f59e0b }
+h3, h4, h5, h6 { color: #34d399 }
+a { color: #38bdf8 }
+b, strong { color: #fff }
+code, pre { color: #10b981 }
+hr { color: #1e293b }
+p { margin-top: .5em; margin-bottom: .5em }
+ul { margin-top: .5em; margin-bottom: .5em; padding-left: 32px }

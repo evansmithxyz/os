@@ -42,6 +42,45 @@ FEATURES_HTML = (
     + "<p>The end</p></body></html>"
 )
 
+# CSS selectors, cascade and @media (tests/test_gui.py). Only SHOWN* may be drawn.
+CSS_HTML = """<html><head><style>
+.a .b { visibility: hidden }
+#x { display: none }
+.c > .d { display: none }
+.g .d { display: none }
+@media print { .e { display: none } }
+@media (max-width: 100px) { .f { display: none } }
+@media screen and (min-width: 600px) { .h { display: none } }
+div.i { display: none } div.i { display: block }
+.j { display: none !important } #k { display: block }
+.nest { color: red; .inner { color: blue } }
+.after-nest { display: none }
+.l:first-child { display: none }
+.m:not(.n) { display: none }
+.m:not(:hover) { color: green }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0) }
+.closed { height: 0; overflow: hidden }
+</style><link rel="stylesheet" href="extra.css"></head><body>
+<div class="after-nest">HIDDEN10</div>
+<p><span class="l">HIDDEN11</span> <span class="l">SHOWN0</span></p>
+<div class="m">HIDDEN12</div><div class="m n">SHOWNA</div>
+<span class="sr">HIDDEN13</span><div class="closed">HIDDEN14</div>
+<details><summary>SHOWNB</summary>HIDDEN15</details>
+<table><tr><td bgcolor="#ff6600">SHOWNC</td></tr></table>
+<div class="a"><div class="b">HIDDEN1</div></div>
+<div id="x">HIDDEN2</div>
+<div class="c"><span class="d">HIDDEN3</span></div>
+<div class="g"><p><span class="d">HIDDEN5</span></p></div>
+<div class="e">SHOWN1</div><div class="f">SHOWN2</div>
+<div class="h">HIDDEN6</div>
+<p style="display:none">HIDDEN4</p>
+<div class="i">SHOWN3</div>
+<div class="j" id="k">HIDDEN7</div>
+<div class="fromsheet">HIDDEN8</div>
+<p hidden>HIDDEN9</p>
+<p>SHOWN4</p></body></html>"""
+EXTRA_CSS = ".fromsheet { display: none }\n"
+
 # A relative link at the top left of the page
 LINKS_HTML = "<html><body><a href='sub'>Go to sub</a> <a href='features.html'>Features</a></body></html>"
 
@@ -57,6 +96,8 @@ class HostWebServer:
         (self.root / "nohead.html").write_text(NO_HEAD_END_HTML)
         (self.root / "features.html").write_text(FEATURES_HTML, encoding="utf-8")
         (self.root / "links.html").write_text(LINKS_HTML)
+        (self.root / "css.html").write_text(CSS_HTML)
+        (self.root / "extra.css").write_text(EXTRA_CSS)
         # GET /sub answers "301 Location: /sub/" (http.server adds the slash)
         (self.root / "sub").mkdir(exist_ok=True)
         (self.root / "sub" / "index.html").write_text("<html><body><p>Sub page</p></body></html>")

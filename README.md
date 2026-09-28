@@ -39,8 +39,9 @@ windowed desktop with i3-style workspaces.
   - Apps:
     - a terminal that runs the same shell as the text console
     - the CyberSurf web browser: built-in pages, `afs://` files, real HTTP
-      and HTTPS with redirects; a text-mode layout (think Lynx) with word
-      wrapping, lists, tables, entities and UTF-8, scrolling and relative links
+      and HTTPS with redirects; an HTML parser, a CSS engine (style sheets,
+      selectors, the cascade, `@media`) and a layout engine drawing with the
+      8x8 font; scrolling and relative links
     - a paint canvas
     - a live system monitor
 
@@ -111,10 +112,36 @@ The terminal window runs the real shell, so every command works there too.
 URL into the browser. `tcplisten` serves a page that your host can open at
 <http://localhost:8888>.
 
-The browser has no CSS or JavaScript; it lays pages out like a text browser.
-Whitespace collapses and text wraps at word boundaries; headings, paragraphs,
-lists and table rows get their own lines; `<script>`, `<style>` and friends
-are hidden and images show their `alt` text. Scroll with Up/Down,
+The browser has no JavaScript yet. A page goes through the same stages as
+in a big browser, all in `kernel/web/`:
+
+1. `dom.asm` parses the HTML into a DOM tree, with the HTML rules that
+   matter for display (void elements, `<p>`/`<li>`/`<td>` closing each other,
+   raw `<script>`/`<style>` text, a missing `</head>`).
+2. `css.asm` reads style sheets: the browser's defaults (`web/ua.css`), the
+   dark look of its own pages (`web/builtin.css`), the page's `<style>`
+   blocks and `<link rel=stylesheet>` files (fetched over HTTP/HTTPS), and
+   `style=""`. Selectors: type, `.class`, `#id`, `*`, descendant and child
+   combinators, `:root`, `:first-child`, `:last-child`, `:not(.class)`,
+   `:not(:hover)`-style states; `@media` (width, screen/print,
+   color scheme), `@supports`, `@layer`. The cascade does specificity,
+   source order, `!important` and inheritance. Properties: `display`,
+   `visibility`, `color`, `background(-color)`, `font-weight`,
+   `text-decoration`, `text-align`, `white-space`, `list-style`,
+   `text-transform`, margins and padding, plus the tricks sites use to
+   hide things (`position:absolute` with 1px size or `clip`, `height:0` with
+   `overflow:hidden`, `opacity:0`, far-off `left`/`top`). Old HTML
+   attributes (`bgcolor`, `<font color>`, `align`) count too.
+3. `layout.asm` lays the styled tree out into a display list: block boxes
+   with collapsing margins, line boxes wrapped at words and aligned,
+   lists with bullets or numbers, table rows with cells side by side,
+   background colours. It is redone only when the page or the window width
+   changes; scrolling just repaints.
+
+Everything is drawn with the 8x8 font, so there are no font sizes, and CSS
+lengths are halved to match it. Not supported: `var()`, attribute
+selectors, `+`/`~`, pseudo-elements, floats, flexbox and grid as layouts
+(they become plain blocks), positioning, images. Scroll with Up/Down,
 PgUp/PgDn, Home/End or the mouse wheel. Pages up to 1 MB are kept.
 
 | Keys / mouse (browser) | Action |
@@ -169,6 +196,8 @@ kernel/
   crypto/               sha256 + HMAC, sha512/384, chacha20poly1305, x25519,
                         bignum (Montgomery), rsa, ecc (ECDSA P-256/P-384), random
   data/roots.der        trusted root certificates (tools/mkroots.py)
+  web/                  dom (HTML parser), css (style sheets, cascade), layout (display list),
+                        ua.css / builtin.css (the browser's own style sheets)
   gfx/                  clipped 2D drawing, font, back buffer, mouse pointer
   gui/                  window manager + event loop, taskbar/footer, theme colours
   apps/                 terminal, browser (+ browser_html: page layout), canvas, sysmon windows

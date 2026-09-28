@@ -14,13 +14,14 @@
 
 [bits 64]
 
-BROWSER_URL_MAX         equ 256
+BROWSER_URL_MAX         equ 1024
 BROWSER_PAGE_BUF_MAX    equ BROWSER_PAGE_SIZE - 1
 browser_page_buf        equ BROWSER_PAGE_ADDR   ; use as [abs browser_page_buf]
 BROWSER_LOG_MAX         equ 80      ; visible text reported by "[klog] browser text:"
 BROWSER_MAX_REDIRECTS   equ 5
 BROWSER_URL_X           equ 182     ; address text, from the window's left edge
 BROWSER_WHEEL_STEP      equ 3 * 14  ; pixels per wheel notch / arrow key
+BROWSER_MAX_SHEETS      equ 8       ; external style sheets per page
 
 ; Colors for Browser UI
 BROWSER_CLR_TOOLBAR     equ 0x00131D2E   ; Deep Navy Toolbar
@@ -37,6 +38,9 @@ browser_pending_nav:    db 0        ; navigate to browser_url_buf when opened
 browser_url_focused:    db 0        ; 1 = URL bar has keyboard focus
 browser_log_text:       db 0        ; 1 = next render logs the page's first text
 browser_page_tls:       db 0        ; 1 = page came over TLS with a verified certificate
+browser_page_builtin:   db 1        ; 1 = the browser's own page: dark style sheet
+browser_sheets:         db 0        ; style sheets fetched for this page
+dom_ready:              db 0        ; dom_init has run
 browser_redirects:      db 0        ; redirects followed for the current navigation
 align 4
 browser_log_len:        dd 0
@@ -59,8 +63,10 @@ browser_prev_url:       resb BROWSER_URL_MAX
 browser_page_title:     resb 64
 browser_status_text:    resb 96
 browser_scratch:        resb 160
-browser_redirect_buf:   resb 384    ; [0] built URL, [256] Location value
-browser_link_buf:       resb 512    ; a link being resolved
+browser_redirect_buf:   resb 2048   ; [0] built URL, [1024] Location value
+browser_link_buf:       resb 1024   ; a link being resolved
+alignb 8
+browser_resolved:       resq 1      ; browser_resolve_link's result
 browser_log_buf:        resb BROWSER_LOG_MAX + 2
 
 section .text
@@ -159,12 +165,33 @@ browser_key:
     ret
 
 ; ------------------------------------------------------------------------------
-; browser_follow_link: RSI = href, ECX = its length (as written in the page).
-; Resolves it against browser_page_url (absolute, //host, /path, ?query or
-; relative, with ./ and ../) and navigates. "#fragment", javascript: and
-; mailto: links do nothing.
+; browser_follow_link: RSI = href, ECX = its length (as written in the page)
+; -> navigate there. "#fragment", javascript: and mailto: links do nothing.
 ; ------------------------------------------------------------------------------
 browser_follow_link:
+    call browser_resolve_link
+    jc .ret
+    push rcx
+    push rsi
+    push rdi
+    mov rsi, [browser_resolved]
+    lea rdi, [browser_url_buf]
+    mov ecx, BROWSER_URL_MAX
+    call strlcpy
+    pop rdi
+    pop rsi
+    pop rcx
+    call browser_navigate
+.ret:
+    ret
+
+; ------------------------------------------------------------------------------
+; browser_resolve_link: RSI = href, ECX = its length -> browser_resolved = the
+; absolute URL, resolved against browser_page_url (absolute, //host, /path,
+; ?query or relative, with ./ and ../). CF=1 for "#fragment", javascript:,
+; mailto: and URLs too long to use.
+; ------------------------------------------------------------------------------
+browser_resolve_link:
     push rax
     push rbx
     push rcx
@@ -193,7 +220,7 @@ browser_follow_link:
     add rsi, 4
     sub ecx, 4
 .store:
-    cmp edx, 400
+    cmp edx, 1000
     jae .copy
     mov [rdi + rdx], al
     inc edx
@@ -328,10 +355,17 @@ browser_follow_link:
     call strlen
     cmp eax, BROWSER_URL_MAX - 1
     jae .done
-    lea rdi, [browser_url_buf]
-    mov ecx, BROWSER_URL_MAX
-    call strlcpy
-    call browser_navigate
+    mov [browser_resolved], rsi
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    clc
+    ret
 .done:
     pop r9
     pop r8
@@ -341,6 +375,7 @@ browser_follow_link:
     pop rcx
     pop rbx
     pop rax
+    stc
     ret
 ; .base: append the first ECX bytes of the base URL (RBX) at RDI
 .base:
@@ -588,6 +623,7 @@ browser_navigate:
 
     mov byte [browser_pending_nav], 0
     mov byte [browser_page_tls], 0
+    mov byte [browser_page_builtin], 1  ; until a fetched page replaces it
     mov byte [browser_page_plain], 0
     mov byte [browser_page_latin1], 0
     mov dword [browser_scroll], 0
@@ -692,6 +728,7 @@ browser_navigate:
     lea rdx, [STR_STATUS_404]
     call browser_set_page
 .done:
+    call browser_prepare_page       ; DOM, style sheets, styles
     mov byte [gui_dirty], 1
     mov byte [browser_log_text], 1  ; the next render reports the visible text
     mov dword [browser_log_len], 0
@@ -708,6 +745,198 @@ browser_navigate:
     pop rdx
     pop rcx
     pop rbx
+    pop rax
+    ret
+
+; ------------------------------------------------------------------------------
+; browser_prepare_page: browser_page_buf -> DOM (dom.asm), style sheets and
+; styles (css.asm). The layout is redone at the next paint. Style sheets, in
+; document order: the browser's defaults (web/ua.css), the dark look of its
+; own pages (web/builtin.css), then the page's <style> blocks and
+; <link rel=stylesheet> files, fetched over HTTP(S).
+; ------------------------------------------------------------------------------
+browser_prepare_page:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r12
+    cmp byte [dom_ready], 0
+    jne .ready
+    call dom_init
+    mov byte [dom_ready], 1
+.ready:
+    call dom_build
+    call css_reset
+    ; @media sees our viewport in CSS pixels (twice ours)
+    mov eax, [browser_vp_w]
+    test eax, eax
+    jnz .have_width
+    mov eax, 880
+.have_width:
+    shl eax, 1
+    mov [css_viewport], eax
+    mov dword [css_origin], 0
+    lea rsi, [css_ua_sheet]
+    mov ecx, css_ua_sheet_len
+    call css_parse
+    mov dword [css_origin], CSS_ORIGIN_AUTHOR
+    cmp byte [browser_page_builtin], 0
+    je .page_sheets
+    lea rsi, [css_builtin_sheet]
+    mov ecx, css_builtin_sheet_len
+    call css_parse
+.page_sheets:
+    mov byte [browser_sheets], 0
+    mov r12d, 1
+.node:
+    cmp r12d, [dom_count]
+    jae .styled
+    mov eax, r12d
+    call dom_node
+    cmp byte [rbx + N_TYPE], NODE_ELEMENT
+    jne .next
+    cmp byte [rbx + N_TAG], TAGID_STYLE
+    je .style
+    cmp byte [rbx + N_TAG], TAGID_LINK
+    jne .next
+    ; <link rel="stylesheet" href="..." [media="..."]>
+    mov eax, r12d
+    lea rdi, [STR_ATTR_REL]
+    call dom_attr
+    jc .next
+    lea rdi, [STR_REL_STYLESHEET]
+    call css_contains_ci
+    jne .next
+    call .media_ok
+    jc .next
+    mov eax, r12d
+    lea rdi, [STR_ATTR_HREF]
+    call dom_attr
+    jc .next
+    call browser_fetch_stylesheet
+    jmp .next
+.style:
+    call .media_ok
+    jc .next
+    mov eax, [rbx + N_FIRST]
+    test eax, eax
+    jz .next
+    call dom_node
+    mov rsi, [rbx + N_NAME]
+    mov ecx, [rbx + N_NAME_LEN]
+    call css_parse
+.next:
+    inc r12d
+    jmp .node
+.styled:
+    mov eax, [css_rule_count]
+    lea rsi, [klog_browser_rules]   ; "[klog] browser: css rules N"
+    call klog_dec
+    call css_compute
+    mov dword [lay_width], -1       ; lay out at the next paint
+    pop r12
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+; .media_ok: element R12's media="" (if any) -> CF=1 if not for the screen
+.media_ok:
+    push rax
+    push rcx
+    push rsi
+    push rdi
+    mov eax, r12d
+    lea rdi, [STR_ATTR_MEDIA]
+    call dom_attr
+    jc .media_yes
+    call css_media_ok
+    jmp .media_out
+.media_yes:
+    clc
+.media_out:
+    pop rdi
+    pop rsi
+    pop rcx
+    pop rax
+    ret
+
+; ------------------------------------------------------------------------------
+; browser_fetch_stylesheet: RSI = href, ECX = its length -> fetched (quietly)
+; and parsed as an author style sheet. At most BROWSER_MAX_SHEETS per page.
+; ------------------------------------------------------------------------------
+browser_fetch_stylesheet:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    cmp byte [browser_sheets], BROWSER_MAX_SHEETS
+    jae .done
+    inc byte [browser_sheets]
+    call browser_resolve_link
+    jc .done
+    mov rsi, [browser_resolved]
+    call url_parse
+    jc .done
+    cmp byte [net_present], 1
+    jne .done
+    lea rsi, [url_host]
+    lea rdi, [url_ip]
+    call net_resolve_host
+    jc .done
+    mov byte [http_quiet], 1
+    lea rsi, [url_ip]
+    lea rdi, [url_host]
+    movzx edx, word [url_port]
+    lea r8, [url_path]
+    cmp byte [url_https], 1
+    je .https
+    call tcp_http_client
+    jmp .fetched
+.https:
+    mov byte [tls_insecure], 0
+    call tls_https_get
+.fetched:
+    mov byte [http_quiet], 0
+    test eax, eax
+    jnz .done
+    ; only a 200 response is a style sheet
+    lea rsi, [abs http_resp_buf]
+    cmp byte [rsi + 9], '2'
+    jne .done
+    ; the body, after the blank line
+.find_body:
+    mov al, [rsi]
+    test al, al
+    jz .done
+    cmp dword [rsi], 0x0A0D0A0D
+    je .body
+    inc rsi
+    jmp .find_body
+.body:
+    add rsi, 4
+    call strlen
+    mov ecx, eax
+    call css_keep_text              ; the next fetch reuses http_resp_buf
+    call css_parse
+    mov eax, ecx
+    push rsi
+    lea rsi, [klog_browser_sheet]
+    call klog_dec
+    pop rsi
+.done:
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
     pop rax
     ret
 
@@ -784,6 +1013,7 @@ browser_fetch_http:
 .show:
     mov al, [url_https]
     mov [browser_page_tls], al
+    mov byte [browser_page_builtin], 0
     call browser_content_type
 
     ; Body = everything after the blank line that ends the headers
@@ -1158,14 +1388,14 @@ browser_redirect_target:
     inc rsi
     jmp .skip_space
 .value:
-    ; the value, up to the end of the line, into browser_redirect_buf + 256
-    lea rdi, [browser_redirect_buf + 256]
+    ; the value, up to the end of the line, into browser_redirect_buf + 1024
+    lea rdi, [browser_redirect_buf + 1024]
     xor ecx, ecx
 .value_char:
     mov al, [rsi + rcx]
     cmp al, ' '
     jbe .value_end                  ; CR, LF, NUL or space
-    cmp ecx, 126
+    cmp ecx, 900                    ; (the URL built from it must stay below +1024)
     jae .no                         ; too long for us
     mov [rdi + rcx], al
     inc ecx
@@ -1966,6 +2196,16 @@ klog_browser:           db "browser: ", 0
 klog_browser_status:    db "browser status: ", 0
 klog_browser_text:      db "browser text: ", 0
 klog_browser_scroll:    db "browser scroll: ", 0
+klog_browser_sheet:     db "browser: style sheet bytes ", 0
+klog_browser_rules:     db "browser: css rules ", 0
+STR_ATTR_REL:           db "rel", 0
+STR_ATTR_HREF:          db "href", 0
+STR_ATTR_MEDIA:         db "media", 0
+STR_REL_STYLESHEET:     db "stylesheet", 0
+css_ua_sheet:           incbin "web/ua.css"
+css_ua_sheet_len        equ $ - css_ua_sheet
+css_builtin_sheet:      incbin "web/builtin.css"
+css_builtin_sheet_len   equ $ - css_builtin_sheet
 STR_LINK_JS:            db "javascript:", 0
 STR_LINK_MAILTO:        db "mailto:", 0
 STR_HDR_CONTENT_TYPE:   db "content-type:", 0

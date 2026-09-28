@@ -9,7 +9,7 @@
 [bits 64]
 
 URL_HOST_MAX            equ 64
-URL_PATH_MAX            equ 256
+URL_PATH_MAX            equ 1024
 
 section .data
 url_port:               dw 80

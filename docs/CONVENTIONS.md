@@ -67,6 +67,7 @@ Routines are prefixed with their module: `con_`, `key_`, `serial_`, `vga_`,
 `ipv4_`/`icmp_`, `udp_`/`dns_`, `tcp_`/`http_`, `url_`, `tls_`, `x509_`/`der_`,
 `sha256_`/`sha512_`/`hmac_`/`hash_`, `chacha20_`/`poly1305_`/`aead_`,
 `fe_`/`x25519_`, `bn_`/`mont_`, `rsa_`/`sig_`, `ec_`/`ecdsa_`, `rand_`, `rtc_`,
+`dom_`, `css_`, `lay_`/`layout_`/`paint_`,
 `gfx_`, `wm_`, `gui_`,
 `desktop_`, `term_`, `canvas_`, `sysmon_`, `browser_`, `shell_`, `cmd_`,
 `fmt_`, and plain names (`strlen`, `memcpy`) for `lib/string.asm`. Local

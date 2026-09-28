@@ -61,7 +61,7 @@ tcp_tx_packet:          resb 2048
 alignb 16
 tcp_rx_buf:             resb TCP_RX_BUF_SIZE + 16   ; last received segment, NUL-terminated
 alignb 16
-http_req_buf:           resb 512
+http_req_buf:           resb 1536
 
 section .rodata
 ; Server HTTP Response Content
@@ -684,7 +684,7 @@ http_build_request:
     jnz .have_path
     lea rsi, [.STR_ROOT]
 .have_path:
-    lea rax, [http_req_buf + 300]   ; leave room for the rest of the request
+    lea rax, [http_req_buf + 1200]  ; leave room for the rest of the request
 .copy_path:
     cmp rdi, rax
     jae .path_done

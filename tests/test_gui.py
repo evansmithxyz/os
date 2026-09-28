@@ -136,7 +136,7 @@ class DesktopTest(OSTestCase):
         self.vm.expect("wm: workspace 2")
         self.vm.mouse_home()
         self.vm.drag(300, 65, 140, 65)      # window x: 60 -> -100
-        self.vm.click(20, 240)              # the visible end of the "Showcase Demo" link
+        self.vm.click(20, 270)              # the visible end of the "Showcase Demo" link
         self.vm.expect("browser: CyberSurf - HTML Showcase Demo")
 
     def test_browser_command_opens_afs_file(self):
@@ -181,6 +181,13 @@ class DesktopTest(OSTestCase):
             line = self.open_page(web, "features.html")
         self.assertIn('browser text: Collapsed white space It\'s (c) 2026 - cafe "quoted" \' EUR5 1. Row title', line)
         self.assertIn("browser: CyberSurf - Feature test", self.vm.output, "window title from <title>")
+
+    def test_browser_css_selectors_cascade_media(self):
+        with HostWebServer() as web:
+            line = self.open_page(web, "css.html")
+        self.assertIn("browser: style sheet bytes", self.vm.output, "extra.css fetched")
+        self.assertIn("browser text: SHOWN0 SHOWNA SHOWNB SHOWNC SHOWN1 SHOWN2 SHOWN3 SHOWN4", line)
+        self.assertNotIn("HIDDEN", line)
 
     def test_browser_scrolls_with_keys_and_wheel(self):
         with HostWebServer() as web:

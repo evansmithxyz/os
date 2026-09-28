@@ -250,11 +250,15 @@ class Machine:
         time.sleep(0.1)
 
     def mouse_home(self) -> None:
-        """Pin the pointer against the top-left corner so its position is known."""
+        """Pin the pointer against the top-left corner so its position is known.
+        Paced: QEMU queues only a few PS/2 packets and holds back the rest of
+        the motion, which the desktop reads between frames; unpaced, leftover
+        motion would cancel the next mouse_to."""
         for _ in range(12):
             self.hmp("mouse_move -120 -120")
+            time.sleep(0.03)
         self.mouse = (0, 0)
-        time.sleep(0.1)
+        time.sleep(0.4)
 
     def _press_at(self, x: int, y: int) -> bool:
         """Press the left button; True if the kernel logged the press at (x, y)."""
