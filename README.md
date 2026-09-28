@@ -38,8 +38,9 @@ windowed desktop with i3-style workspaces.
     workspaces.
   - Apps:
     - a terminal that runs the same shell as the text console
-    - the CyberSurf web browser (built-in pages, `afs://` files, real HTTP and
-      HTTPS, redirects)
+    - the CyberSurf web browser: built-in pages, `afs://` files, real HTTP
+      and HTTPS with redirects; a text-mode layout (think Lynx) with word
+      wrapping, lists, tables, entities and UTF-8, scrolling and relative links
     - a paint canvas
     - a live system monitor
 
@@ -110,6 +111,19 @@ The terminal window runs the real shell, so every command works there too.
 URL into the browser. `tcplisten` serves a page that your host can open at
 <http://localhost:8888>.
 
+The browser has no CSS or JavaScript; it lays pages out like a text browser.
+Whitespace collapses and text wraps at word boundaries; headings, paragraphs,
+lists and table rows get their own lines; `<script>`, `<style>` and friends
+are hidden and images show their `alt` text. Scroll with Up/Down,
+PgUp/PgDn, Home/End or the mouse wheel. Pages up to 1 MB are kept.
+
+| Keys / mouse (browser) | Action |
+|---|---|
+| Type, Enter | Edit the address, go |
+| Up / Down, mouse wheel | Scroll a few lines |
+| PgUp / PgDn, Home / End | Scroll a screen, to the top / bottom |
+| Click a link | Follow it (relative links resolve against the page) |
+
 HTTPS speaks TLS 1.3 with one cipher suite, `TLS_CHACHA20_POLY1305_SHA256`,
 and one key exchange, X25519. Servers that only offer AES-GCM (rare, since
 TLS 1.3 servers normally support ChaCha20) fail with a handshake alert.
@@ -157,7 +171,7 @@ kernel/
   data/roots.der        trusted root certificates (tools/mkroots.py)
   gfx/                  clipped 2D drawing, font, back buffer, mouse pointer
   gui/                  window manager + event loop, taskbar/footer, theme colours
-  apps/                 terminal, browser, canvas, sysmon windows
+  apps/                 terminal, browser (+ browser_html: page layout), canvas, sysmon windows
   apps/shell/           line editor + command table + command handlers
 rootfs/                 files copied onto a freshly formatted disk
 tools/                  build.py, mkimage.py (disk images), ppm.py (screenshots)

@@ -1530,7 +1530,7 @@ tls_resp_append:
     jbe .fits
     mov ecx, eax
 .fits:
-    lea rdi, [http_resp_buf]
+    lea rdi, [abs http_resp_buf]
     mov eax, [http_resp_len]
     add rdi, rax
     add [http_resp_len], ecx
@@ -1572,7 +1572,7 @@ tls_https_get:
     mov byte [tls_got_cv], 0
     mov dword [x509_chain_count], 0
     mov dword [http_resp_len], 0
-    mov byte [http_resp_buf], 0
+    mov byte [abs http_resp_buf], 0
     mov dword [tls_in_len], 0
     mov dword [tls_in_pos], 0
     mov dword [tls_hs_len], 0

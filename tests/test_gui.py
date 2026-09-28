@@ -6,6 +6,7 @@ client area starts at (62, 80). Taskbar pills are laid out in gui/desktop.asm.
 """
 
 import os
+import re
 import time
 import unittest
 
@@ -135,7 +136,7 @@ class DesktopTest(OSTestCase):
         self.vm.expect("wm: workspace 2")
         self.vm.mouse_home()
         self.vm.drag(300, 65, 140, 65)      # window x: 60 -> -100
-        self.vm.click(20, 336)              # the visible end of the "Showcase Demo" link
+        self.vm.click(20, 240)              # the visible end of the "Showcase Demo" link
         self.vm.expect("browser: CyberSurf - HTML Showcase Demo")
 
     def test_browser_command_opens_afs_file(self):
@@ -168,6 +169,49 @@ class DesktopTest(OSTestCase):
             self.vm.send(f"browser http://10.0.2.2:{web.port}/nohead.html\r")
             self.vm.expect("browser status: HTTP/1.0 200 OK | 10.0.2.2", timeout=20)
             self.vm.expect("browser text: Still visible")
+
+    # --- layout (kernel/apps/browser_html.asm), pages from tests/test_net.py ------
+    def open_page(self, web, page: str) -> str:
+        self.vm.send(f"browser http://10.0.2.2:{web.port}/{page}\r")
+        self.vm.expect("gui: started")
+        return self.vm.expect(r"browser text: [^\r\n]*\r?\n", regex=True, timeout=20)
+
+    def test_browser_layout_whitespace_entities_tables(self):
+        with HostWebServer() as web:
+            line = self.open_page(web, "features.html")
+        self.assertIn('browser text: Collapsed white space It\'s (c) 2026 - cafe "quoted" \' EUR5 1. Row title', line)
+        self.assertIn("browser: CyberSurf - Feature test", self.vm.output, "window title from <title>")
+
+    def test_browser_scrolls_with_keys_and_wheel(self):
+        with HostWebServer() as web:
+            self.open_page(web, "features.html")
+            self.vm.key("pgdn")
+            self.vm.expect("browser scroll: ")
+            line = self.vm.expect(r"browser text: [^\r\n]*\r?\n", regex=True)
+            self.assertRegex(line, r"browser text: Line \d+")
+            self.vm.key("end")              # the last screenful: Line 80 and "The end" at the bottom
+            line = self.vm.expect(r"browser text: [^\r\n]*\r?\n", regex=True)
+            first = int(re.search(r"browser text: Line (\d+)", line).group(1))
+            self.assertGreater(first, 50, line)
+            self.vm.key("home")
+            line = self.vm.expect(r"browser text: [^\r\n]*\r?\n", regex=True)
+            self.assertIn("browser text: Collapsed", line)
+            # two wheel notches down over the page: 2 x 3 lines
+            self.vm.mouse_home()
+            self.vm.mouse_to(500, 400)
+            self.vm.wheel(2)
+            self.vm.expect("browser scroll: 84")
+            self.vm.wheel(-2)
+            self.vm.expect("browser scroll: 0")
+
+    def test_browser_follows_relative_link(self):
+        """links.html's first link is href='sub': /links.html -> /sub -> (301) /sub/."""
+        with HostWebServer() as web:
+            self.open_page(web, "links.html")
+            self.vm.mouse_home()
+            self.vm.click(100, 148)         # first line of the page: "Go to sub"
+            self.vm.expect(f"browser: redirect -> http://10.0.2.2:{web.port}/sub/", timeout=20)
+            self.vm.expect("browser text: Sub page")
 
     def test_browser_follows_redirect(self):
         with HostWebServer() as web:

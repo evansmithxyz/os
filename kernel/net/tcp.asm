@@ -25,7 +25,8 @@ TCP_STATE_CLOSE_WAIT    equ 7
 TCP_STATE_LAST_ACK      equ 8
 TCP_STATE_TIME_WAIT     equ 9
 
-HTTP_RESP_MAX           equ 131072  ; bytes of HTTP response kept for the browser
+HTTP_RESP_MAX           equ HTTP_RESP_SIZE - 1  ; bytes of HTTP response kept (+ NUL)
+http_resp_buf           equ HTTP_RESP_ADDR      ; use as [abs http_resp_buf]
 TCP_RX_BUF_SIZE         equ 4096
 TCP_SEND_MAX            equ 1400    ; payload bytes per segment we send
 
@@ -61,8 +62,6 @@ alignb 16
 tcp_rx_buf:             resb TCP_RX_BUF_SIZE + 16   ; last received segment, NUL-terminated
 alignb 16
 http_req_buf:           resb 512
-alignb 16
-http_resp_buf:          resb HTTP_RESP_MAX + 1      ; whole response of the last GET
 
 section .rodata
 ; Server HTTP Response Content
@@ -804,7 +803,7 @@ tcp_http_client:
 
     xor r12d, r12d              ; R12 = bytes of the response already printed
     mov dword [http_resp_len], 0
-    mov byte [http_resp_buf], 0
+    mov byte [abs http_resp_buf], 0
     mov byte [tcp_rx_to_tls], 0
     call tcp_connect
     jc .error
@@ -830,7 +829,7 @@ tcp_http_client:
     mov eax, [http_resp_len]
     cmp eax, r12d
     jbe .progress
-    lea rsi, [http_resp_buf]
+    lea rsi, [abs http_resp_buf]
     add rsi, r12
     mov r12d, eax
     mov bl, COLOR_LIGHT_CYAN
@@ -1023,7 +1022,7 @@ http_resp_append:
     jbe .fits
     mov ecx, eax
 .fits:
-    lea rdi, [http_resp_buf]
+    lea rdi, [abs http_resp_buf]
     mov eax, [http_resp_len]
     add rdi, rax
     add [http_resp_len], ecx

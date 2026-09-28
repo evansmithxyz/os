@@ -29,6 +29,12 @@ SC_UP           equ 0x48
 SC_LEFT         equ 0x4B
 SC_RIGHT        equ 0x4D
 SC_DOWN         equ 0x50
+SC_HOME         equ 0x47
+SC_PGUP         equ 0x49
+SC_END          equ 0x4F
+SC_PGDN         equ 0x51
+SC_INSERT       equ 0x52
+SC_DELETE       equ 0x53
 SC_EXTENDED     equ 0xE0
 
 section .data
@@ -61,6 +67,22 @@ isr_keyboard:
     out PIC1_COMMAND, al
     pop rax
     iretq
+
+; kbd_is_nav_key: BL = make code -> ZF=1 for Home, End, PgUp, PgDn, Insert, Delete
+kbd_is_nav_key:
+    cmp bl, SC_HOME
+    je .ret
+    cmp bl, SC_END
+    je .ret
+    cmp bl, SC_PGUP
+    je .ret
+    cmp bl, SC_PGDN
+    je .ret
+    cmp bl, SC_INSERT
+    je .ret
+    cmp bl, SC_DELETE
+.ret:
+    ret
 
 ; ------------------------------------------------------------------------------
 ; kbd_decode: AL = raw scancode byte
@@ -100,6 +122,8 @@ kbd_decode:
     cmp bl, SC_LEFT
     je .push_special
     cmp bl, SC_RIGHT
+    je .push_special
+    call kbd_is_nav_key
     je .push_special
     jmp .done
 
@@ -168,6 +192,8 @@ kbd_decode:
     cmp bl, SC_LEFT
     je .push_special
     cmp bl, SC_RIGHT
+    je .push_special
+    call kbd_is_nav_key
     je .push_special
     jmp .done
 .push_special:

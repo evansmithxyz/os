@@ -1,24 +1,26 @@
 ; ==============================================================================
 ; Antigravity OS - CyberSurf Web Browser window
 ; ------------------------------------------------------------------------------
-; A tiny HTML renderer (h1-h3, p, b, br, hr, ul/li, code, a href) with
-; navigation for:
+; The window: toolbar, address bar, bookmarks, status bar, navigation for
 ;   http://antigravity.os/...   built-in pages (home, demo, live telemetry)
 ;   afs://<file>                files on the AntigravityFS disk
-;   http://host[:port]/path     real HTTP/1.0 over the kernel's TCP stack
-;                               (host names are resolved with DNS)
-; Drawing uses the window frame position (br_wx/br_wy/br_ww/br_wh), which the
-; WIN_DRAW callback derives from the client rectangle.
+;   http(s)://host[:port]/path  real HTTP/1.0 over the kernel's TCP stack, TLS
+;                               1.3 for https (host names are resolved with DNS)
+; and scrolling (arrows, PgUp/PgDn, Home/End, mouse wheel). The page layout is
+; in browser_html.asm. Drawing uses the window frame position
+; (br_wx/br_wy/br_ww/br_wh), which the WIN_DRAW callback derives from the
+; client rectangle.
 ; ==============================================================================
 
 [bits 64]
 
-BROWSER_URL_MAX         equ 96
-BROWSER_PAGE_BUF_MAX    equ 131072
-BROWSER_MAX_LINKS       equ 16
-BROWSER_LINK_SIZE       equ 80      ; x1, y1, x2, y2 (dd) + 64-byte target URL
+BROWSER_URL_MAX         equ 256
+BROWSER_PAGE_BUF_MAX    equ BROWSER_PAGE_SIZE - 1
+browser_page_buf        equ BROWSER_PAGE_ADDR   ; use as [abs browser_page_buf]
 BROWSER_LOG_MAX         equ 80      ; visible text reported by "[klog] browser text:"
 BROWSER_MAX_REDIRECTS   equ 5
+BROWSER_URL_X           equ 182     ; address text, from the window's left edge
+BROWSER_WHEEL_STEP      equ 3 * 14  ; pixels per wheel notch / arrow key
 
 ; Colors for Browser UI
 BROWSER_CLR_TOOLBAR     equ 0x00131D2E   ; Deep Navy Toolbar
@@ -33,8 +35,6 @@ section .data
 browser_ready:          db 0
 browser_pending_nav:    db 0        ; navigate to browser_url_buf when opened
 browser_url_focused:    db 0        ; 1 = URL bar has keyboard focus
-browser_in_link:        db 0
-browser_href_set:       db 0        ; current <a> tag had an href
 browser_log_text:       db 0        ; 1 = next render logs the page's first text
 browser_page_tls:       db 0        ; 1 = page came over TLS with a verified certificate
 browser_redirects:      db 0        ; redirects followed for the current navigation
@@ -43,22 +43,14 @@ browser_log_len:        dd 0
 browser_log_y:          dd 0        ; y of the last logged glyph
 browser_url_len:        dd 0
 browser_link_count:     dd 0
-browser_page_len:       dd 0
-browser_cur_x:          dd 0
-browser_cur_y:          dd 0
-browser_text_color:     dd 0x00E2E8F0
 browser_vp_x:           dd 0
 browser_vp_y:           dd 0
 browser_vp_w:           dd 0
 browser_vp_h:           dd 0
-browser_link_x1:        dd 0
-browser_link_y1:        dd 0
 br_wx:                  dd 0        ; window frame geometry for the current draw
 br_wy:                  dd 0
 br_ww:                  dd 0
 br_wh:                  dd 0
-align 8
-browser_parse_ptr:      dq 0
 
 section .bss
 alignb 16
@@ -66,12 +58,10 @@ browser_url_buf:        resb BROWSER_URL_MAX
 browser_prev_url:       resb BROWSER_URL_MAX
 browser_page_title:     resb 64
 browser_status_text:    resb 96
-browser_temp_href:      resb 64
 browser_scratch:        resb 160
 browser_redirect_buf:   resb 384    ; [0] built URL, [256] Location value
+browser_link_buf:       resb 512    ; a link being resolved
 browser_log_buf:        resb BROWSER_LOG_MAX + 2
-browser_links:          resb BROWSER_MAX_LINKS * BROWSER_LINK_SIZE
-browser_page_buf:       resb BROWSER_PAGE_BUF_MAX + 1
 
 section .text
 ; ==============================================================================
@@ -90,18 +80,23 @@ browser_draw:
     mov [br_wh], eax
     jmp browser_draw_window
 
-; browser_mouse: WIN_MOUSE callback - only presses matter
+; browser_mouse: WIN_MOUSE callback - presses click, the wheel scrolls
 browser_mouse:
+    cmp al, WM_MOUSE_WHEEL
+    je .wheel
     cmp al, WM_MOUSE_PRESS
     jne .ret
     call browser_handle_click
 .ret:
     ret
+.wheel:
+    imul ecx, ecx, BROWSER_WHEEL_STEP
+    jmp browser_scroll_by
 
 ; browser_key: WIN_KEY callback - typing edits the address bar
 browser_key:
     test al, al
-    jz .unused
+    jz .scroll_key
     cmp al, 0x0D
     je .enter
     cmp al, 0x08
@@ -135,8 +130,348 @@ browser_key:
 .used:
     stc
     ret
+.scroll_key:
+    ; Up/Down: a few lines, PgUp/PgDn: a viewport, Home/End: the ends
+    mov ecx, -BROWSER_WHEEL_STEP
+    cmp ah, SC_UP
+    je .scroll
+    mov ecx, BROWSER_WHEEL_STEP
+    cmp ah, SC_DOWN
+    je .scroll
+    mov ecx, [browser_vp_h]
+    sub ecx, 40
+    cmp ah, SC_PGDN
+    je .scroll
+    neg ecx
+    cmp ah, SC_PGUP
+    je .scroll
+    mov ecx, -0x1000000
+    cmp ah, SC_HOME
+    je .scroll
+    mov ecx, 0x1000000
+    cmp ah, SC_END
+    jne .unused
+.scroll:
+    call browser_scroll_by
+    jmp .used
 .unused:
     clc
+    ret
+
+; ------------------------------------------------------------------------------
+; browser_follow_link: RSI = href, ECX = its length (as written in the page).
+; Resolves it against browser_page_url (absolute, //host, /path, ?query or
+; relative, with ./ and ../) and navigates. "#fragment", javascript: and
+; mailto: links do nothing.
+; ------------------------------------------------------------------------------
+browser_follow_link:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    ; a clean copy: no whitespace, &amp; decoded
+    lea rdi, [browser_link_buf]
+    xor edx, edx
+.copy:
+    test ecx, ecx
+    jz .copied
+    mov al, [rsi]
+    inc rsi
+    dec ecx
+    cmp al, ' '
+    jbe .copy
+    cmp al, '&'
+    jne .store
+    cmp ecx, 4
+    jb .store
+    cmp dword [rsi], 'amp;'
+    jne .store
+    add rsi, 4
+    sub ecx, 4
+.store:
+    cmp edx, 400
+    jae .copy
+    mov [rdi + rdx], al
+    inc edx
+    jmp .copy
+.copied:
+    mov byte [rdi + rdx], 0
+    lea rsi, [browser_link_buf]
+    mov al, [rsi]
+    test al, al
+    jz .done
+    cmp al, '#'
+    je .done
+    lea rdi, [STR_LINK_JS]
+    call str_has_prefix
+    je .done
+    lea rdi, [STR_LINK_MAILTO]
+    call str_has_prefix
+    je .done
+    lea rdi, [url_http_prefix]
+    call str_has_prefix
+    je .absolute
+    lea rdi, [url_https_prefix]
+    call str_has_prefix
+    je .absolute
+    lea rdi, [STR_PROTO_AFS]
+    call str_has_prefix
+    je .absolute
+
+    ; relative to the page: RBX = base URL, RDI = output
+    lea rbx, [browser_page_url]
+    lea rdi, [browser_redirect_buf]
+    mov byte [rdi], 0
+    push rsi
+    mov rsi, rbx
+    push rdi
+    lea rdi, [STR_PROTO_AFS]
+    call str_has_prefix
+    pop rdi
+    pop rsi
+    jne .web
+    ; afs:// pages link to other files on the disk
+    push rsi
+    lea rsi, [STR_PROTO_AFS]
+    call fmt_str
+    pop rsi
+.afs_slash:
+    cmp byte [rsi], '/'
+    jne .afs_name
+    inc rsi
+    jmp .afs_slash
+.afs_name:
+    call fmt_str
+    jmp .built
+.web:
+    ; R8 = end of "scheme://", R9 = end of the origin (host and port)
+    xor r8d, r8d
+.find_scheme:
+    mov al, [rbx + r8]
+    test al, al
+    jz .done
+    inc r8
+    cmp al, ':'
+    jne .find_scheme
+    cmp word [rbx + r8], '//'
+    jne .done
+    lea r9, [r8 + 2]
+.find_origin_end:
+    mov al, [rbx + r9]
+    test al, al
+    jz .have_origin
+    cmp al, '/'
+    je .have_origin
+    cmp al, '?'
+    je .have_origin
+    cmp al, '#'
+    je .have_origin
+    inc r9
+    jmp .find_origin_end
+.have_origin:
+    cmp word [rsi], '//'
+    jne .not_scheme_relative
+    mov ecx, r8d                    ; "https:" + "//host/path"
+    call .base
+    jmp .append
+.not_scheme_relative:
+    cmp byte [rsi], '/'
+    jne .not_root
+    mov ecx, r9d                    ; origin + "/path"
+    call .base
+    jmp .append
+.not_root:
+    ; ECX = end of the base path (before '?' or '#')
+    mov ecx, r9d
+.find_path_end:
+    mov al, [rbx + rcx]
+    test al, al
+    jz .have_path_end
+    cmp al, '?'
+    je .have_path_end
+    cmp al, '#'
+    je .have_path_end
+    inc ecx
+    jmp .find_path_end
+.have_path_end:
+    cmp byte [rsi], '?'
+    je .query                       ; same path, new query
+    ; the base's directory: up to and including its last '/'
+.dir:
+    cmp ecx, r9d
+    jbe .no_dir
+    cmp byte [rbx + rcx - 1], '/'
+    je .query
+    dec ecx
+    jmp .dir
+.no_dir:
+    mov ecx, r9d
+    call .base
+    mov al, '/'
+    call fmt_char
+    jmp .append
+.query:
+    call .base
+.append:
+    call fmt_str
+    ; tidy "./" and "../" in the path
+    lea rsi, [browser_redirect_buf]
+    add rsi, r9
+    call browser_dot_segments
+.built:
+    lea rsi, [browser_redirect_buf]
+.absolute:
+    call strlen
+    cmp eax, BROWSER_URL_MAX - 1
+    jae .done
+    lea rdi, [browser_url_buf]
+    mov ecx, BROWSER_URL_MAX
+    call strlcpy
+    call browser_navigate
+.done:
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+; .base: append the first ECX bytes of the base URL (RBX) at RDI
+.base:
+    push rcx
+    push rsi
+    mov rsi, rbx
+    rep movsb
+    mov byte [rdi], 0
+    pop rsi
+    pop rcx
+    ret
+
+; ------------------------------------------------------------------------------
+; browser_dot_segments: RSI = the path part of a URL (in place). Removes "/./"
+; and folds "/x/../" away, as a browser does before sending the request.
+; ------------------------------------------------------------------------------
+browser_dot_segments:
+    push rax
+    push rcx
+    push rsi
+    push rdi
+    mov rcx, rsi                    ; RCX = start of the path
+.scan:
+    mov al, [rsi]
+    test al, al
+    jz .done
+    cmp al, '?'
+    je .done
+    cmp al, '#'
+    je .done
+    cmp al, '/'
+    jne .next
+    cmp byte [rsi + 1], '.'
+    jne .next
+    mov al, [rsi + 2]
+    cmp al, '/'
+    je .dot                         ; "/./"
+    test al, al
+    je .dot_end                     ; trailing "/."
+    cmp al, '.'
+    jne .next
+    mov al, [rsi + 3]
+    cmp al, '/'
+    je .dotdot                      ; "/../"
+    test al, al
+    jne .next
+    ; trailing "/..": becomes "/"
+    mov byte [rsi + 3], '/'
+    mov byte [rsi + 4], 0
+    jmp .dotdot
+.dot_end:
+    mov byte [rsi + 1], 0
+    jmp .done
+.dot:
+    lea rdi, [rsi + 1]              ; "/./x" -> "/x"
+    push rsi
+    lea rsi, [rsi + 3]
+    call .move_down
+    pop rsi
+    jmp .scan
+.dotdot:
+    ; back to the '/' before this one (not past the start)
+    mov rdi, rsi
+.back:
+    cmp rdi, rcx
+    jbe .at_start
+    dec rdi
+    cmp byte [rdi], '/'
+    jne .back
+.at_start:
+    push rsi
+    lea rsi, [rsi + 3]              ; from the '/' after ".."
+    call .move_down
+    pop rsi
+    mov rsi, rdi
+    jmp .scan
+.next:
+    inc rsi
+    jmp .scan
+.done:
+    pop rdi
+    pop rsi
+    pop rcx
+    pop rax
+    ret
+; .move_down: copy the string at RSI (with its NUL) to RDI
+.move_down:
+    push rax
+    push rsi
+    push rdi
+.md_byte:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    test al, al
+    jnz .md_byte
+    pop rdi
+    pop rsi
+    pop rax
+    ret
+
+; ------------------------------------------------------------------------------
+; browser_scroll_by: ECX = pixels (negative = up). Going down stops at the end
+; of the page (browser_render_html_page clamps once it has seen the end).
+; ------------------------------------------------------------------------------
+browser_scroll_by:
+    push rax
+    mov eax, [browser_scroll]
+    test ecx, ecx
+    js .apply
+    cmp byte [browser_more], 0      ; already showing the end
+    je .done
+.apply:
+    add eax, ecx
+    jns .set
+    xor eax, eax
+.set:
+    cmp eax, [browser_scroll]
+    je .done
+    mov [browser_scroll], eax
+    mov byte [gui_dirty], 1
+    mov byte [browser_log_text], 1  ; tests: log what is now at the top
+    mov dword [browser_log_len], 0
+    mov byte [browser_log_buf], 0
+    push rsi
+    lea rsi, [klog_browser_scroll]
+    call klog_dec
+    pop rsi
+.done:
+    pop rax
     ret
 
 ; browser_open: WIN_OPEN callback (window opened from the closed state)
@@ -206,7 +541,7 @@ browser_set_page:
     push rdi
     push rdx
     push rdi
-    lea rdi, [browser_page_buf]
+    lea rdi, [abs browser_page_buf]
     mov ecx, BROWSER_PAGE_BUF_MAX + 1
     call strlcpy
     pop rsi
@@ -253,6 +588,9 @@ browser_navigate:
 
     mov byte [browser_pending_nav], 0
     mov byte [browser_page_tls], 0
+    mov byte [browser_page_plain], 0
+    mov byte [browser_page_latin1], 0
+    mov dword [browser_scroll], 0
     mov dword [browser_link_count], 0
     lea rsi, [browser_url_buf]
     call strlen
@@ -312,12 +650,34 @@ browser_navigate:
     call fs_find_file
     test rax, rax
     jz .afs_missing
-    lea rdi, [browser_page_buf]
+    lea rdi, [abs browser_page_buf]
     mov ecx, BROWSER_PAGE_BUF_MAX
     call fs_read_file
-    lea rdi, [browser_page_buf]
+    lea rdi, [abs browser_page_buf]
     mov byte [rdi + rax], 0
+    ; a file is plain text unless its name ends in .htm or .html
+    mov byte [browser_page_plain], 1
     lea rsi, [browser_url_buf]
+    call strlen
+    cmp eax, 5
+    jb .afs_title
+    mov edx, [rsi + rax - 4]
+    or edx, 0x20202020
+    cmp edx, '.htm'
+    je .afs_html
+    cmp eax, 6
+    jb .afs_title
+    mov edx, [rsi + rax - 5]
+    or edx, 0x20202000              ; keep the '.'
+    cmp edx, '.htm'
+    jne .afs_title
+    mov dl, [rsi + rax - 1]
+    or dl, 0x20
+    cmp dl, 'l'
+    jne .afs_title
+.afs_html:
+    mov byte [browser_page_plain], 0
+.afs_title:
     lea rdi, [browser_page_title]
     mov ecx, 64
     call strlcpy
@@ -424,9 +784,10 @@ browser_fetch_http:
 .show:
     mov al, [url_https]
     mov [browser_page_tls], al
+    call browser_content_type
 
     ; Body = everything after the blank line that ends the headers
-    lea rsi, [http_resp_buf]
+    lea rsi, [abs http_resp_buf]
 .find_body:
     mov al, [rsi]
     test al, al
@@ -443,9 +804,9 @@ browser_fetch_http:
     add rsi, 2
     jmp .copy
 .no_headers:
-    lea rsi, [http_resp_buf]
+    lea rsi, [abs http_resp_buf]
 .copy:
-    lea rdi, [browser_page_buf]
+    lea rdi, [abs browser_page_buf]
     mov ecx, BROWSER_PAGE_BUF_MAX + 1
     call strlcpy
 
@@ -461,8 +822,9 @@ browser_fetch_http:
     lea rdi, [browser_page_title]
     mov ecx, 64
     call strlcpy
+    call browser_title_from_page    ; "CyberSurf - <title>" if the page has one
     lea rdi, [browser_scratch]
-    lea rsi, [http_resp_buf]
+    lea rsi, [abs http_resp_buf]
     xor ecx, ecx
 .status_line:
     mov al, [rsi + rcx]
@@ -529,6 +891,218 @@ browser_fetch_http:
     ret
 
 ; ------------------------------------------------------------------------------
+; browser_content_type: from the response's Content-Type header set
+; browser_page_plain (text/plain) and browser_page_latin1 (ISO-8859-x or
+; Windows-125x charset)
+; ------------------------------------------------------------------------------
+browser_content_type:
+    push rax
+    push rcx
+    push rsi
+    push rdi
+    lea rdi, [STR_HDR_CONTENT_TYPE]
+    call browser_header
+    jc .done
+    ; RSI = the value, lower-cased in browser_scratch
+    lea rdi, [STR_CT_PLAIN]
+    call browser_contains
+    jne .charset
+    mov byte [browser_page_plain], 1
+.charset:
+    lea rdi, [STR_CT_LATIN1]
+    call browser_contains
+    je .latin1
+    lea rdi, [STR_CT_CP1252]
+    call browser_contains
+    jne .done
+.latin1:
+    mov byte [browser_page_latin1], 1
+.done:
+    pop rdi
+    pop rsi
+    pop rcx
+    pop rax
+    ret
+
+; ------------------------------------------------------------------------------
+; browser_header: RDI = header name with ':' (lower case) -> RSI = its value in
+; browser_scratch, lower-cased; CF=1 if the response has no such header
+; ------------------------------------------------------------------------------
+browser_header:
+    push rax
+    push rcx
+    push rdx
+    push rdi
+    lea rsi, [abs http_resp_buf]
+.line:
+    mov al, [rsi]
+    test al, al
+    jz .none
+    inc rsi
+    cmp al, 0x0A
+    jne .line
+    cmp byte [rsi], 0x0D            ; blank line: end of the headers
+    je .none
+    cmp byte [rsi], 0x0A
+    je .none
+    xor ecx, ecx
+.name:
+    mov al, [rdi + rcx]
+    test al, al
+    jz .found
+    mov dl, [rsi + rcx]
+    or dl, 0x20
+    cmp dl, al
+    jne .line
+    inc ecx
+    jmp .name
+.found:
+    add rsi, rcx
+.space:
+    cmp byte [rsi], ' '
+    jne .value
+    inc rsi
+    jmp .space
+.value:
+    lea rdi, [browser_scratch]
+    xor ecx, ecx
+.value_char:
+    mov al, [rsi + rcx]
+    cmp al, 0x0D
+    je .value_end
+    cmp al, 0x0A
+    je .value_end
+    test al, al
+    jz .value_end
+    cmp ecx, 150
+    jae .value_end
+    cmp al, 'A'
+    jb .lower
+    cmp al, 'Z'
+    ja .lower
+    or al, 0x20
+.lower:
+    mov [rdi + rcx], al
+    inc ecx
+    jmp .value_char
+.value_end:
+    mov byte [rdi + rcx], 0
+    mov rsi, rdi
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rax
+    clc
+    ret
+.none:
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rax
+    stc
+    ret
+
+; browser_contains: ZF=1 if the string at RSI contains the string at RDI
+browser_contains:
+    push rsi
+.try:
+    cmp byte [rsi], 0
+    je .no
+    call str_has_prefix
+    je .yes
+    inc rsi
+    jmp .try
+.no:
+    pop rsi
+    test rsp, rsp                   ; ZF=0
+    ret
+.yes:
+    pop rsi
+    ret
+
+; ------------------------------------------------------------------------------
+; browser_title_from_page: if browser_page_buf has a <title>, make the window
+; title "CyberSurf - <title>" (spaces collapsed, cut to fit)
+; ------------------------------------------------------------------------------
+browser_title_from_page:
+    push rax
+    push rcx
+    push rsi
+    push rdi
+    lea rsi, [abs browser_page_buf]
+.find:
+    mov al, [rsi]
+    test al, al
+    jz .done
+    inc rsi
+    cmp al, '<'
+    jne .find
+    mov eax, [rsi]
+    or eax, 0x20202020
+    cmp eax, 'titl'
+    jne .find
+    mov al, [rsi + 4]
+    or al, 0x20
+    cmp al, 'e'
+    jne .find
+    mov al, [rsi + 5]
+    cmp al, '>'
+    je .open
+    cmp al, ' '
+    jne .find
+.open:
+    mov al, [rsi]
+    test al, al
+    jz .done
+    inc rsi
+    cmp al, '>'
+    jne .open
+    ; the text, up to '<'
+    lea rdi, [browser_page_title]
+    push rsi
+    lea rsi, [STR_TITLE_PREFIX]
+    call fmt_str
+    pop rsi
+    lea rcx, [browser_page_title + 63]
+    mov ah, 1                       ; 1 = at a space (drop leading ones)
+.char:
+    mov al, [rsi]
+    test al, al
+    jz .end
+    cmp al, '<'
+    je .end
+    inc rsi
+    cmp al, ' '
+    ja .visible
+    test ah, ah
+    jnz .char
+    mov ah, 1
+    mov al, ' '
+    jmp .put
+.visible:
+    cmp al, 0x7E
+    ja .char                        ; the font has no glyphs past '~'
+    xor ah, ah
+.put:
+    cmp rdi, rcx
+    jae .end
+    mov [rdi], al
+    inc rdi
+    jmp .char
+.end:
+    cmp byte [rdi - 1], ' '
+    jne .terminate
+    dec rdi
+.terminate:
+    mov byte [rdi], 0
+.done:
+    pop rdi
+    pop rsi
+    pop rcx
+    pop rax
+    ret
+
+; ------------------------------------------------------------------------------
 ; browser_redirect_target: if http_resp_buf is a 3xx response with a Location
 ; header, put the absolute target URL in browser_url_buf. A target starting
 ; with '/' is relative to the request (url_https, url_host, url_port).
@@ -541,7 +1115,7 @@ browser_redirect_target:
     push rsi
     push rdi
 
-    lea rsi, [http_resp_buf]
+    lea rsi, [abs http_resp_buf]
     cmp dword [rsi], 'HTTP'
     jne .no
     cmp byte [rsi + 9], '3'         ; "HTTP/1.x 3xx"
@@ -666,7 +1240,7 @@ browser_build_status_page:
     push rdx
     push rsi
     push rdi
-    lea rdi, [browser_page_buf]
+    lea rdi, [abs browser_page_buf]
     lea rsi, [TELEM_HEAD]
     call fmt_str
     lea rsi, [TELEM_CPU]
@@ -887,12 +1461,22 @@ browser_draw_window:
     mov ebx, -1
     call gfx_print_string
 
-    ; URL Text
+    ; URL Text: the end of it when it is longer than the box
+    mov eax, [br_ww]
+    sub eax, BROWSER_URL_X + 68
+    shr eax, 3                      ; characters that fit (one left for the cursor)
+    mov ecx, [browser_url_len]
+    xor r9d, r9d                    ; R9 = characters hidden on the left
+    sub ecx, eax
+    jle .url_fits
+    mov r9d, ecx
+.url_fits:
     mov ecx, [br_wx]
-    add ecx, 172
+    add ecx, BROWSER_URL_X
     mov edx, [br_wy]
     add edx, 37
     lea rsi, [browser_url_buf]
+    add rsi, r9
     mov eax, THEME_TEXT
     mov ebx, -1
     call gfx_print_string
@@ -901,8 +1485,9 @@ browser_draw_window:
     cmp byte [browser_url_focused], 1
     jne .skip_url_cursor
     mov ecx, [br_wx]
-    add ecx, 172
+    add ecx, BROWSER_URL_X
     mov eax, [browser_url_len]
+    sub eax, r9d
     shl eax, 3                  ; len * 8
     add ecx, eax
     mov edx, [br_wy]
@@ -1124,684 +1709,7 @@ browser_draw_window:
     pop rax
     ret
 
-; ------------------------------------------------------------------------------
-; browser_render_html_page: Tokenizes and renders HTML from browser_page_buf
-; ------------------------------------------------------------------------------
-browser_render_html_page:
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-
-    ; Viewport boundaries
-    mov eax, [br_wx]
-    add eax, 6
-    mov [browser_vp_x], eax
-
-    mov eax, [br_wy]
-    add eax, 80
-    mov [browser_vp_y], eax
-
-    mov eax, [br_ww]
-    sub eax, 12
-    mov [browser_vp_w], eax
-
-    mov eax, [br_wh]
-    sub eax, 104
-    mov [browser_vp_h], eax
-
-    ; Initial parser state
-    mov eax, [browser_vp_x]
-    add eax, 20
-    mov [browser_cur_x], eax
-
-    mov eax, [browser_vp_y]
-    add eax, 16
-    mov [browser_cur_y], eax
-
-    mov dword [browser_text_color], 0x00CBD5E1 ; Light slate grey
-    mov dword [browser_link_count], 0
-    mov byte [browser_in_link], 0
-
-    lea r12, [browser_page_buf]
-
-.parse_loop:
-    mov al, [r12]
-    test al, al
-    jz .render_complete
-    inc r12
-
-    ; Check for Tag open '<'
-    cmp al, '<'
-    je .handle_tag
-
-    ; Check for Newline '\n'
-    cmp al, 0x0A
-    je .handle_newline
-
-    ; Check for Carriage Return '\r'
-    cmp al, 0x0D
-    je .parse_loop
-
-    cmp al, '&'
-    je .entity
-
-    ; Regular Printable ASCII Character (32 .. 126)
-    cmp al, 32
-    jb .parse_loop
-    cmp al, 126
-    ja .parse_loop
-
-.printable:
-    ; Line wrap check: cur_x + 8 > right_margin
-    mov ecx, [browser_cur_x]
-    add ecx, 8
-    mov edx, [browser_vp_x]
-    add edx, [browser_vp_w]
-    sub edx, 24
-    cmp ecx, edx
-    jle .draw_char
-
-    ; Wrap line!
-    mov ecx, [browser_vp_x]
-    add ecx, 20
-    mov [browser_cur_x], ecx
-    add dword [browser_cur_y], 14
-
-.draw_char:
-    ; Vertical bound check: cur_y + 10 > bottom_margin
-    mov edx, [browser_cur_y]
-    add edx, 10
-    mov ebx, [browser_vp_y]
-    add ebx, [browser_vp_h]
-    sub ebx, 10
-    cmp edx, ebx
-    jge .render_complete
-
-    ; Render single glyph (AL already holds ASCII character)
-    call browser_log_char
-    mov ecx, [browser_cur_x]      ; ECX = X
-    mov edx, [browser_cur_y]      ; EDX = Y
-    mov esi, [browser_text_color] ; ESI = FG Color
-    mov r8d, -1                   ; R8D = Transparent background
-    call gfx_draw_char
-
-    add dword [browser_cur_x], 8
-    jmp .parse_loop
-
-.entity:
-    ; "&name;" from browser_entities becomes its character; anything else
-    ; is drawn as a plain '&'
-    lea rsi, [browser_entities]
-.ent_next:
-    movzx ecx, byte [rsi]           ; length of the name, including ';'
-    test ecx, ecx
-    jz .ent_unknown
-    inc rsi
-    xor edx, edx
-.ent_cmp:
-    mov bl, [r12 + rdx]
-    cmp bl, [rsi + rdx]
-    jne .ent_skip
-    inc edx
-    cmp edx, ecx
-    jb .ent_cmp
-    mov al, [rsi + rcx]             ; the character it stands for
-    add r12, rcx
-    jmp .printable
-.ent_skip:
-    lea rsi, [rsi + rcx + 1]
-    jmp .ent_next
-.ent_unknown:
-    mov al, '&'
-    jmp .printable
-
-.handle_newline:
-    mov ecx, [browser_vp_x]
-    add ecx, 20
-    mov [browser_cur_x], ecx
-    add dword [browser_cur_y], 14
-    jmp .parse_loop
-
-.handle_tag:
-    ; <!-- comment --> is skipped whole (it may contain '>' and text)
-    cmp byte [r12], '!'
-    jne .tag_name
-    cmp word [r12 + 1], '--'
-    jne .tag_name
-.skip_comment:
-    mov al, [r12]
-    test al, al
-    jz .render_complete
-    inc r12
-    cmp al, '-'
-    jne .skip_comment
-    cmp word [r12], '->'
-    jne .skip_comment
-    add r12, 2
-    jmp .parse_loop
-
-.tag_name:
-    ; Read tag name until space or '>' (cleared first: "a < b" must not
-    ; re-run the previous tag)
-    mov byte [browser_href_set], 0
-    lea rdi, [browser_temp_href]
-    mov qword [rdi], 0
-    mov qword [rdi + 8], 0
-    xor ecx, ecx
-.read_tag_name:
-    mov al, [r12]
-    test al, al
-    jz .render_complete
-    inc r12
-    cmp al, '>'
-    je .eval_tag
-    cmp al, ' '
-    je .skip_tag_attrs
-    ; Convert to lowercase
-    cmp al, 'A'
-    jb .store_tag_char
-    cmp al, 'Z'
-    ja .store_tag_char
-    add al, 32
-.store_tag_char:
-    cmp ecx, 15
-    jae .read_tag_name
-    mov [rdi + rcx], al
-    inc ecx
-    mov byte [rdi + rcx], 0
-    jmp .read_tag_name
-
-.skip_tag_attrs:
-    ; If tag is 'a', scan for href="..."
-    cmp byte [browser_temp_href], 'a'
-    jne .drain_tag
-    ; Extract href target
-.scan_href:
-    mov al, [r12]
-    test al, al
-    jz .render_complete
-    inc r12
-    cmp al, '>'
-    je .eval_tag
-    cmp al, 'h'
-    jne .scan_href
-    cmp byte [r12], 'r'
-    jne .scan_href
-    cmp byte [r12 + 1], 'e'
-    jne .scan_href
-    cmp byte [r12 + 2], 'f'
-    jne .scan_href
-    add r12, 3
-    ; Find quote
-.find_q:
-    mov al, [r12]
-    test al, al
-    jz .render_complete
-    inc r12
-    cmp al, '>'
-    je .eval_tag
-    cmp al, '"'
-    je .copy_href
-    cmp al, "'"
-    je .copy_href
-    jmp .find_q
-
-.copy_href:
-    ; Copy URL into link table slot if room
-    mov edx, [browser_link_count]
-    cmp edx, BROWSER_MAX_LINKS
-    jae .drain_tag
-    imul edx, BROWSER_LINK_SIZE
-    lea rdi, [browser_links + 16]
-    add rdi, rdx
-    xor ecx, ecx
-.href_loop:
-    mov al, [r12]
-    test al, al
-    jz .eval_tag
-    inc r12
-    cmp al, '"'
-    je .href_done
-    cmp al, "'"
-    je .href_done
-    cmp ecx, 62
-    jae .href_loop
-    mov [rdi + rcx], al
-    inc ecx
-    mov byte [rdi + rcx], 0
-    jmp .href_loop
-.href_done:
-    mov byte [browser_href_set], 1
-    jmp .drain_tag
-
-.drain_tag:
-    mov al, [r12]
-    test al, al
-    jz .render_complete
-    inc r12
-    cmp al, '>'
-    jne .drain_tag
-
-.eval_tag:
-    ; Check tag in browser_temp_href
-    ; 0. <script>, <style> and <title> hold no visible text: skip to the end tag
-    lea rsi, [browser_temp_href]
-    lea rdi, [STR_TAG_SCRIPT]
-    call strcmp
-    je .skip_raw
-    lea rdi, [STR_TAG_STYLE]
-    call strcmp
-    je .skip_raw
-    lea rdi, [STR_TAG_TITLE]
-    call strcmp
-    jne .chk_head
-.skip_raw:
-    ; RDI = tag name: find "</name" in any case, then its '>'
-    mov al, [r12]
-    test al, al
-    jz .render_complete
-    inc r12
-    cmp al, '<'
-    jne .skip_raw
-    cmp byte [r12], '/'
-    jne .skip_raw
-    xor ecx, ecx
-.raw_cmp:
-    mov al, [rdi + rcx]
-    test al, al
-    jz .drain_end_tag
-    mov dl, [r12 + rcx + 1]
-    or dl, 0x20                     ; lower case
-    cmp dl, al
-    jne .skip_raw
-    inc ecx
-    jmp .raw_cmp
-
-.chk_head:
-    ; Skip <head>...</head>. When "</head>" is not in the buffer, parse the
-    ; head normally instead of rendering nothing.
-    cmp dword [browser_temp_href], 0x64616568 ; "head" (exactly: not "header")
-    jne .chk_div
-    cmp byte [browser_temp_href + 4], 0
-    jne .chk_div
-    mov r13, r12                    ; just after <head>
-.skip_head:
-    mov al, [r12]
-    test al, al
-    jz .no_head_end
-    inc r12
-    cmp al, '<'
-    jne .skip_head
-    cmp byte [r12], '/'
-    jne .skip_head
-    cmp dword [r12 + 1], 0x64616568 ; "/head"
-    jne .skip_head
-    cmp byte [r12 + 5], '>'
-    jne .skip_head
-.drain_end_tag:
-    mov al, [r12]
-    test al, al
-    jz .render_complete
-    inc r12
-    cmp al, '>'
-    jne .drain_end_tag
-    jmp .parse_loop
-.no_head_end:
-    mov r12, r13
-    jmp .parse_loop
-
-.chk_div:
-    ; <div> and </div> start a new line unless already at the start of one
-    lea rsi, [browser_temp_href]
-    lea rdi, [STR_TAG_DIV]
-    call strcmp
-    je .block_break
-    lea rdi, [STR_TAG_DIV_END]
-    call strcmp
-    jne .chk_h1
-.block_break:
-    mov eax, [browser_vp_x]
-    add eax, 20
-    cmp [browser_cur_x], eax
-    jle .parse_loop
-    mov [browser_cur_x], eax
-    add dword [browser_cur_y], 14
-    jmp .parse_loop
-
-.chk_h1:
-    ; 1. "h1"
-    cmp word [browser_temp_href], 0x3168 ; "h1"
-    jne .chk_h1_end
-    mov eax, [browser_vp_x]
-    add eax, 20
-    mov [browser_cur_x], eax
-    add dword [browser_cur_y], 8
-    mov dword [browser_text_color], 0x0000F0FF ; Cyan
-    jmp .parse_loop
-
-.chk_h1_end:
-    cmp byte [browser_temp_href], '/'
-    jne .chk_h2
-    cmp word [browser_temp_href + 1], 0x3168 ; "/h1"
-    jne .chk_h2_end
-    ; Draw cyan underline across heading
-    mov ecx, [browser_vp_x]
-    add ecx, 20
-    mov edx, [browser_cur_y]
-    add edx, 11
-    mov esi, [browser_cur_x]
-    sub esi, ecx
-    mov r8d, 1
-    mov eax, 0x0000F0FF
-    call gfx_fill_rect
-
-    mov eax, [browser_vp_x]
-    add eax, 20
-    mov [browser_cur_x], eax
-    add dword [browser_cur_y], 18
-    mov dword [browser_text_color], 0x00CBD5E1
-    jmp .parse_loop
-
-.chk_h2:
-    cmp word [browser_temp_href], 0x3268 ; "h2"
-    jne .chk_h2_end
-    mov eax, [browser_vp_x]
-    add eax, 20
-    mov [browser_cur_x], eax
-    add dword [browser_cur_y], 6
-    mov dword [browser_text_color], 0x00F59E0B ; Amber
-    jmp .parse_loop
-
-.chk_h2_end:
-    cmp byte [browser_temp_href], '/'
-    jne .chk_h3
-    cmp word [browser_temp_href + 1], 0x3268 ; "/h2"
-    jne .chk_h3_end
-    mov eax, [browser_vp_x]
-    add eax, 20
-    mov [browser_cur_x], eax
-    add dword [browser_cur_y], 16
-    mov dword [browser_text_color], 0x00CBD5E1
-    jmp .parse_loop
-
-.chk_h3:
-    cmp word [browser_temp_href], 0x3368 ; "h3"
-    jne .chk_h3_end
-    mov eax, [browser_vp_x]
-    add eax, 20
-    mov [browser_cur_x], eax
-    add dword [browser_cur_y], 4
-    mov dword [browser_text_color], 0x0034D399 ; Emerald
-    jmp .parse_loop
-
-.chk_h3_end:
-    cmp byte [browser_temp_href], '/'
-    jne .chk_p
-    cmp word [browser_temp_href + 1], 0x3368 ; "/h3"
-    jne .chk_p
-    mov eax, [browser_vp_x]
-    add eax, 20
-    mov [browser_cur_x], eax
-    add dword [browser_cur_y], 14
-    mov dword [browser_text_color], 0x00CBD5E1
-    jmp .parse_loop
-
-.chk_p:
-    cmp word [browser_temp_href], 0x0070 ; "p"
-    jne .chk_p_end
-    mov eax, [browser_vp_x]
-    add eax, 20
-    mov [browser_cur_x], eax
-    add dword [browser_cur_y], 4
-    mov dword [browser_text_color], 0x00E2E8F0
-    jmp .parse_loop
-
-.chk_p_end:
-    cmp word [browser_temp_href], 0x702F ; "/p"
-    jne .chk_hr
-    mov eax, [browser_vp_x]
-    add eax, 20
-    mov [browser_cur_x], eax
-    add dword [browser_cur_y], 16
-    mov dword [browser_text_color], 0x00CBD5E1
-    jmp .parse_loop
-
-.chk_hr:
-    cmp word [browser_temp_href], 0x7268 ; "hr"
-    jne .chk_br
-    add dword [browser_cur_y], 8
-    mov ecx, [browser_vp_x]
-    add ecx, 20
-    mov edx, [browser_cur_y]
-    mov esi, [browser_vp_w]
-    sub esi, 40
-    mov r8d, 1
-    mov eax, 0x001E293B
-    call gfx_fill_rect
-
-    mov eax, [browser_vp_x]
-    add eax, 20
-    mov [browser_cur_x], eax
-    add dword [browser_cur_y], 10
-    jmp .parse_loop
-
-.chk_br:
-    cmp word [browser_temp_href], 0x7262 ; "br"
-    jne .chk_li
-    mov eax, [browser_vp_x]
-    add eax, 20
-    mov [browser_cur_x], eax
-    add dword [browser_cur_y], 14
-    jmp .parse_loop
-
-.chk_li:
-    cmp word [browser_temp_href], 0x696C ; "li" (exactly: not "link")
-    jne .chk_li_end
-    cmp byte [browser_temp_href + 2], 0
-    jne .chk_li_end
-    mov eax, [browser_vp_x]
-    add eax, 28
-    mov [browser_cur_x], eax
-
-    ; Draw cyan bullet dot
-    mov ecx, [browser_cur_x]
-    mov edx, [browser_cur_y]
-    add edx, 3
-    mov esi, 4
-    mov r8d, 4
-    mov eax, 0x0038BDF8
-    call gfx_fill_rect
-    add dword [browser_cur_x], 10
-    mov dword [browser_text_color], 0x00E2E8F0
-    jmp .parse_loop
-
-.chk_li_end:
-    cmp dword [browser_temp_href], 0x00696C2F ; "/li" (exactly: not "/label")
-    jne .chk_b
-    mov eax, [browser_vp_x]
-    add eax, 20
-    mov [browser_cur_x], eax
-    add dword [browser_cur_y], 14
-    mov dword [browser_text_color], 0x00CBD5E1
-    jmp .parse_loop
-
-.chk_b:
-    cmp word [browser_temp_href], 0x0062 ; "b"
-    jne .chk_b_end
-    mov dword [browser_text_color], 0x00FFFFFF ; Bright white
-    jmp .parse_loop
-
-.chk_b_end:
-    cmp word [browser_temp_href], 0x622F ; "/b"
-    jne .chk_code
-    mov dword [browser_text_color], 0x00CBD5E1
-    jmp .parse_loop
-
-.chk_code:
-    cmp dword [browser_temp_href], 0x65646F63 ; "code"
-    jne .chk_code_end
-    mov eax, [browser_vp_x]
-    add eax, 28
-    mov [browser_cur_x], eax
-    mov dword [browser_text_color], 0x0010B981 ; Emerald green code
-    jmp .parse_loop
-
-.chk_code_end:
-    cmp byte [browser_temp_href], '/'
-    jne .chk_a
-    cmp dword [browser_temp_href + 1], 0x65646F63 ; "/code"
-    jne .chk_a
-    mov eax, [browser_vp_x]
-    add eax, 20
-    mov [browser_cur_x], eax
-    add dword [browser_cur_y], 14
-    mov dword [browser_text_color], 0x00CBD5E1
-    jmp .parse_loop
-
-.chk_a:
-    cmp word [browser_temp_href], 0x0061 ; "a"
-    jne .chk_a_end
-    ; Starting hyperlink. An <a> without href must not inherit the URL a
-    ; previous page left in this link slot.
-    cmp byte [browser_href_set], 0
-    jne .have_href
-    mov edx, [browser_link_count]
-    cmp edx, BROWSER_MAX_LINKS
-    jae .have_href
-    imul edx, BROWSER_LINK_SIZE
-    lea rdi, [browser_links + 16]
-    mov byte [rdi + rdx], 0
-.have_href:
-    mov byte [browser_in_link], 1
-    mov eax, [browser_cur_x]
-    mov [browser_link_x1], eax
-    mov eax, [browser_cur_y]
-    mov [browser_link_y1], eax
-    mov dword [browser_text_color], 0x0038BDF8 ; Sky blue
-    jmp .parse_loop
-
-.chk_a_end:
-    cmp word [browser_temp_href], 0x612F ; "/a"
-    jne .parse_loop
-    ; Completed hyperlink
-    cmp byte [browser_in_link], 1
-    jne .parse_loop
-    mov byte [browser_in_link], 0
-
-    ; Draw underline under link
-    mov ecx, [browser_link_x1]
-    mov edx, [browser_cur_y]
-    add edx, 9
-    mov esi, [browser_cur_x]
-    sub esi, ecx
-    mov r8d, 1
-    mov eax, 0x0038BDF8
-    call gfx_fill_rect
-
-    ; Save link bounding box to browser_links table
-    mov edx, [browser_link_count]
-    cmp edx, BROWSER_MAX_LINKS
-    jae .reset_link_color
-
-    imul edx, BROWSER_LINK_SIZE
-    lea rdi, [browser_links]
-    add rdi, rdx
-    mov eax, [browser_link_x1]
-    mov [rdi + 0], eax
-    mov eax, [browser_link_y1]
-    mov [rdi + 4], eax
-    mov eax, [browser_cur_x]
-    mov [rdi + 8], eax
-    mov eax, [browser_cur_y]
-    add eax, 10
-    mov [rdi + 12], eax
-
-    inc dword [browser_link_count]
-
-.reset_link_color:
-    mov dword [browser_text_color], 0x00CBD5E1
-    jmp .parse_loop
-
-.render_complete:
-    cmp byte [browser_log_text], 0
-    je .restore
-    mov byte [browser_log_text], 0
-    lea rsi, [klog_browser_text]    ; "[klog] browser text: <first visible text>"
-    lea rdi, [browser_log_buf]
-    call klog2
-.restore:
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    ret
-
-; ------------------------------------------------------------------------------
-; browser_log_char: AL = glyph about to be drawn at browser_cur_y. While
-; browser_log_text is set, collects the page's first visible text for the
-; "[klog] browser text:" line: runs of spaces and line changes become one space.
-; ------------------------------------------------------------------------------
-browser_log_char:
-    cmp byte [browser_log_text], 0
-    je .ret
-    push rcx
-    push rdx
-    push rdi
-    lea rdi, [browser_log_buf]
-    mov ecx, [browser_log_len]
-    cmp ecx, BROWSER_LOG_MAX
-    jae .done
-    test ecx, ecx
-    jz .check_space
-    cmp byte [rdi + rcx - 1], ' '
-    je .check_space
-    mov edx, [browser_cur_y]
-    cmp edx, [browser_log_y]
-    je .check_space
-    mov byte [rdi + rcx], ' '       ; new line
-    inc ecx
-    cmp al, ' '
-    je .terminate                   ; that space stands in for this one
-    jmp .store
-.check_space:
-    cmp al, ' '                     ; no leading or repeated spaces
-    jne .store
-    test ecx, ecx
-    jz .done
-    cmp byte [rdi + rcx - 1], ' '
-    je .done
-.store:
-    mov [rdi + rcx], al
-    inc ecx
-.terminate:
-    mov byte [rdi + rcx], 0
-    mov [browser_log_len], ecx
-    mov edx, [browser_cur_y]
-    mov [browser_log_y], edx
-.done:
-    pop rdi
-    pop rdx
-    pop rcx
-.ret:
-    ret
-
+; (the HTML renderer is in browser_html.asm)
 ; ------------------------------------------------------------------------------
 ; browser_handle_click: a click inside the browser window at [mouse_x],[mouse_y]
 ; ------------------------------------------------------------------------------
@@ -2023,12 +1931,10 @@ browser_handle_click:
     cmp edx, [rdi + 12]
     jg .next_link
 
-    ; Link matched! Copy target URL and navigate!
-    mov rsi, rdi
-    add rsi, 16                 ; Target URL string
-    lea rdi, [browser_url_buf]
-    call strcpy
-    call browser_navigate
+    ; Link matched: resolve its href against this page and go there
+    mov rsi, [rdi + LINK_HREF]
+    mov ecx, [rdi + LINK_HREF_LEN]
+    call browser_follow_link
     mov rax, 1
     jmp .browser_click_done
 
@@ -2059,23 +1965,13 @@ browser_label:          db "Browser", 0
 klog_browser:           db "browser: ", 0
 klog_browser_status:    db "browser status: ", 0
 klog_browser_text:      db "browser text: ", 0
-STR_TAG_SCRIPT:         db "script", 0
-STR_TAG_STYLE:          db "style", 0
-STR_TAG_TITLE:          db "title", 0
-STR_TAG_DIV:            db "div", 0
-STR_TAG_DIV_END:        db "/div", 0
-
-; HTML entities the renderer decodes: length of the name (with ';'), the
-; name, the character it stands for. A zero length ends the table.
-browser_entities:
-    db 4, "amp;", '&'
-    db 3, "lt;", '<'
-    db 3, "gt;", '>'
-    db 5, "quot;", '"'
-    db 5, "apos;", "'"
-    db 4, "#39;", "'"
-    db 5, "nbsp;", ' '
-    db 0
+klog_browser_scroll:    db "browser scroll: ", 0
+STR_LINK_JS:            db "javascript:", 0
+STR_LINK_MAILTO:        db "mailto:", 0
+STR_HDR_CONTENT_TYPE:   db "content-type:", 0
+STR_CT_PLAIN:           db "text/plain", 0
+STR_CT_LATIN1:          db "iso-8859", 0
+STR_CT_CP1252:          db "windows-125", 0
 STR_URL_HOME:           db "http://antigravity.os/", 0
 STR_URL_HOME_LEN        equ ($ - STR_URL_HOME - 1)
 STR_URL_HOME_NOSLASH:   db "http://antigravity.os", 0

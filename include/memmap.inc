@@ -15,6 +15,8 @@
 ;   0x00100000  kernel .bss     zeroed by kernel_entry, up to 1 MB
 ;   0x00200000  kernel stack    grows down from KERNEL_STACK_TOP (1 MB)
 ;   0x00300000  NIC DMA         RTL8139 RX ring + TX buffers
+;   0x00400000  HTTP response   the last HTTP(S) response (1 MB)
+;   0x00500000  browser page    the page the browser shows (1 MB)
 ;   0x01000000  GUI buffers     back buffer, wallpaper cache, canvas
 ; ==============================================================================
 
@@ -48,6 +50,13 @@ KERNEL_STACK_TOP        equ 0x00300000  ; stack occupies 0x200000 - 0x2FFFFF
 ; --- Device buffers -----------------------------------------------------------
 NIC_RX_RING_ADDR        equ 0x00300000  ; 8 KB + 16 + 1500 (WRAP mode overflow)
 NIC_TX_BUF_ADDR         equ 0x00304000  ; 4 x 2 KB transmit buffers
+
+; --- Web ----------------------------------------------------------------------
+; Too big for .bss; use them as [abs HTTP_RESP_ADDR]
+HTTP_RESP_ADDR          equ 0x00400000  ; response of the last GET (headers + body)
+HTTP_RESP_SIZE          equ 0x00100000
+BROWSER_PAGE_ADDR       equ 0x00500000  ; the browser's current page (HTML or text)
+BROWSER_PAGE_SIZE       equ 0x00100000
 
 ; --- GUI (each 1024 x 768 x 4 bytes = 3 MB) -----------------------------------
 GUI_BACKBUFFER_ADDR     equ 0x01000000  ; everything is composed here, then copied to the LFB

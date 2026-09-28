@@ -344,7 +344,7 @@ cmd_curl:
     call con_puts_color
 .body:
     mov bl, COLOR_LIGHT_CYAN
-    lea rsi, [http_resp_buf]
+    lea rsi, [abs http_resp_buf]
     call con_puts_color
     call con_newline
     ret

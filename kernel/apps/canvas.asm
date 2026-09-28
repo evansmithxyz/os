@@ -392,6 +392,8 @@ canvas_draw:
 ; canvas_mouse: WIN_MOUSE callback (AL = event, ECX,EDX = client coords)
 ; ------------------------------------------------------------------------------
 canvas_mouse:
+    cmp al, WM_MOUSE_WHEEL          ; nothing to scroll
+    je .done
     cmp al, WM_MOUSE_RELEASE
     je .release
     cmp edx, CANVAS_TOOLBAR_H

@@ -32,6 +32,19 @@ BIG_HTML = (
 # No "</head>" at all: the page must still render instead of coming up blank
 NO_HEAD_END_HTML = "<html><head><title>Broken</title><body><p>Still visible</p></body></html>"
 
+# Layout features, then enough lines to scroll (tests/test_gui.py BrowserLayoutTest)
+FEATURES_HTML = (
+    "<html><head><title>Feature\n   test</title></head><body>\n"
+    "<p>Collapsed\n   white    space</p>\n"
+    "<p>It&#x27;s &copy 2026 &mdash; caf&eacute; “quoted” ’ &#8364;5</p>\n"
+    "<table><tr><td><center>1.</center></td><td><a href='sub/'>Row title</a></td></tr></table>\n"
+    + "".join(f"<p>Line {n}</p>\n" for n in range(1, 81))
+    + "<p>The end</p></body></html>"
+)
+
+# A relative link at the top left of the page
+LINKS_HTML = "<html><body><a href='sub'>Go to sub</a> <a href='features.html'>Features</a></body></html>"
+
 
 class HostWebServer:
     """http.server on 127.0.0.1 (reachable from the guest as 10.0.2.2:<port>)."""
@@ -42,6 +55,8 @@ class HostWebServer:
         (self.root / "hello.html").write_text(HELLO_HTML)
         (self.root / "big.html").write_text(BIG_HTML)
         (self.root / "nohead.html").write_text(NO_HEAD_END_HTML)
+        (self.root / "features.html").write_text(FEATURES_HTML, encoding="utf-8")
+        (self.root / "links.html").write_text(LINKS_HTML)
         # GET /sub answers "301 Location: /sub/" (http.server adds the slash)
         (self.root / "sub").mkdir(exist_ok=True)
         (self.root / "sub" / "index.html").write_text("<html><body><p>Sub page</p></body></html>")

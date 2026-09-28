@@ -283,6 +283,15 @@ class Machine:
         self.hmp("mouse_button 0")
         time.sleep(0.25)
 
+    def wheel(self, notches: int) -> None:
+        """Turn the mouse wheel where the pointer is (positive = down, towards
+        the user). HMP's dz is the other way round: +1 is wheel up."""
+        step = -1 if notches > 0 else 1
+        for _ in range(abs(notches)):
+            self.hmp(f"mouse_move 0 0 {step}")
+            time.sleep(0.05)
+        time.sleep(0.2)
+
     def drag(self, x1: int, y1: int, x2: int, y2: int, steps: int = 6) -> None:
         self.mouse_down(x1, y1)
         for i in range(1, steps + 1):
