@@ -21,6 +21,17 @@ suite and the reviewers (human or not) assume them.
     `WIN_TICK` (called through the `wm_call_*` trampolines in `gui/wm.asm`)
 - Every routine starts with a comment block saying what it does, its inputs
   and its outputs.
+- **XMM registers and the x87 stack are scratch** everywhere: nothing keeps
+  a value in them across a call, and interrupt handlers never touch them
+  (`fpu_init` turns them on; the JavaScript engine uses them for doubles).
+- **JavaScript** (`kernel/js/`) has two more rules:
+  - opcode handlers in `vm.asm` keep the interpreter's registers (RSI = pc,
+    R12 = value stack, R13 = frame base, R14 = environment, R15 = function,
+    RBP = opcode table) and store R12 in `vm_sp` before calling anything
+    that can run JavaScript (`VMCALL`);
+  - native functions take RDI = arguments, ECX = count, RDX = `this` and
+    return the result in RAX, preserving everything else. Errors call
+    `js_throw`, which does not return.
 
 ## Sections and memory
 
@@ -68,6 +79,10 @@ Routines are prefixed with their module: `con_`, `key_`, `serial_`, `vga_`,
 `sha256_`/`sha512_`/`hmac_`/`hash_`, `chacha20_`/`poly1305_`/`aead_`,
 `fe_`/`x25519_`, `bn_`/`mont_`, `rsa_`/`sig_`, `ec_`/`ecdsa_`, `rand_`, `rtc_`,
 `dom_`, `css_`, `lay_`/`layout_`/`paint_`,
+`js_` (engine API and runtime helpers), `jsnum_`/`jsbig_` (numbers),
+`jsstr_` (strings, atoms), `jsobj_`/`jsarr_`/`jsfn_` (objects), `jslex_`,
+`jsp_` (parser), `jsc_` (compiler), `vm_`/`vmop_` (interpreter), `jsb_`
+(built-ins), `jsi_`/`jsout_` (printing values),
 `gfx_`, `wm_`, `gui_`,
 `desktop_`, `term_`, `canvas_`, `sysmon_`, `browser_`, `shell_`, `cmd_`,
 `fmt_`, and plain names (`strlen`, `memcpy`) for `lib/string.asm`. Local

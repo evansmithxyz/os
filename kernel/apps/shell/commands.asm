@@ -89,6 +89,7 @@ COMMAND "date",      cmd_date,      0,            "date                Date and 
 COMMAND "reboot",    cmd_reboot,    0,            "reboot              Restart the machine"
 COMMAND "halt",      cmd_halt,      0,            "halt                Stop the CPU"
 COMMAND "cryptotest", cmd_cryptotest, 0,           "cryptotest          Run the TLS crypto self-test (hex output)"
+COMMAND "js",        cmd_js,        CMDF_FILEARG, "js <code | file.js> Run JavaScript, e.g. js 1 + 2"
 ALIAS   "crash",     cmd_crash,     CMDF_HIDDEN   ; crash [ud|gp|pf|de] - tests the panic handler
 
 HEADING "Desktop"
@@ -108,3 +109,4 @@ section .text
 %include "apps/shell/cmd_sys.asm"
 %include "apps/shell/cmd_desktop.asm"
 %include "apps/shell/cmd_crypto.asm"
+%include "apps/shell/cmd_js.asm"

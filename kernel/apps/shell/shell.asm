@@ -12,7 +12,7 @@
 
 [bits 64]
 
-SHELL_INPUT_MAX         equ 128
+SHELL_INPUT_MAX         equ 512     ; long enough for `js` one-liners
 SHELL_HISTORY           equ 16      ; power of two
 SHELL_WORD_MAX          equ 64
 

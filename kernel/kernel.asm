@@ -50,6 +50,7 @@ kernel_entry:
     rep stosb
 
     call gdt_init
+    call fpu_init
     call serial_init
     call vga_init
     mov byte [con_attr], COLOR_WHITE
@@ -87,6 +88,24 @@ kernel_loop:
 .idle:
     hlt
     jmp kernel_loop
+
+; ------------------------------------------------------------------------------
+; fpu_init: enable the x87 FPU and SSE (the JavaScript engine computes with
+; doubles). Interrupt handlers never touch them, so no state is saved.
+; ------------------------------------------------------------------------------
+fpu_init:
+    push rax
+    mov rax, cr0
+    and rax, ~(1 << 2)              ; EM off: real FPU
+    or rax, (1 << 1)                ; MP on
+    and rax, ~(1 << 3)              ; TS off
+    mov cr0, rax
+    mov rax, cr4
+    or rax, (1 << 9) | (1 << 10)    ; OSFXSR, OSXMMEXCPT: SSE instructions
+    mov cr4, rax
+    fninit
+    pop rax
+    ret
 
 ; ------------------------------------------------------------------------------
 ; kernel_print_banner: ASCII-art logo on the console
@@ -189,6 +208,16 @@ kernel_report_boot:
 %include "web/dom.asm"
 %include "web/css.asm"
 %include "web/layout.asm"
+%include "js/js.inc"
+%include "js/number.asm"
+%include "js/heap.asm"
+%include "js/object.asm"
+%include "js/lexer.asm"
+%include "js/parser.asm"
+%include "js/compiler.asm"
+%include "js/vm.asm"
+%include "js/builtins.asm"
+%include "js/js.asm"
 %include "apps/shell/shell.asm"
 %include "apps/shell/commands.asm"
 

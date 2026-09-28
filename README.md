@@ -21,6 +21,7 @@ windowed desktop with i3-style workspaces.
   - IDT with a real handler for every CPU exception; each one prints a full
     register dump.
   - 8259 PIC and a 1 kHz PIT timer.
+  - x87 FPU and SSE enabled (JavaScript numbers are doubles).
   - Serial console on COM1: output is mirrored there and serial input drives
     the shell.
 - **Storage:** ATA PIO driver and AntigravityFS (AFS1), with files that
@@ -32,6 +33,9 @@ windowed desktop with i3-style workspaces.
   (PKCS#1 v1.5 and PSS, up to 4096 bits) and ECDSA (P-256, P-384) against the
   Mozilla root store, the CMOS clock and the host name.
 - **Shell:** about 30 commands, Tab completion, history (Up/Down) and Ctrl+C.
+- **JavaScript:** an engine written in assembly (`kernel/js/`): a parser,
+  a bytecode compiler and an interpreter, with closures, objects, arrays,
+  prototypes and correctly rounded number formatting. Run it with `js`.
 - **Desktop:**
   - 1024×768×32 graphics through the Bochs/QEMU display adapter.
   - Movable and resizable windows with minimize and maximize, and 4
@@ -89,6 +93,7 @@ and `... cat build/os.img welcome.txt` read its files from the host.
 ls  cat  touch  write  rm  df                     files
 ifconfig  arp  ping  dns  curl  tcplisten         network
 sysinfo  about  cpu  mem  regs  uptime  clear     system
+js <code | file.js>                               JavaScript
 gui  browser [url]  ws  exit                      desktop
 ```
 
@@ -112,7 +117,8 @@ The terminal window runs the real shell, so every command works there too.
 URL into the browser. `tcplisten` serves a page that your host can open at
 <http://localhost:8888>.
 
-The browser has no JavaScript yet. A page goes through the same stages as
+The browser doesn't run page scripts yet (the JavaScript engine is only
+in the shell so far; see below). A page goes through the same stages as
 in a big browser, all in `kernel/web/`:
 
 1. `dom.asm` parses the HTML into a DOM tree, with the HTML rules that
@@ -175,6 +181,57 @@ Trusted roots:
 `cryptotest` runs the crypto on the RFC test vectors and fixed RSA and ECDSA
 signatures (`tools/gen_cryptotest.py`).
 
+**JavaScript.** `js` runs a line of code, or a script file from the disk,
+and prints the result the way Node.js does:
+
+```
+antigravity64> js 0.1 + 0.2
+0.30000000000000004
+antigravity64> js function fib(n) { return n < 2 ? n : fib(n-1) + fib(n-2) } fib(20)
+6765
+antigravity64> js console.log('sum', [1, 2, 3], {a: 'x'})
+sum [ 1, 2, 3 ] { a: 'x' }
+antigravity64> js nope()
+Uncaught ReferenceError: nope is not defined (line 1)
+antigravity64> js script.js
+```
+
+Each run starts from a fresh engine; Esc or Ctrl+C stops a script that
+doesn't end. The engine (`kernel/js/`) works like the big ones, minus the
+optimising compilers:
+
+1. `lexer.asm` turns the text into tokens; names and strings become atoms
+   (one shared copy per text, so property names compare as pointers).
+2. `parser.asm` builds a syntax tree and records every declaration in its
+   scope.
+3. `compiler.asm` turns the tree into bytecode. Variables of functions that
+   contain no other functions live in stack slots; the others live in heap
+   environments that closures capture (`let` in a `for` loop gets a fresh
+   one each time round).
+4. `vm.asm` runs the bytecode on a value stack. Calls between JavaScript
+   functions don't use the kernel stack, so deep recursion ends with
+   `RangeError: Maximum call stack size exceeded` instead of a crash.
+5. Values are NaN-boxed doubles; `number.asm` converts between text and
+   doubles with exact big-integer arithmetic where needed, so numbers print
+   exactly as in a browser (`1e+21`, `5e-324`, `(1.005).toFixed(2)` is
+   `1.00`).
+
+Supported: `var`/`let`/`const`, functions, closures, `arguments`, `this`,
+`new` and prototypes, objects and arrays (with holes), every operator
+including `**`, `??` and the logical assignments, `if`/`for`/`for-in`/
+`for-of`/`while`/`do`/`switch`, labels, `break`/`continue`, `throw`
+(uncaught), and built-ins: `console.log`, `Math`, `parseInt`,
+`parseFloat`, `isNaN`, `isFinite`, `String`, `Number`, `Boolean`,
+`Object.keys`, `Array.isArray`, `push`/`pop`/`join`/`indexOf`/`slice`,
+`charAt`/`charCodeAt`/`indexOf`/`slice`/`substring`/`toUpperCase`/
+`toLowerCase`/`trim`, `toFixed`, `toString(radix)`.
+
+Not yet (the parser says so): arrow functions, classes, `try`/`catch`,
+template literals, destructuring, spread, getters/setters, optional
+chaining, regular expressions, generators and `async`. Strings are UTF-8
+bytes, so `length` counts bytes. Memory isn't reclaimed during a run
+(the heap is 64 MB).
+
 ## Project layout
 
 ```
@@ -198,9 +255,11 @@ kernel/
   data/roots.der        trusted root certificates (tools/mkroots.py)
   web/                  dom (HTML parser), css (style sheets, cascade), layout (display list),
                         ua.css / builtin.css (the browser's own style sheets)
+  js/                   JavaScript engine: lexer, parser, compiler (bytecode), vm,
+                        heap (strings, atoms), object, number, builtins, js (API, printing)
   gfx/                  clipped 2D drawing, font, back buffer, mouse pointer
   gui/                  window manager + event loop, taskbar/footer, theme colours
-  apps/                 terminal, browser (+ browser_html: page layout), canvas, sysmon windows
+  apps/                 terminal, browser, canvas, sysmon windows
   apps/shell/           line editor + command table + command handlers
 rootfs/                 files copied onto a freshly formatted disk
 tools/                  build.py, mkimage.py (disk images), ppm.py (screenshots)
@@ -232,7 +291,7 @@ docs/                   CONVENTIONS.md, screenshots
 |---|---|
 | 0 | stage 1 (MBR) |
 | 1–31 | stage 2 |
-| 32–1055 | kernel slot (512 KB; the kernel uses about 50 KB today) |
+| 32–1055 | kernel slot (512 KB; the kernel uses about 260 KB today) |
 | 1056 | AFS superblock `"AFS1"` |
 | 1057–1058 | inode table (32 × 32 bytes) |
 | 1059–4095 | file data (2 MB image) |
@@ -248,7 +307,11 @@ docs/                   CONVENTIONS.md, screenshots
 | `0x100000` | kernel `.bss` (zeroed at boot) |
 | `0x200000–0x2FFFFF` | kernel stack |
 | `0x300000` | RTL8139 RX ring and TX buffers |
+| `0x400000` / `0x500000` | last HTTP(S) response / the browser's page (1 MB each) |
+| `0x600000` / `0xA00000` / `0xC00000` | DOM nodes / CSS rules / layout display list |
 | `0x1000000` | GUI back buffer, wallpaper, canvas (3 MB each) |
+| `0x2000000` | JavaScript: value stack, call frames, source, compiler scratch, syntax tree |
+| `0x3000000` | JavaScript heap (64 MB) |
 | `0xFD000000` | framebuffer (from the display adapter's PCI BAR0) |
 
 ### Console and input
@@ -257,7 +320,9 @@ docs/                   CONVENTIONS.md, screenshots
   desktop runs, it also appends to the terminal window instead of VGA text
   memory, which is why every shell command works in both places.
 - The keyboard IRQ and incoming serial bytes both push key events into one
-  queue. The text console and the desktop both drain it.
+  queue. The text console and the desktop both drain it. Serial bytes stay
+  in the UART while the queue is nearly full, so pasting a long line loses
+  nothing.
 
 ### Desktop
 
@@ -286,8 +351,9 @@ class MyTest(OSTestCase):
 ```
 
 The suite covers boot, the shell, the filesystem (including persistence and
-reading the image from the host), the network, the desktop, and the panic
-handler. The network tests use a web server on the host; set
+reading the image from the host), the network, TLS, the desktop and the
+browser, the JavaScript engine (`test_js.py` compares its output with what
+Node.js prints), and the panic handler. The network tests use a web server on the host; set
 `AGOS_TEST_INTERNET=1` to also test DNS against the real internet.
 
 ## Debugging
