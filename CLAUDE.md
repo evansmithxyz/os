@@ -1,0 +1,7 @@
+- Build: python tools/build.py | Test: python tools/build.py test (must pass before a change is done)
+- Read docs/CONVENTIONS.md before editing assembly (register rules, .bss, print via con_*)
+- Disk sector numbers only in include/layout.inc; fixed addresses only in include/memmap.inc
+- New shell command = handler + one COMMAND line in kernel/apps/shell/commands.asm
+- Every feature gets a test in tests/; prefer serial/[klog] checks over screenshots
+- Crash debugging: python tools/build.py sym <RIP>; serial logs are in tests/output/
+- I develop on Windows + WSL (NASM, QEMU, Python 3)
