@@ -45,6 +45,7 @@ JK_NATIVE               equ 5           ; function implemented in the kernel
 JK_ENV                  equ 6           ; captured variables of a scope
 JK_CODE                 equ 7           ; compiled function (template)
 JK_ITER                 equ 8           ; for-in / for-of state
+JK_ACCESSOR             equ 9           ; a getter/setter pair (JPA_ACCESSOR properties)
 
 ; Strings: bytes (UTF-8 passes through), NUL-terminated for convenience
 JSTR_LEN                equ 4           ; dword
@@ -65,11 +66,12 @@ JC_ARGUMENTS            equ 1
 JC_MATH                 equ 2
 JC_GLOBAL               equ 3
 JC_CONSOLE              equ 4
-JC_HOST                 equ 5           ; classes from here on are host objects (jsdom.asm)
-JC_NODE                 equ 5           ; a DOM node (JSD_NODE = its index)
-JC_STYLE                equ 6           ; element.style
-JC_CLASSLIST            equ 7           ; element.classList
-JC_LOCATION             equ 8           ; window.location
+JC_ERROR                equ 5           ; made by Error / TypeError / ... (or thrown by the engine)
+JC_HOST                 equ 16          ; classes from here on are host objects (jsdom.asm)
+JC_NODE                 equ 16          ; a DOM node (JSD_NODE = its index)
+JC_STYLE                equ 17          ; element.style
+JC_CLASSLIST            equ 18          ; element.classList
+JC_LOCATION             equ 19          ; window.location
 JSD_NODE                equ 32          ; dword: node index in a host object
 JSD_SIZE                equ 40
 
@@ -80,6 +82,11 @@ JPE_VAL                 equ 8
 JPE_SIZE                equ 16
 JPA_HIDDEN              equ 1           ; not enumerable (attribute bits, key >> 32)
 JPA_READONLY            equ 2
+JPA_ACCESSOR            equ 4           ; the value is a JK_ACCESSOR cell (raw pointer)
+JPA_FIXED               equ 8           ; not configurable: cannot be deleted
+JACC_GET                equ 8           ; qword: getter function or undefined
+JACC_SET                equ 16          ; qword: setter
+JACC_SIZE               equ 24
 
 ; Arrays
 JARR_ELEMS              equ 32          ; qword, -> values
@@ -94,8 +101,11 @@ JFN_NATIVE              equ 32          ; qword, routine address (JK_NATIVE)
 JFN_ENV                 equ 40          ; qword, enclosing environment (JK_FUNC)
 JFN_NARGS               equ 40          ; dword, declared argument count (JK_NATIVE)
 JFN_NAME                equ 48          ; qword, name atom (JK_NATIVE)
+JFN_THIS                equ 48          ; qword, `this` an arrow function keeps (JK_FUNC)
 JFN_PROTO_OBJ           equ 56          ; qword, the .prototype object once made
-JFN_SIZE                equ 64
+JFN_DATA                equ 56          ; qword, a native's own data (bound functions)
+JFN_HOME                equ 64          ; qword, object a method belongs to (super), raw
+JFN_SIZE                equ 72
 
 ; Environments (variables captured by inner functions)
 JENV_COUNT              equ 4           ; dword
@@ -113,11 +123,16 @@ JCODE_NAME              equ 24          ; qword, name atom or 0
 JCODE_ARGSLOT           equ 32          ; dword, slot of `arguments` (JCF_ARGUMENTS)
 JCODE_SELFSLOT          equ 36          ; dword, slot of its own name (JCF_SELF)
 JCODE_LINE              equ 40          ; dword, line of the `function` keyword
+JCODE_RESTSLOT          equ 44          ; dword, slot of a ...rest parameter (JCF_REST)
 JCODE_SIZE              equ 48
 JCF_HEAPENV             equ 1           ; variables live in a heap env (has inner functions)
 JCF_ARGUMENTS           equ 2           ; uses `arguments`
 JCF_SELF                equ 4           ; named function expression binds its name
 JCF_SCRIPT              equ 8           ; top-level script
+JCF_ARROW               equ 16          ; arrow function: `this` from where it was made
+JCF_REST                equ 32          ; has a ...rest parameter
+JCF_CLASSCTOR           equ 64          ; a class constructor (only with new)
+JCF_DERIVED             equ 128         ; ... of a class that extends another
 
 ; Iterators (for-in / for-of)
 JIT_MODE                equ 1           ; byte: JIM_*
@@ -146,6 +161,20 @@ JE_TYPE                 equ 1
 JE_REFERENCE            equ 2
 JE_SYNTAX               equ 3
 JE_RANGE                equ 4
+JE_COUNT                equ 5
+
+; --- Exception handlers (TRY .. ENDTRY) ---------------------------------------
+JTH_PC                  equ 0           ; where the catch code starts
+JTH_SP                  equ 8           ; value stack, frame, environment, function
+JTH_BASE                equ 16
+JTH_ENV                 equ 24
+JTH_FUNC                equ 32
+JTH_FP                  equ 40
+JTH_RSP                 equ 48          ; kernel stack of that vm_run
+JTH_NEST                equ 56          ; dword, vm_nesting then
+JTH_DEPTH               equ 60          ; dword, js_depth then (js_eval / js_call_safe level)
+JTH_SIZE                equ 64
+JSVM_MAX_HANDLERS       equ 256
 
 ; --- Macros -------------------------------------------------------------------
 ; JS_TAG dst64, src64: dst = tag (top 16 bits). Below JS_TAG_SPECIAL = number.
@@ -180,6 +209,21 @@ JE_RANGE                equ 4
 ;   FORIN o -> iter | FOROF o -> iter | ITERNEXT rel32: iter -> iter v, or jump
 ;   THROW v | LINE u32 | COMPLETION v -> | GETCOMPL -> v | CONSTERR atom32
 ;   DECLGLOB atom32: defines the global as undefined unless it exists
+;   TRY rel32: exceptions until the matching ENDTRY jump there (value pushed)
+;   TOSTR a -> String(a) | SPREAD arr v -> arr (v's items appended)
+;   OBJSPREAD o src -> o (src's own enumerable properties copied)
+;   CALLA name32 / NEWA name32: f this arr -> result (the array's items are
+;     the arguments)
+;   JNULLISH rel32: a null/undefined top becomes undefined and jumps (?.)
+;   JNULLCALL rel32: f this: f null/undefined -> undefined, jump (f?.())
+;   ARRREST u32 i: v -> [v[i], v[i+1], ...]
+;   OBJREST u16 n: src k1..kn -> a copy of src without those keys
+;   INITGET / INITSET atom32: o f -> o (accessor in an object literal)
+;   CLASS u8 flags, code32: [parent] -> constructor (flags 1: has a parent)
+;   METHOD atom32, u8 kind: target f -> (kind 0 method, 1 getter, 2 setter)
+;   METHODE u8 kind: target key f ->
+;   SUPERFN -> the parent constructor | SUPERCALL u8 n, name32 (like CALL)
+;   SUPERCALLA name32 | SUPERGET atom32 -> super.name
 %macro JS_OPCODE_LIST 0
     OPC UNDEF
     OPC NULL
@@ -268,6 +312,26 @@ JE_RANGE                equ 4
     OPC CONSTERR
     OPC DECLGLOB
     OPC POW
+    OPC TRY
+    OPC ENDTRY
+    OPC TOSTR
+    OPC SPREAD
+    OPC OBJSPREAD
+    OPC CALLA
+    OPC NEWA
+    OPC JNULLISH
+    OPC JNULLCALL
+    OPC ARRREST
+    OPC OBJREST
+    OPC INITGET
+    OPC INITSET
+    OPC CLASS
+    OPC METHOD
+    OPC METHODE
+    OPC SUPERFN
+    OPC SUPERCALL
+    OPC SUPERCALLA
+    OPC SUPERGET
 %endmacro
 
 %assign js_opc_n 0

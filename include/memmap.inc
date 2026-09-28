@@ -22,7 +22,8 @@
 ;   0x00C00000  layout          display list and its text (4 MB)
 ;   0x01000000  GUI buffers     back buffer, wallpaper cache, canvas
 ;   0x02000000  JavaScript      value stack, call frames, source, compiler
-;                               scratch, syntax tree, heap (kernel/js/)
+;                               scratch, syntax tree, heap, collector
+;                               bitmap and mark stack (kernel/js/)
 ; ==============================================================================
 
 ; --- Boot handoff -------------------------------------------------------------
@@ -87,5 +88,9 @@ JS_CODEBUF_SIZE         equ 0x00100000
 JS_AST_ADDR             equ 0x02400000  ; syntax tree, scopes (freed after compiling)
 JS_AST_SIZE             equ 0x00C00000
 JS_HEAP_ADDR            equ 0x03000000  ; strings, objects, bytecode
-JS_HEAP_SIZE            equ 0x04000000
+JS_HEAP_SIZE            equ 0x03E00000
+JS_GC_BITMAP_ADDR       equ 0x06E00000  ; heap block starts, 1 bit per 8 bytes
+JS_GC_BITMAP_SIZE       equ 0x00100000
+JS_GC_STACK_ADDR        equ 0x06F00000  ; the collector's mark stack
+JS_GC_STACK_SIZE        equ 0x00100000
 JS_MIN_RAM              equ 0x07000000  ; the engine needs RAM up to here

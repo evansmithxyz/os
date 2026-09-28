@@ -233,6 +233,14 @@ class DesktopTest(OSTestCase):
             self.vm.expect(f"js: navigate -> http://10.0.2.2:{web.port}/hello.html")
             self.vm.expect("browser text: Hello from the host", timeout=20)
 
+    def test_browser_page_survives_garbage_collection(self):
+        with HostWebServer() as web:
+            line = self.open_page(web, "gc.html")
+        out = self.vm.output
+        self.assertIn("[klog] js gc: live bytes", out)
+        self.assertIn("js: after gc 0,1,2,3,4 GC-4-TEXT", out)
+        self.assertIn("browser text: GC-0-TEXT GC-1-TEXT GC-2-TEXT GC-3-TEXT GC-4-TEXT", line)
+
     def test_browser_click_events(self):
         with HostWebServer() as web:
             self.open_page(web, "click.html")

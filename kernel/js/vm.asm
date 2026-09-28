@@ -15,8 +15,9 @@
 ; Everything else is scratch inside handlers. Before calling anything that
 ; may run JavaScript, a handler stores R12 in vm_sp (VMCALL).
 ;
-; Natives: RDI = arguments, ECX = count, RDX = this, R8D = 1 under `new`
-; -> RAX = result. They preserve every other register, like normal routines.
+; Natives: RDI = arguments, ECX = count, RDX = this, R8D = 1 under `new` (2
+; from super()), R10 = the native function object itself -> RAX = result.
+; They preserve every other register, like normal routines.
 ; Errors: js_throw / js_throw_value unwind to js_eval (no try/catch yet).
 ; ==============================================================================
 
@@ -92,6 +93,11 @@ jsmsg_not_iterable:     db "% is not iterable", 0
 jsmsg_instanceof:       db "Right-hand side of 'instanceof' is not callable", 0
 jsmsg_in:               db "Cannot use 'in' operator to search for '%' in a primitive", 0
 jsmsg_interrupted:      db "Script interrupted", 0
+jsmsg_class_call:       db "Class constructor % cannot be invoked without 'new'", 0
+jsmsg_extends:          db "Class extends value % is not a constructor or null", 0
+jsmsg_super:            db "'super' keyword unexpected here", 0
+jsvm_at_line:           db 10, "    at line ", 0
+jsmsg_handlers:         db "Too many nested try blocks", 0
 
 section .bss
 alignb 8
@@ -104,8 +110,13 @@ js_exception:           resq 1          ; thrown value; JS_HOLE = message in js_
 vm_line:                resd 1          ; current source line
 vm_budget:              resd 1
 vm_nesting:             resd 1          ; js_call depth
+js_call_flags:          resd 1          ; JFRF_* for the frame js_call makes
 js_exception_line:      resd 1
 js_err_buf:             resb 256
+vm_handler_count:       resd 1
+js_throwing:            resb 1
+alignb 8
+vm_handlers:            resb JTH_SIZE * JSVM_MAX_HANDLERS
 
 section .text
 
@@ -115,10 +126,11 @@ section .text
 
 ; ------------------------------------------------------------------------------
 ; js_throw: EDX = JE_* kind, RSI = message (a '%' is replaced by RDI), RDI =
-; detail string (heap string) or 0. Does not return: the script is abandoned
-; and js_eval returns CF=1 with the text in js_err_buf.
+; detail string (heap string) or 0. Throws a new Error object of that kind
+; (js_err_buf keeps "Kind: message" as text). Does not return.
 ; ------------------------------------------------------------------------------
 js_throw:
+    mov r9d, edx                    ; the kind
     push rdi
     lea rdi, [js_err_buf]
     lea rax, [jsvm_kind_names]
@@ -134,6 +146,7 @@ js_throw:
 .kind_done:
     mov word [rdi], ': '
     add rdi, 2
+    mov r10, rdi                    ; the message starts here
     pop rdx                         ; detail
     lea r8, [js_err_buf + 250]
 .msg:
@@ -169,14 +182,136 @@ js_throw:
     jmp .msg
 .done:
     mov byte [rdi], 0
-    mov rax, JS_HOLE
+    cmp byte [js_throwing], 0
+    jne .fallback                   ; making the error object failed (no memory)
+    mov byte [js_throwing], 1
+    mov rsi, r10
+    mov rcx, rdi
+    sub rcx, r10
+    call jsstr_new
+    mov edx, r9d
+    call js_make_error
+    mov byte [js_throwing], 0
+    jmp js_throw_value
+.fallback:
+    mov byte [js_throwing], 0
+    mov rax, JS_HOLE                ; the text in js_err_buf stands for it
     jmp js_throw_value
 
-; js_throw_value: RAX = the thrown value (`throw x`). Does not return.
+; ------------------------------------------------------------------------------
+; js_make_error: EDX = JE_* kind, RAX = message (heap string) or 0 -> RAX = a
+; new error object (its prototype says the kind; message and stack own)
+; ------------------------------------------------------------------------------
+js_make_error:
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+    mov rdi, rax
+    lea rbx, [js_error_protos]
+    mov rax, [rbx + rdx*8]
+    call jsobj_new
+    mov dword [rax + JOBJ_CLASS], JC_ERROR
+    call js_error_fill
+    BOX rax, rcx, JS_OBJ_BITS
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; js_error_fill: RAX = object, RDI = message (heap string) or 0, EDX = kind
+; -> its message and stack ("Kind: message" + "\n    at line N") set
+js_error_fill:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    mov rbx, rax
+    mov r8d, edx
+    test rdi, rdi
+    jz .stack
+    mov rcx, rdi
+    BOX rcx, rsi, JS_STR_BITS
+    mov rdx, [atom_message]
+    call jsobj_define_hidden
+.stack:
+    call jsout_save
+    lea rsi, [jsvm_kind_names]
+    mov rsi, [rsi + r8*8]
+    call jsout_cstr
+    test rdi, rdi
+    jz .at
+    mov al, ':'
+    call jsout_byte
+    mov al, ' '
+    call jsout_byte
+    mov rax, rdi
+    call jsout_str
+.at:
+    lea rsi, [jsvm_at_line]
+    call jsout_cstr
+    mov eax, [vm_line]
+    call jsout_u64
+    call jsout_take
+    mov rcx, rax
+    mov rax, rbx
+    mov rdx, [atom_stack]
+    call jsobj_define_hidden
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; ------------------------------------------------------------------------------
+; js_throw_value: RAX = the thrown value (`throw x`). Does not return: it
+; goes to the innermost try (catch) of this js_eval / js_call_safe level, or
+; ends that level (js_eval_fail).
+; ------------------------------------------------------------------------------
 js_throw_value:
     mov [js_exception], rax
-    mov eax, [vm_line]
-    mov [js_exception_line], eax
+    mov edx, [vm_line]
+    mov [js_exception_line], edx
+    mov ecx, [vm_handler_count]
+    test ecx, ecx
+    jz js_throw_uncatchable.out
+    dec ecx
+    imul rbx, rcx, JTH_SIZE
+    lea rdx, [vm_handlers]
+    add rbx, rdx
+    mov edx, [js_depth]
+    cmp edx, [rbx + JTH_DEPTH]
+    jne js_throw_uncatchable.out    ; the handler is outside this js_eval level
+    mov [vm_handler_count], ecx
+    ; back to the state at TRY, the exception pushed, on to the catch code
+    mov rsp, [rbx + JTH_RSP]
+    mov r12, [rbx + JTH_SP]
+    mov r13, [rbx + JTH_BASE]
+    mov r14, [rbx + JTH_ENV]
+    mov r15, [rbx + JTH_FUNC]
+    mov rdx, [rbx + JTH_FP]
+    mov [vm_fp], rdx
+    mov edx, [rbx + JTH_NEST]
+    mov [vm_nesting], edx
+    mov rsi, [rbx + JTH_PC]
+    lea rbp, [vm_ops]
+    PUSHV rax
+    NEXT
+
+; js_throw_uncatchable: RAX = value -> ends this js_eval level, whatever
+; try/catch is in the way (Esc / Ctrl+C)
+js_throw_uncatchable:
+    mov [js_exception], rax
+    mov edx, [vm_line]
+    mov [js_exception_line], edx
+.out:
     mov rsp, [js_catch_rsp]
     jmp js_eval_fail
 
@@ -909,6 +1044,8 @@ js_get:
     push rcx
     push rdx
     push rdi
+    push r8
+    mov r8, rax                     ; the receiver (a getter's this)
     mov edx, edx
     mov rcx, rax
     shr rcx, 48
@@ -965,7 +1102,20 @@ js_get:
 .lookup:
     call jsobj_lookup
     jc .undefined
+.entry:
+    bt qword [rbx + JPE_KEY], 34    ; an accessor: call its getter
+    jc .getter
     mov rax, [rbx + JPE_VAL]
+    jmp .out
+.getter:
+    mov rax, [rbx + JPE_VAL]
+    mov rax, [rax + JACC_GET]
+    mov rcx, JS_UNDEF
+    cmp rax, rcx
+    je .out
+    mov rdx, r8
+    xor ecx, ecx
+    call js_call
     jmp .out
 .undefined:
     mov rax, JS_UNDEF
@@ -996,8 +1146,7 @@ js_get:
     mov rax, [rcx + JCODE_NAME]
     jmp .name
 .own:
-    mov rax, [rbx + JPE_VAL]
-    jmp .out
+    jmp .entry
 .prototype:
     call jsfn_prototype
     jmp .out
@@ -1022,6 +1171,7 @@ js_get:
 .name_ok:
     BOX rax, rcx, JS_STR_BITS
 .out:
+    pop r8
     pop rdi
     pop rdx
     pop rcx
@@ -1099,6 +1249,30 @@ js_put:
     call jsd_put                    ; DOM properties (CF=0: handled)
     jnc .out
 .ordinary:
+    ; an accessor here or on a prototype: its setter
+    push rbx
+    call jsobj_lookup
+    jc .data
+    bt qword [rbx + JPE_KEY], 34
+    jnc .data
+    mov rbx, [rbx + JPE_VAL]
+    mov rbx, [rbx + JACC_SET]
+    mov rdi, JS_UNDEF
+    cmp rbx, rdi
+    je .setter_done                 ; no setter: ignored
+    push rcx
+    mov rdi, rsp                    ; the argument
+    mov rdx, rax
+    BOX rdx, rcx, JS_OBJ_BITS       ; this
+    mov rax, rbx
+    mov ecx, 1
+    call js_call
+    pop rcx
+.setter_done:
+    pop rbx
+    jmp .out
+.data:
+    pop rbx
     call jsobj_put
 .out:
     pop rdi
@@ -1411,6 +1585,270 @@ js_forin_keys:
     pop rcx
     ret
 
+; ------------------------------------------------------------------------------
+; js_spread_into: RAX = array, RDX = value -> the value's items appended
+; (arrays and strings; anything else is not iterable yet)
+; ------------------------------------------------------------------------------
+js_spread_into:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+    push rsi
+    mov rsi, rax                    ; the array being built
+    mov rcx, rdx
+    shr rcx, 48
+    cmp ecx, JS_TAG_STRING
+    je .string
+    cmp ecx, JS_TAG_OBJECT
+    jne .not_iterable
+    mov ebx, edx
+    cmp byte [rbx + JH_KIND], JK_ARRAY
+    jne .not_iterable
+    xor edi, edi
+.item:
+    cmp edi, [rbx + JARR_LEN]
+    jae .done
+    mov rax, [rbx + JARR_ELEMS]
+    mov rcx, [rax + rdi*8]
+    mov rax, JS_HOLE
+    cmp rcx, rax
+    jne .push
+    mov rcx, JS_UNDEF
+.push:
+    mov rax, rsi
+    call jsarr_push
+    inc edi
+    jmp .item
+.string:
+    mov ebx, edx
+    xor edi, edi
+.char:
+    cmp edi, [rbx + JSTR_LEN]
+    jae .done
+    movzx eax, byte [rbx + JSTR_DATA + rdi]
+    call jsstr_char
+    mov rcx, rax
+    BOX rcx, rax, JS_STR_BITS
+    mov rax, rsi
+    call jsarr_push
+    inc edi
+    jmp .char
+.done:
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+.not_iterable:
+    mov rax, rdx
+    call js_to_string
+    mov rdi, rax
+    lea rsi, [jsmsg_not_iterable]
+    jmp js_throw_type
+
+; js_own_keys: RAX = value -> RAX = array (raw) of its own enumerable keys
+; (strings; for objects without their prototypes' keys)
+js_own_keys:
+    push rdx
+    push rdi
+    mov rdx, rax
+    shr rdx, 48
+    cmp edx, JS_TAG_OBJECT
+    jne .any
+    mov edi, eax
+    push qword [rdi + JOBJ_PROTO]
+    mov qword [rdi + JOBJ_PROTO], 0
+    call js_forin_keys
+    pop qword [rdi + JOBJ_PROTO]
+    pop rdi
+    pop rdx
+    ret
+.any:
+    call js_forin_keys
+    pop rdi
+    pop rdx
+    ret
+
+; js_copy_props: RAX = object (raw), RDX = source -> the source's own
+; enumerable properties copied onto the object ({...src}, Object.assign)
+js_copy_props:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    mov rsi, rax
+    mov rdi, rdx
+    call vm_nullish_rdx
+    jc .done
+    mov rax, rdi
+    call js_own_keys
+    mov rbx, rax
+    xor ecx, ecx
+.key:
+    cmp ecx, [rbx + JARR_LEN]
+    jae .done
+    mov rdx, [rbx + JARR_ELEMS]
+    mov rdx, [rdx + rcx*8]          ; the key (a string value)
+    push rcx
+    mov rax, rdi
+    push rdx
+    call js_get_elem
+    mov rcx, rax
+    pop rdx
+    mov edx, edx
+    mov rax, rsi
+    call jsobj_define
+    pop rcx
+    inc ecx
+    jmp .key
+.done:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; vm_nullish_rdx: RDX = value -> CF=1 for null / undefined
+vm_nullish_rdx:
+    push rax
+    mov rax, rdx
+    call vm_nullish
+    pop rax
+    ret
+
+; js_array_rest: RAX = value, EDX = start -> RAX = array of its items from
+; there on (arrays, strings)
+js_array_rest:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    mov rbx, rax
+    xor ecx, ecx
+    call jsarr_new
+    mov rsi, rax
+    mov rax, rbx
+    shr rax, 48
+    cmp eax, JS_TAG_STRING
+    je .string
+    cmp eax, JS_TAG_OBJECT
+    jne .done
+    mov ebx, ebx
+    cmp byte [rbx + JH_KIND], JK_ARRAY
+    jne .done
+.item:
+    cmp edx, [rbx + JARR_LEN]
+    jae .done
+    mov rax, [rbx + JARR_ELEMS]
+    mov rcx, [rax + rdx*8]
+    mov rax, JS_HOLE
+    cmp rcx, rax
+    jne .push
+    mov rcx, JS_UNDEF
+.push:
+    mov rax, rsi
+    call jsarr_push
+    inc edx
+    jmp .item
+.string:
+    mov ebx, ebx
+.char:
+    cmp edx, [rbx + JSTR_LEN]
+    jae .done
+    movzx eax, byte [rbx + JSTR_DATA + rdx]
+    call jsstr_char
+    mov rcx, rax
+    BOX rcx, rax, JS_STR_BITS
+    mov rax, rsi
+    call jsarr_push
+    inc edx
+    jmp .char
+.done:
+    mov rax, rsi
+    BOX rax, rcx, JS_OBJ_BITS
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; js_object_rest: RAX = source, RDI = excluded keys (string values), ECX =
+; how many -> RAX = a new object with the other own enumerable properties
+js_object_rest:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push r8
+    push r9
+    push r10
+    mov r8, rax                     ; source
+    mov r9, rdi                     ; excluded
+    mov r10d, ecx
+    call jsobj_new_plain
+    mov rsi, rax                    ; the result
+    mov rdx, r8
+    call vm_nullish_rdx
+    jc .done
+    mov rax, r8
+    call js_own_keys
+    mov rbx, rax
+    xor ecx, ecx
+.key:
+    cmp ecx, [rbx + JARR_LEN]
+    jae .done
+    mov rdx, [rbx + JARR_ELEMS]
+    mov rdx, [rdx + rcx*8]
+    ; excluded? (keys are atoms: compare the texts)
+    push rcx
+    xor ecx, ecx
+.excluded:
+    cmp ecx, r10d
+    jae .copy
+    mov rax, [r9 + rcx*8]
+    push rdx
+    call js_strict_equal
+    pop rdx
+    jc .skip
+    inc ecx
+    jmp .excluded
+.copy:
+    mov rax, r8
+    push rdx
+    call js_get_elem
+    mov rcx, rax
+    pop rdx
+    mov rax, rdx
+    call js_to_key
+    mov edx, eax
+    mov rax, rsi
+    call jsobj_define
+.skip:
+    pop rcx
+    inc ecx
+    jmp .key
+.done:
+    mov rax, rsi
+    BOX rax, rcx, JS_OBJ_BITS
+    pop r10
+    pop r9
+    pop r8
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
 ; ==============================================================================
 ; Functions and calls
 ; ==============================================================================
@@ -1454,6 +1892,8 @@ jsfn_native:
 ; -> RAX = result. Runs JavaScript functions in a nested vm_run.
 ; ------------------------------------------------------------------------------
 js_call:
+    mov dword [js_call_flags], JFRF_BOUNDARY
+js_call_flagged:
     push rbx
     mov rbx, rax
     shr rbx, 48
@@ -1464,6 +1904,13 @@ js_call:
     je .native
     cmp byte [rbx + JH_KIND], JK_FUNC
     jne .not_function
+    ; a class constructor only runs under new
+    test dword [js_call_flags], JFRF_CONSTRUCT
+    jnz .callable
+    mov rbx, [rbx + JFN_CODE]
+    test byte [rbx + JCODE_FLAGS], JCF_CLASSCTOR
+    jnz .class
+.callable:
     pop rbx
     push rbx
     push rcx
@@ -1502,7 +1949,7 @@ js_call:
     dec r8d
     jmp .copy
 .enter:
-    mov r8d, JFRF_BOUNDARY
+    mov r8d, [js_call_flags]
     call vm_enter_js
     call vm_run
     pop qword [vm_sp]
@@ -1524,11 +1971,23 @@ js_call:
     ret
 .native:
     push r8
+    push r10
     xor r8d, r8d
+    test dword [js_call_flags], JFRF_CONSTRUCT
+    jz .plain
+    mov r8d, 1                      ; (from js_construct)
+.plain:
+    mov r10, rbx
     call [rbx + JFN_NATIVE]
+    pop r10
     pop r8
     pop rbx
     ret
+.class:
+    mov edi, [rbx + JCODE_NAME]
+    pop rbx
+    lea rsi, [jsmsg_class_call]
+    jmp js_throw_type
 .not_function:
     pop rbx
     lea rsi, [jsmsg_not_function]
@@ -1538,6 +1997,59 @@ js_call:
     mov rdi, rax
     pop rax
     lea rsi, [jsmsg_not_function]
+    jmp js_throw_type
+
+; ------------------------------------------------------------------------------
+; js_construct: RAX = function, RDI = arguments, ECX = count -> RAX = the
+; result of new f(...arguments)
+; ------------------------------------------------------------------------------
+js_construct:
+    push rbx
+    push rdx
+    call js_is_callable
+    jnc .not_constructor
+    mov ebx, eax
+    cmp byte [rbx + JH_KIND], JK_FUNC
+    jne .this
+    mov rdx, [rbx + JFN_CODE]
+    test byte [rdx + JCODE_FLAGS], JCF_ARROW
+    jnz .not_constructor
+.this:
+    ; this = a new object inheriting f.prototype
+    push rax
+    mov rdx, [atom_prototype]
+    call js_get
+    mov rdx, rax
+    shr rdx, 48
+    cmp edx, JS_TAG_OBJECT
+    mov rdx, [js_object_proto]
+    jne .proto
+    mov edx, eax
+.proto:
+    mov rax, rdx
+    call jsobj_new
+    BOX rax, rdx, JS_OBJ_BITS
+    mov rdx, rax
+    pop rax
+    push rdx
+    mov dword [js_call_flags], JFRF_BOUNDARY | JFRF_CONSTRUCT
+    call js_call_flagged
+    pop rdx
+    ; (a JavaScript frame already put this in place of a non-object result)
+    mov rbx, rax
+    shr rbx, 48
+    cmp ebx, JS_TAG_OBJECT
+    je .out
+    mov rax, rdx
+.out:
+    pop rdx
+    pop rbx
+    ret
+.not_constructor:
+    lea rsi, [jsmsg_value]
+    call jsstr_from_cstr
+    mov rdi, rax
+    lea rsi, [jsmsg_not_constructor]
     jmp js_throw_type
 
 vm_stack_overflow:
@@ -1576,6 +2088,12 @@ vm_enter_js:
     mov r15d, [rbx]                 ; the function object
     mov r9, [r15 + JFN_CODE]        ; its template
     lea r13, [rbx + 16]
+    test byte [r9 + JCODE_FLAGS], JCF_ARROW
+    jz .own_this
+    mov rax, [r15 + JFN_THIS]
+    mov [rbx + 8], rax
+    jmp .this_ok
+.own_this:
     ; sloppy-mode `this`: undefined/null -> the global object
     mov rax, [rbx + 8]
     mov rdx, rax
@@ -1611,6 +2129,35 @@ vm_enter_js:
     BOX r11, rax, JS_OBJ_BITS
     pop rcx
 .params:
+    ; ...rest: the arguments after the named ones
+    xor r8d, r8d
+    test byte [r9 + JCODE_FLAGS], JCF_REST
+    jz .missing_params
+    push rcx
+    mov edx, ecx
+    sub edx, r10d
+    jg .rest_count
+    xor edx, edx
+.rest_count:
+    push rdx
+    mov ecx, edx
+    call jsarr_new
+    mov r8, rax
+    pop rdx
+    lea rdi, [r13 + r10*8]
+.rest_item:
+    test edx, edx
+    jz .rest_done
+    mov rcx, [rdi]
+    mov rax, r8
+    call jsarr_push
+    add rdi, 8
+    dec edx
+    jmp .rest_item
+.rest_done:
+    BOX r8, rax, JS_OBJ_BITS
+    pop rcx
+.missing_params:
     ; missing arguments are undefined; extra ones are dropped
     mov rax, JS_UNDEF
 .missing:
@@ -1652,9 +2199,14 @@ vm_enter_js:
     jmp .env_param
 .env_special:
     test byte [r9 + JCODE_FLAGS], JCF_ARGUMENTS
-    jz .env_self
+    jz .env_rest
     mov edx, [r9 + JCODE_ARGSLOT]
     mov [r14 + JENV_VALS + rdx*8], r11
+.env_rest:
+    test byte [r9 + JCODE_FLAGS], JCF_REST
+    jz .env_self
+    mov edx, [r9 + JCODE_RESTSLOT]
+    mov [r14 + JENV_VALS + rdx*8], r8
 .env_self:
     test byte [r9 + JCODE_FLAGS], JCF_SELF
     jz .code
@@ -1675,9 +2227,14 @@ vm_enter_js:
     jmp .local
 .stack_special:
     test byte [r9 + JCODE_FLAGS], JCF_ARGUMENTS
-    jz .stack_self
+    jz .stack_rest
     mov edx, [r9 + JCODE_ARGSLOT]
     mov [r13 + rdx*8], r11
+.stack_rest:
+    test byte [r9 + JCODE_FLAGS], JCF_REST
+    jz .stack_self
+    mov edx, [r9 + JCODE_RESTSLOT]
+    mov [r13 + rdx*8], r8
 .stack_self:
     test byte [r9 + JCODE_FLAGS], JCF_SELF
     jz .code
@@ -1707,9 +2264,10 @@ vm_check_budget:
     ret
 .cancel:
     lea rsi, [jsmsg_interrupted]
+    call jsstr_from_cstr
     xor edx, edx
-    xor edi, edi
-    jmp js_throw
+    call js_make_error
+    jmp js_throw_uncatchable
 
 ; vm_run: execute from the registers vm_enter_js set up until the boundary
 ; frame returns -> RAX = its result
@@ -1852,6 +2410,8 @@ vmop_GETGLOB:
     add rbx, rcx
     cmp [rbx + JPE_KEY], edx
     jne .slow
+    bt qword [rbx + JPE_KEY], 34
+    jc .accessor
     mov rax, [rbx + JPE_VAL]
     PUSHV rax
     NEXT
@@ -1859,13 +2419,23 @@ vmop_GETGLOB:
     call jsobj_find_own
     jc .inherited
     call vm_cache_index             ; [RSI-4] = index of RBX
+    bt qword [rbx + JPE_KEY], 34
+    jc .accessor
     mov rax, [rbx + JPE_VAL]
     PUSHV rax
     NEXT
 .inherited:
     call jsobj_lookup
     jc .missing
+    bt qword [rbx + JPE_KEY], 34
+    jc .accessor
     mov rax, [rbx + JPE_VAL]
+    PUSHV rax
+    NEXT
+.accessor:
+    mov rax, [js_global]
+    BOX rax, rcx, JS_OBJ_BITS
+    VMCALL js_get
     PUSHV rax
     NEXT
 .missing:
@@ -1898,14 +2468,17 @@ vmop_SETGLOB:
     add rbx, rcx
     cmp [rbx + JPE_KEY], edx
     jne .slow
-    bt qword [rbx + JPE_KEY], 33    ; read-only (NaN, Infinity, undefined)
-    jc .done
+    test byte [rbx + JPE_KEY + 4], JPA_READONLY | JPA_ACCESSOR
+    jnz .slow                       ; read-only (NaN, ...) or an accessor
     mov [rbx + JPE_VAL], rdi
 .done:
     NEXT
 .slow:
     mov rcx, rdi
-    call jsobj_put
+    push rax
+    BOX rax, rbx, JS_OBJ_BITS
+    VMCALL js_put
+    pop rax
     call jsobj_find_own
     jc .done
     call vm_cache_index
@@ -1954,6 +2527,8 @@ vmop_GETPROP:
     add rbx, rcx
     cmp [rbx + JPE_KEY], edx
     jne .own
+    bt qword [rbx + JPE_KEY], 34
+    jc .generic                     ; an accessor
     mov rax, [rbx + JPE_VAL]
     PUSHV rax
     NEXT
@@ -1964,6 +2539,8 @@ vmop_GETPROP:
     jc .not_own
     call vm_cache_index
     pop rax
+    bt qword [rbx + JPE_KEY], 34
+    jc .generic
     mov rax, [rbx + JPE_VAL]
     PUSHV rax
     NEXT
@@ -2094,6 +2671,7 @@ vmop_CALL:
     movzx ecx, byte [rsi]
     mov r9d, [rsi + 1]
     add rsi, 5
+.common:                            ; ECX = argument count, R9D = name
     lea rax, [rcx*8 + 16]
     mov rbx, r12
     sub rbx, rax                    ; callee slot
@@ -2109,6 +2687,7 @@ vmop_CALL:
     jne vm_not_function
     mov rax, [rdi + JFN_NATIVE]
     mov rdx, [rbx + 8]
+    mov r10, rdi                    ; natives also get themselves
     lea rdi, [rbx + 16]
     xor r8d, r8d
     mov [vm_sp], r12
@@ -2117,9 +2696,15 @@ vmop_CALL:
     PUSHV rax
     NEXT
 .js:
+    mov rdx, [rdi + JFN_CODE]
+    test byte [rdx + JCODE_FLAGS], JCF_CLASSCTOR
+    jnz .class
     xor r8d, r8d
     call vm_enter_js
     NEXT
+.class:
+    lea rsi, [jsmsg_class_call]
+    jmp vm_call_error
 
 ; vm_not_function: R9D = name atom (or 0)
 vm_not_function:
@@ -2141,12 +2726,21 @@ vmop_NEW:
     movzx ecx, byte [rsi]
     mov r9d, [rsi + 1]
     add rsi, 5
+.common:
     lea rax, [rcx*8 + 16]
     mov rbx, r12
     sub rbx, rax
     mov rax, [rbx]
     call js_is_callable
     jnc .not_constructor
+    ; arrow functions are not constructors
+    mov edx, eax
+    cmp byte [rdx + JH_KIND], JK_FUNC
+    jne .constructor
+    mov rdx, [rdx + JFN_CODE]
+    test byte [rdx + JCODE_FLAGS], JCF_ARROW
+    jnz .not_constructor
+.constructor:
     ; this = a new object inheriting f.prototype
     push rcx
     mov rdx, [atom_prototype]
@@ -2172,6 +2766,7 @@ vmop_NEW:
 .native:
     mov rax, [rdi + JFN_NATIVE]
     mov rdx, [rbx + 8]
+    mov r10, rdi                    ; natives also get themselves
     lea rdi, [rbx + 16]
     mov r8d, 1
     mov [vm_sp], r12
@@ -2596,6 +3191,14 @@ vmop_CLOSURE:
     add rsi, 4
     mov rdx, r14
     call jsfn_new
+    mov rdx, [rax + JFN_CODE]
+    test byte [rdx + JCODE_FLAGS], JCF_ARROW
+    jz .box
+    mov rdx, [r13 - 8]              ; the `this` it will always have
+    mov [rax + JFN_THIS], rdx
+    mov rdx, [r15 + JFN_HOME]       ; and super
+    mov [rax + JFN_HOME], rdx
+.box:
     BOX rax, rdx, JS_OBJ_BITS
     PUSHV rax
     NEXT
@@ -2726,6 +3329,354 @@ vmop_COMPLETION:
 vmop_GETCOMPL:
     mov rax, [vm_completion]
     PUSHV rax
+    NEXT
+
+vmop_TOSTR:
+    POPV rax
+    VMCALL js_to_string
+    BOX rax, rdx, JS_STR_BITS
+    PUSHV rax
+    NEXT
+
+vmop_SPREAD:
+    POPV rdx
+    mov eax, [r12 - 8]
+    VMCALL js_spread_into
+    NEXT
+
+vmop_OBJSPREAD:
+    POPV rdx
+    mov eax, [r12 - 8]
+    VMCALL js_copy_props
+    NEXT
+
+; CALLA / NEWA name32: [f][this][array] -> the array's items as arguments
+vmop_CALLA:
+    mov r9d, [rsi]
+    add rsi, 4
+    call vm_spread_args
+    jmp vmop_CALL.common
+vmop_NEWA:
+    mov r9d, [rsi]
+    add rsi, 4
+    call vm_spread_args
+    jmp vmop_NEW.common
+
+; vm_spread_args: the array on top of the stack -> its items in its place,
+; ECX = how many
+vm_spread_args:
+    POPV rax
+    mov eax, eax
+    mov ecx, [rax + JARR_LEN]
+    lea rdx, [r12 + rcx*8 + 32768]
+    cmp rdx, JS_STACK_ADDR + JS_STACK_SIZE
+    jae vm_stack_overflow
+    mov rdi, [rax + JARR_ELEMS]
+    xor edx, edx
+    mov r8, JS_HOLE
+.item:
+    cmp edx, ecx
+    jae .done
+    mov rax, [rdi + rdx*8]
+    cmp rax, r8
+    jne .push
+    mov rax, JS_UNDEF
+.push:
+    PUSHV rax
+    inc edx
+    jmp .item
+.done:
+    ret
+
+vmop_JNULLISH:
+    mov rax, [r12 - 8]
+    call vm_nullish
+    jnc vm_no_jump
+    mov rax, JS_UNDEF
+    mov [r12 - 8], rax
+    jmp vm_jump
+
+vmop_JNULLCALL:
+    mov rax, [r12 - 16]
+    call vm_nullish
+    jnc vm_no_jump
+    sub r12, 16
+    mov rax, JS_UNDEF
+    PUSHV rax
+    jmp vm_jump
+
+; vm_nullish: RAX = value -> CF=1 for null / undefined
+vm_nullish:
+    push rdx
+    mov rdx, rax
+    shr rdx, 48
+    cmp edx, JS_TAG_SPECIAL
+    jne .no
+    cmp eax, 1
+    ja .no
+    pop rdx
+    stc
+    ret
+.no:
+    pop rdx
+    clc
+    ret
+
+vmop_ARRREST:
+    mov edx, [rsi]
+    add rsi, 4
+    POPV rax
+    VMCALL js_array_rest
+    PUSHV rax
+    NEXT
+
+vmop_OBJREST:
+    movzx ecx, word [rsi]
+    add rsi, 2
+    lea rax, [rcx*8]
+    sub r12, rax                    ; the keys are at [R12], the object below
+    mov rdi, r12
+    mov rax, [r12 - 8]
+    VMCALL js_object_rest
+    mov [r12 - 8], rax
+    NEXT
+
+; INITGET / INITSET atom32: [obj f] -> [obj]
+vmop_INITGET:
+    mov r8d, 1
+    jmp vm_init_accessor
+vmop_INITSET:
+    mov r8d, 2
+vm_init_accessor:
+    mov edx, [rsi]
+    add rsi, 4
+    POPV rcx
+    mov eax, [r12 - 8]
+    call jsobj_define_accessor
+    NEXT
+
+; CLASS u8 flags, code32: [parent] -> the constructor, with its prototype
+vmop_CLASS:
+    movzx ebx, byte [rsi]
+    mov edi, [rsi + 1]              ; the constructor's code
+    add rsi, 5
+    mov r8, [js_object_proto]       ; the prototype's prototype
+    xor r9d, r9d                    ; the parent constructor (raw), 0 = none
+    test ebx, 1
+    jz .make
+    POPV rax
+    mov rdx, JS_NULL
+    cmp rax, rdx
+    je .null_parent
+    call js_is_callable
+    jnc .bad_parent
+    mov r9d, eax
+    mov rdx, [atom_prototype]
+    VMCALL js_get
+    mov rdx, rax
+    shr rdx, 48
+    xor r8d, r8d
+    cmp edx, JS_TAG_OBJECT
+    jne .make                       ; (null)
+    mov r8d, eax
+    jmp .make
+.null_parent:
+    xor r8d, r8d
+.make:
+    mov rax, rdi
+    mov rdx, r14
+    call jsfn_new
+    mov rbx, rax                    ; the constructor
+    mov rax, r8
+    call jsobj_new
+    mov rdi, rax                    ; its prototype object
+    mov rcx, rbx
+    BOX rcx, rdx, JS_OBJ_BITS
+    mov rdx, [atom_constructor]
+    call jsobj_define_hidden
+    mov rax, rdi
+    BOX rax, rdx, JS_OBJ_BITS
+    mov [rbx + JFN_PROTO_OBJ], rax
+    mov [rbx + JFN_HOME], rdi
+    test r9, r9
+    jz .push
+    mov [rbx + JOBJ_PROTO], r9      ; statics are inherited too
+.push:
+    mov rax, rbx
+    BOX rax, rdx, JS_OBJ_BITS
+    PUSHV rax
+    NEXT
+.bad_parent:
+    mov [vm_sp], r12
+    call js_to_string
+    mov rdi, rax
+    lea rsi, [jsmsg_extends]
+    jmp js_throw_type
+
+; METHOD atom32, u8 kind: [target f] -> []
+vmop_METHOD:
+    mov edx, [rsi]
+    movzx r8d, byte [rsi + 4]
+    add rsi, 5
+    POPV rcx
+    POPV rax
+    call vm_define_method
+    NEXT
+
+; METHODE u8 kind: [target key f] -> []
+vmop_METHODE:
+    movzx r8d, byte [rsi]
+    inc rsi
+    POPV rcx
+    POPV rax
+    mov [vm_sp], r12
+    call js_to_key
+    mov edx, eax
+    POPV rax
+    call vm_define_method
+    NEXT
+
+; vm_define_method: RAX = target (value), EDX = key atom, RCX = function,
+; R8D = 0 method / 1 getter / 2 setter -> defined (not enumerable), with the
+; target as the function's home object (super)
+vm_define_method:
+    push rax
+    push rdx
+    mov eax, eax
+    mov rdx, rcx
+    shr rdx, 48
+    cmp edx, JS_TAG_OBJECT
+    jne .define
+    mov edx, ecx
+    cmp byte [rdx + JH_KIND], JK_FUNC
+    jne .define
+    mov [rdx + JFN_HOME], rax
+.define:
+    mov edx, [rsp]
+    test r8d, r8d
+    jnz .accessor
+    call jsobj_define_hidden
+    jmp .out
+.accessor:
+    bts rdx, 32                     ; hidden
+    call jsobj_define_accessor
+.out:
+    pop rdx
+    pop rax
+    ret
+
+; SUPERFN: -> the parent constructor (the prototype of the running function)
+vmop_SUPERFN:
+    mov rax, [r15 + JOBJ_PROTO]
+    test rax, rax
+    jz .null
+    BOX rax, rdx, JS_OBJ_BITS
+    PUSHV rax
+    NEXT
+.null:
+    mov rax, JS_NULL
+    PUSHV rax
+    NEXT
+
+; SUPERCALL u8 n, name32: [parent][this][args] -> result. Like CALL, but a
+; class constructor may be called, and natives fill in `this` (R8D = 2)
+vmop_SUPERCALL:
+    movzx ecx, byte [rsi]
+    mov r9d, [rsi + 1]
+    add rsi, 5
+.common:
+    lea rax, [rcx*8 + 16]
+    mov rbx, r12
+    sub rbx, rax
+    mov rax, [rbx]
+    mov rdx, rax
+    shr rdx, 48
+    cmp edx, JS_TAG_OBJECT
+    jne vm_not_function
+    mov edi, eax
+    cmp byte [rdi + JH_KIND], JK_FUNC
+    je .js
+    cmp byte [rdi + JH_KIND], JK_NATIVE
+    jne vm_not_function
+    mov rax, [rdi + JFN_NATIVE]
+    mov rdx, [rbx + 8]
+    mov r10, rdi                    ; natives also get themselves
+    lea rdi, [rbx + 16]
+    mov r8d, 2
+    mov [vm_sp], r12
+    call rax
+    mov r12, rbx
+    PUSHV rax
+    NEXT
+.js:
+    xor r8d, r8d
+    call vm_enter_js
+    NEXT
+
+vmop_SUPERCALLA:
+    mov r9d, [rsi]
+    add rsi, 4
+    call vm_spread_args
+    jmp vmop_SUPERCALL.common
+
+; SUPERGET atom32: -> super.name (on the prototype of the method's home object)
+vmop_SUPERGET:
+    mov edx, [rsi]
+    add rsi, 4
+    mov rax, [r15 + JFN_HOME]
+    test rax, rax
+    jz .bad
+    mov rax, [rax + JOBJ_PROTO]
+    test rax, rax
+    jz .undefined
+    BOX rax, rcx, JS_OBJ_BITS
+    VMCALL js_get
+    PUSHV rax
+    NEXT
+.undefined:
+    mov rax, JS_UNDEF
+    PUSHV rax
+    NEXT
+.bad:
+    mov edx, JE_SYNTAX
+    lea rsi, [jsmsg_super]
+    xor edi, edi
+    jmp js_throw
+
+; TRY rel32: a handler for exceptions until ENDTRY
+vmop_TRY:
+    mov ecx, [vm_handler_count]
+    cmp ecx, JSVM_MAX_HANDLERS
+    jae .too_many
+    imul rbx, rcx, JTH_SIZE
+    lea rdx, [vm_handlers]
+    add rbx, rdx
+    movsxd rax, dword [rsi]
+    lea rax, [rsi + rax + 4]
+    mov [rbx + JTH_PC], rax
+    mov [rbx + JTH_SP], r12
+    mov [rbx + JTH_BASE], r13
+    mov [rbx + JTH_ENV], r14
+    mov [rbx + JTH_FUNC], r15
+    mov rax, [vm_fp]
+    mov [rbx + JTH_FP], rax
+    mov [rbx + JTH_RSP], rsp
+    mov eax, [vm_nesting]
+    mov [rbx + JTH_NEST], eax
+    mov eax, [js_depth]
+    mov [rbx + JTH_DEPTH], eax
+    inc ecx
+    mov [vm_handler_count], ecx
+    add rsi, 4
+    NEXT
+.too_many:
+    mov edx, JE_RANGE
+    lea rsi, [jsmsg_handlers]
+    xor edi, edi
+    jmp js_throw
+
+vmop_ENDTRY:
+    dec dword [vm_handler_count]
     NEXT
 
 vmop_CONSTERR:

@@ -166,6 +166,28 @@ document.getElementById('go').onclick = function (e) { e.preventDefault(); conso
 </script>
 </body></html>"""
 
+# Garbage collection on a page: text and element objects only the DOM refers to
+GC_HTML = """<html><body>
+<div id="out"></div>
+<script>
+var out = document.getElementById('out');
+for (var i = 0; i < 5; i++) {
+    var p = document.createElement('p');
+    p.textContent = ['GC', i, 'TEXT'].join('-');    // a string nothing else keeps
+    p.tag = {n: i};                                 // on the element's object
+    out.appendChild(p);
+}
+p = null;
+out = null;
+var junk;
+for (var k = 0; k < 100000; k++) junk = {k: k, s: 'garbage ' + k, a: [k, k]};
+var ps = document.getElementsByTagName('p');
+var tags = [];
+for (var i = 0; i < ps.length; i++) tags.push(ps[i].tag.n);
+console.log('after gc', tags.join(), ps[4].textContent);
+</script>
+</body></html>"""
+
 
 class HostWebServer:
     """http.server on 127.0.0.1 (reachable from the guest as 10.0.2.2:<port>)."""
@@ -184,6 +206,7 @@ class HostWebServer:
         (self.root / "extra.js").write_text(EXTRA_JS)
         (self.root / "click.html").write_text(CLICK_HTML)
         (self.root / "dom.html").write_text(DOM_HTML)
+        (self.root / "gc.html").write_text(GC_HTML)
         # GET /sub answers "301 Location: /sub/" (http.server adds the slash)
         (self.root / "sub").mkdir(exist_ok=True)
         (self.root / "sub" / "index.html").write_text("<html><body><p>Sub page</p></body></html>")

@@ -24,14 +24,23 @@ suite and the reviewers (human or not) assume them.
 - **XMM registers and the x87 stack are scratch** everywhere: nothing keeps
   a value in them across a call, and interrupt handlers never touch them
   (`fpu_init` turns them on; the JavaScript engine uses them for doubles).
-- **JavaScript** (`kernel/js/`) has two more rules:
+- **JavaScript** (`kernel/js/`) has three more rules:
   - opcode handlers in `vm.asm` keep the interpreter's registers (RSI = pc,
     R12 = value stack, R13 = frame base, R14 = environment, R15 = function,
     RBP = opcode table) and store R12 in `vm_sp` before calling anything
     that can run JavaScript (`VMCALL`);
-  - native functions take RDI = arguments, ECX = count, RDX = `this` and
-    return the result in RAX, preserving everything else. Errors call
-    `js_throw`, which does not return.
+  - native functions take RDI = arguments, ECX = count, RDX = `this`,
+    R8D = 1 under `new`, R10 = the function object itself (a bound
+    function finds its target there) and return the result in RAX,
+    preserving everything else. Errors call `js_throw`, which does not
+    return;
+  - heap blocks come from `js_alloc` and are never freed by hand: the
+    collector (`gc.asm`) frees what nothing points to. Keep heap pointers
+    in registers, on the stacks, in `.bss` qwords, in heap blocks or in the
+    DOM node fields it scans; a pointer kept anywhere else (a dword, another
+    memory region) does not keep its block alive. Mark blocks that hold no
+    pointers `GCF_LEAF`, and allocate what must live forever with
+    `js_alloc_perm`.
 
 ## Sections and memory
 

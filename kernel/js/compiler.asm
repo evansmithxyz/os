@@ -29,10 +29,13 @@ JLC_BREAK_ENV           equ 20          ; dword, env depth at the break target
 JLC_CONT_ENV            equ 24          ; dword, env depth at the continue target
 JLC_BREAKS              equ 32          ; patch list
 JLC_CONTS               equ 40          ; patch list
-JLC_SIZE                equ 48
+JLC_FINALLY             equ 48          ; LC_TRY: the finally block (0 = none)
+JLC_SCOPE               equ 56          ; LC_TRY: the scope at the try statement
+JLC_SIZE                equ 64
 LC_LOOP                 equ 1
 LC_SWITCH               equ 2
 LC_BLOCK                equ 3
+LC_TRY                  equ 4           ; inside try { } (or catch { } with a finally)
 
 ; Name resolution results (jsc_resolve)
 RES_LOCAL               equ 1
@@ -66,6 +69,7 @@ jsc_scope:              resq 1          ; current scope
 jsc_loop:               resq 1          ; innermost loop context
 jsc_pending_label:      resq 1          ; label for the next loop
 jsc_script:             resq 1          ; the script's function info
+jsc_chain:              resq 1          ; patch list of the ?. in the current chain
 jsc_env_depth:          resd 1          ; block envs entered in this function
 jsc_completion:         resd 1          ; 1 = expression statements set the completion value
 jsc_line:               resd 1          ; line of the last OP_LINE
@@ -293,6 +297,18 @@ jsc_function:
     mov rsi, [rsi + JVR_NEXT]
     jmp .globals
 .body:
+    test dword [rbx + JFI_FLAGS], FIF_PARAMCODE
+    jz .fields
+    call jsc_param_code
+.fields:
+    ; a base class's constructor sets its fields first (a derived one after super())
+    mov eax, [rbx + JFI_FLAGS]
+    and eax, FIF_CLASSCTOR | FIF_DERIVED
+    cmp eax, FIF_CLASSCTOR
+    jne .hoist
+    mov rax, rbx
+    call jsc_fields
+.hoist:
     ; function declarations first (hoisting), then the statements
     mov rax, [rbx + JFI_BODY]
     call jsc_hoist
@@ -309,7 +325,7 @@ jsc_function:
     call jsc_op
 .template:
     mov ecx, JCODE_SIZE
-    call js_alloc
+    call js_alloc_perm
     mov rdi, rax
     mov byte [rdi + JH_KIND], JK_CODE
     mov ecx, [rbx + JFI_FLAGS]
@@ -330,6 +346,25 @@ jsc_function:
     jz .f4
     or al, JCF_SCRIPT
 .f4:
+    test ecx, FIF_ARROW
+    jz .f5
+    or al, JCF_ARROW
+.f5:
+    test ecx, FIF_CLASSCTOR
+    jz .f5a
+    or al, JCF_CLASSCTOR
+.f5a:
+    test ecx, FIF_DERIVED
+    jz .f5b
+    or al, JCF_DERIVED
+.f5b:
+    cmp qword [rbx + JFI_REST], 0
+    je .f6
+    or al, JCF_REST
+    mov rcx, [rbx + JFI_REST]
+    mov ecx, [rcx + JVR_SLOT]
+    mov [rdi + JCODE_RESTSLOT], ecx
+.f6:
     mov [rdi + JCODE_FLAGS], al
     mov eax, [rbx + JFI_NPARAMS]
     mov [rdi + JCODE_NPARAMS], ax
@@ -364,7 +399,7 @@ jsc_function:
     mov rcx, [jsc_code_ptr]
     sub rcx, [jsc_code_start]
     mov [rdi + JCODE_LEN], ecx
-    call js_alloc
+    call js_alloc_perm
     mov [rdi + JCODE_CODE], rax
     push rdi
     mov rsi, [jsc_code_start]
@@ -390,11 +425,11 @@ jsc_function:
     ret
 
 ; jsc_assign_slots: RBX = function info; gives every variable its slot and
-; marks which scopes make heap environments
+; marks which scopes make heap environments. Parameters come first (the call
+; puts the arguments in slots 0..n-1).
 jsc_assign_slots:
     push rax
     push rcx
-    push rdx
     push rsi
     mov rsi, [rbx + JFI_SCOPES]
     xor ecx, ecx                    ; next stack slot (stack functions)
@@ -404,15 +439,7 @@ jsc_assign_slots:
     test rsi, rsi
     jz .stack_done
     mov byte [rsi + JSC_ENV], 0
-    mov rax, [rsi + JSC_VARS]
-.stack_var:
-    test rax, rax
-    jz .stack_next
-    mov [rax + JVR_SLOT], ecx
-    inc ecx
-    mov rax, [rax + JVR_NEXT]
-    jmp .stack_var
-.stack_next:
+    call .number
     mov rsi, [rsi + JSC_NEXT]
     jmp .stack_scope
 .stack_done:
@@ -422,15 +449,7 @@ jsc_assign_slots:
     test rsi, rsi
     jz .heap_done
     xor ecx, ecx
-    mov rax, [rsi + JSC_VARS]
-.heap_var:
-    test rax, rax
-    jz .heap_env
-    mov [rax + JVR_SLOT], ecx
-    inc ecx
-    mov rax, [rax + JVR_NEXT]
-    jmp .heap_var
-.heap_env:
+    call .number
     mov byte [rsi + JSC_ENV], 1
     cmp rsi, [rbx + JFI_SCOPE]
     je .heap_next                   ; the function scope always gets one
@@ -445,8 +464,48 @@ jsc_assign_slots:
     mov [rbx + JFI_NLOCALS], eax
 .out:
     pop rsi
-    pop rdx
     pop rcx
+    pop rax
+    ret
+; .number: RSI = scope, ECX = next slot -> its variables numbered (in the
+; function scope: parameters, then the rest)
+.number:
+    push rax
+    cmp rsi, [rbx + JFI_SCOPE]
+    jne .all
+    mov rax, [rsi + JSC_VARS]
+.params:
+    test rax, rax
+    jz .others
+    cmp byte [rax + JVR_KIND], VK_PARAM
+    jne .param_next
+    mov [rax + JVR_SLOT], ecx
+    inc ecx
+.param_next:
+    mov rax, [rax + JVR_NEXT]
+    jmp .params
+.others:
+    mov rax, [rsi + JSC_VARS]
+.other:
+    test rax, rax
+    jz .numbered
+    cmp byte [rax + JVR_KIND], VK_PARAM
+    je .other_next
+    mov [rax + JVR_SLOT], ecx
+    inc ecx
+.other_next:
+    mov rax, [rax + JVR_NEXT]
+    jmp .other
+.all:
+    mov rax, [rsi + JSC_VARS]
+.any:
+    test rax, rax
+    jz .numbered
+    mov [rax + JVR_SLOT], ecx
+    inc ecx
+    mov rax, [rax + JVR_NEXT]
+    jmp .any
+.numbered:
     pop rax
     ret
 
@@ -745,6 +804,10 @@ jsc_stmt:
     je .throw
     cmp ecx, NT_SWITCH
     je .switch
+    cmp ecx, NT_TRY
+    je .try
+    cmp ecx, NT_CLASS
+    je .class
     jmp .out
 .expr:
     mov rax, [rbx + JN_A]
@@ -798,11 +861,15 @@ jsc_stmt:
     test rax, rax
     jz .return_undef
     call jsc_expr
+    call jsc_leave_tries             ; ENDTRY and finally blocks on the way out
     mov al, OP_RET
     call jsc_op
     jmp .out
 .return_undef:
-    mov al, OP_RETUNDEF
+    mov al, OP_UNDEF
+    call jsc_op
+    call jsc_leave_tries
+    mov al, OP_RET
     call jsc_op
     jmp .out
 .throw:
@@ -825,6 +892,17 @@ jsc_stmt:
     jmp .out
 .switch:
     call jsc_switch
+    jmp .out
+.try:
+    call jsc_try
+    jmp .out
+.class:
+    call jsc_class
+    mov rdx, [rbx + JN_A]
+    mov edi, 1
+    call jsc_store
+    mov al, OP_POP
+    call jsc_op
     jmp .out
 .jump:
     call jsc_break_continue
@@ -862,10 +940,24 @@ jsc_declarations:
     jz .done
     mov rdx, [rsi + JN_A]
     mov rax, [rsi + JN_B]
+    test word [rsi + JN_FLAGS], JNF_PATTERN
+    jnz .pattern
     test rax, rax
     jz .no_init
     call jsc_named_expr
     jmp .store
+.pattern:
+    test rax, rax
+    jnz .pattern_value
+    mov al, OP_UNDEF
+    call jsc_op
+    jmp .pattern_store
+.pattern_value:
+    call jsc_expr
+.pattern_store:
+    mov rax, rdx
+    call jsc_destructure            ; (EDI = 1: declarations)
+    jmp .next
 .no_init:
     cmp ecx, KW_VAR
     je .next
@@ -903,6 +995,205 @@ jsc_named_expr:
 ; ------------------------------------------------------------------------------
 ; Loops. Each pushes a context for break/continue (jsc_push_loop).
 ; ------------------------------------------------------------------------------
+
+; jsc_pops: ECX = values to drop -> that many OP_POPs, ECX = 0
+jsc_pops:
+    push rax
+    mov al, OP_POP
+.loop:
+    test ecx, ecx
+    jz .done
+    call jsc_op
+    dec ecx
+    jmp .loop
+.done:
+    pop rax
+    ret
+
+; jsc_leave_try: RAX = an LC_TRY context being left by a jump -> LEAVEENV down
+; to its env depth, ENDTRY, then its finally block (compiled as it stands at
+; the try statement). jsc_env_depth is the try's afterwards.
+jsc_leave_try:
+    push rax
+    push rbx
+    push rcx
+    mov rbx, rax
+    mov ecx, [jsc_env_depth]
+    sub ecx, [rbx + JLC_BREAK_ENV]
+    mov al, OP_LEAVEENV
+.leave:
+    test ecx, ecx
+    jle .left
+    call jsc_op
+    dec ecx
+    jmp .leave
+.left:
+    mov eax, [rbx + JLC_BREAK_ENV]
+    mov [jsc_env_depth], eax
+    mov al, OP_ENDTRY
+    call jsc_op
+    mov rax, [rbx + JLC_FINALLY]
+    test rax, rax
+    jz .done
+    push qword [jsc_loop]
+    push qword [jsc_scope]
+    mov rcx, [rbx + JLC_PARENT]
+    mov [jsc_loop], rcx
+    mov rcx, [rbx + JLC_SCOPE]
+    mov [jsc_scope], rcx
+    call jsc_stmt
+    pop qword [jsc_scope]
+    pop qword [jsc_loop]
+.done:
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; jsc_leave_tries: before a return: every try of this function, innermost
+; first (the return value stays on the stack meanwhile)
+jsc_leave_tries:
+    push rax
+    push rbx
+    push qword [jsc_env_depth]
+    mov rbx, [jsc_loop]
+.loop:
+    test rbx, rbx
+    jz .done
+    cmp byte [rbx + JLC_KIND], LC_TRY
+    jne .next
+    mov rax, rbx
+    call jsc_leave_try
+.next:
+    mov rbx, [rbx + JLC_PARENT]
+    jmp .loop
+.done:
+    pop qword [jsc_env_depth]
+    pop rbx
+    pop rax
+    ret
+
+; ------------------------------------------------------------------------------
+; jsc_try: RBX = NT_TRY
+;     TRY -> fin                     (with a finally block)
+;       TRY -> catch                 (with a catch block)
+;         block
+;       ENDTRY, JMP after
+;     catch: [bind the exception] catch block
+;     after:
+;     ENDTRY, finally block, JMP end
+;   fin: finally block, THROW        (the exception is on the stack)
+;   end:
+; ------------------------------------------------------------------------------
+jsc_try:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push qword [jsc_pending_label]
+    mov qword [jsc_pending_label], 0
+    xor r8d, r8d                    ; the finally context
+    cmp qword [rbx + JN_D], 0
+    je .no_finally
+    mov al, LC_TRY
+    xor ecx, ecx
+    call jsc_push_loop
+    mov r8, rax
+    mov rcx, [rbx + JN_D]
+    mov [r8 + JLC_FINALLY], rcx
+    mov rcx, [jsc_scope]
+    mov [r8 + JLC_SCOPE], rcx
+    mov al, OP_TRY
+    call jsc_jump
+    mov r9, rax                     ; -> fin
+.no_finally:
+    cmp qword [rbx + JN_C], 0
+    je .no_catch
+    mov al, LC_TRY
+    xor ecx, ecx
+    call jsc_push_loop
+    mov rdi, rax
+    mov rcx, [jsc_scope]
+    mov [rdi + JLC_SCOPE], rcx
+    mov al, OP_TRY
+    call jsc_jump
+    mov rsi, rax                    ; -> catch
+    mov rax, [rbx + JN_A]
+    call jsc_stmt
+    mov al, OP_ENDTRY
+    call jsc_op
+    mov rax, rdi
+    call jsc_pop_loop
+    mov al, OP_JMP
+    call jsc_jump
+    mov rdi, rax                    ; -> after
+    mov rax, rsi
+    call jsc_patch_here
+    ; catch: the exception is on the stack
+    mov rax, [rbx + JN_E]
+    call jsc_enter_scope
+    mov rsi, rax
+    mov rdx, [rbx + JN_B]
+    test rdx, rdx
+    jz .no_binding
+    push rdi
+    mov edi, 1
+    mov rax, rdx
+    cmp byte [rbx + JN_OP], 1
+    je .catch_pattern
+    call jsc_store
+    pop rdi
+.no_binding:
+    mov al, OP_POP
+    call jsc_op
+    jmp .catch_body
+.catch_pattern:
+    call jsc_destructure
+    pop rdi
+.catch_body:
+    mov rax, [rbx + JN_C]
+    call jsc_stmt
+    mov rax, rsi
+    call jsc_leave_scope
+    mov rax, rdi
+    call jsc_patch_here
+    jmp .body_done
+.no_catch:
+    mov rax, [rbx + JN_A]
+    call jsc_stmt
+.body_done:
+    test r8, r8
+    jz .done
+    mov al, OP_ENDTRY
+    call jsc_op
+    mov rax, r8
+    call jsc_pop_loop
+    mov rax, [rbx + JN_D]
+    call jsc_stmt
+    mov al, OP_JMP
+    call jsc_jump
+    mov rdi, rax                    ; -> end
+    mov rax, r9
+    call jsc_patch_here
+    mov rax, [rbx + JN_D]
+    call jsc_stmt
+    mov al, OP_THROW
+    call jsc_op
+    mov rax, rdi
+    call jsc_patch_here
+.done:
+    pop qword [jsc_pending_label]
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
 
 ; jsc_push_loop: AL = LC_*, CL = values on the stack while inside it
 ; -> RAX = context (its label is the pending one)
@@ -1132,16 +1423,26 @@ jsc_forin:
     cmp byte [rax + JN_TYPE], NT_VAR
     jne .target
     mov rax, [rax + JN_A]           ; the NT_DECL
-    mov rdx, [rax + JN_A]
     push rdi
     mov edi, 1
+    test word [rax + JN_FLAGS], JNF_PATTERN
+    jz .decl_name
+    mov rax, [rax + JN_A]
+    call jsc_destructure
+    pop rdi
+    jmp .body
+.decl_name:
+    mov rdx, [rax + JN_A]
     call jsc_store
     pop rdi
     mov al, OP_POP
     call jsc_op
     jmp .body
 .target:
-    call jsc_store_top
+    push rdi
+    xor edi, edi
+    call jsc_destructure
+    pop rdi
 .body:
     mov rax, [rbx + JN_D]
     call jsc_stmt
@@ -1370,13 +1671,27 @@ jsc_break_continue:
     mov rsi, [rsi + JLC_PARENT]
     jmp .find
 .found:
-    mov al, OP_POP
-.pops:
-    test ecx, ecx
-    jz .envs
-    call jsc_op
-    dec ecx
-    jmp .pops
+    push qword [jsc_env_depth]      ; the jump changes it only on its way out
+    ; try blocks on the way out: ENDTRY, and their finally code
+    mov rdi, [jsc_loop]
+    xor ecx, ecx                    ; values to pop so far
+.walk:
+    cmp rdi, rsi
+    je .walked
+    cmp byte [rdi + JLC_KIND], LC_TRY
+    jne .walk_pops
+    call jsc_pops                   ; ECX values, then 0
+    push rax
+    mov rax, rdi
+    call jsc_leave_try
+    pop rax
+.walk_pops:
+    movzx eax, byte [rdi + JLC_POPS]
+    add ecx, eax
+    mov rdi, [rdi + JLC_PARENT]
+    jmp .walk
+.walked:
+    call jsc_pops
 .envs:
     mov ecx, [jsc_env_depth]
     cmp byte [rbx + JN_TYPE], NT_BREAK
@@ -1402,6 +1717,7 @@ jsc_break_continue:
     mov rbx, rdi
     call jsc_add_patch
     pop rbx
+    pop qword [jsc_env_depth]
     pop rdi
     pop rsi
     pop rdx
@@ -1504,6 +1820,16 @@ jsc_expr:
     je .call
     cmp ecx, NT_NEW
     je .new
+    cmp ecx, NT_TEMPLATE
+    je .template
+    cmp ecx, NT_CLASS
+    je .class
+    cmp ecx, NT_SUPERCALL
+    je .supercall
+    cmp ecx, NT_SUPERMEMBER
+    je .supermember
+    cmp ecx, NT_CHAIN
+    je .chain
     ; NT_HOLE outside an array: undefined
     mov al, OP_UNDEF
     call jsc_op
@@ -1551,10 +1877,19 @@ jsc_expr:
     jmp .append
 .element_value:
     mov rax, rsi
+    cmp byte [rsi + JN_TYPE], NT_SPREAD
+    jne .element_plain
+    mov rax, [rsi + JN_A]
+    call jsc_expr
+    mov al, OP_SPREAD
+    call jsc_op
+    jmp .next_element
+.element_plain:
     call jsc_expr
 .append:
     mov al, OP_APPEND
     call jsc_op
+.next_element:
     mov rsi, [rsi + JN_NEXT]
     jmp .element
 .object:
@@ -1564,6 +1899,28 @@ jsc_expr:
 .property:
     test rsi, rsi
     jz .out
+    cmp byte [rsi + JN_OP], 2
+    jne .not_spread
+    mov rax, [rsi + JN_A]           ; ...spread
+    call jsc_expr
+    mov al, OP_OBJSPREAD
+    call jsc_op
+    jmp .next_property
+.not_spread:
+    cmp byte [rsi + JN_OP], 3
+    jb .data_property
+    ; get / set
+    mov rax, [rsi + JN_B]
+    call jsc_expr
+    mov rdx, [rsi + JN_A]
+    mov al, OP_INITGET
+    cmp byte [rsi + JN_OP], 3
+    je .accessor_op
+    mov al, OP_INITSET
+.accessor_op:
+    call jsc_op_u32
+    jmp .next_property
+.data_property:
     cmp byte [rsi + JN_OP], 0
     jne .computed
     mov rdx, [rsi + JN_A]
@@ -1648,6 +2005,7 @@ jsc_expr:
 .member:
     mov rax, [rbx + JN_A]
     call jsc_expr
+    call jsc_optional
     mov rdx, [rbx + JN_B]
     mov al, OP_GETPROP
     call jsc_op_u32_cache
@@ -1655,6 +2013,7 @@ jsc_expr:
 .index:
     mov rax, [rbx + JN_A]
     call jsc_expr
+    call jsc_optional
     mov rax, [rbx + JN_B]
     call jsc_expr
     mov al, OP_GETELEM
@@ -1665,6 +2024,56 @@ jsc_expr:
     jmp .out
 .new:
     call jsc_new
+    jmp .out
+.template:
+    ; "piece" + String(expression) + "piece" ...
+    mov rsi, [rbx + JN_A]
+    mov rdx, [rsi + JN_A]
+    mov al, OP_STR
+    call jsc_op_u32
+.template_piece:
+    mov rsi, [rsi + JN_NEXT]
+    test rsi, rsi
+    jz .out
+    cmp byte [rsi + JN_TYPE], NT_STR
+    jne .template_expr
+    mov rdx, [rsi + JN_A]
+    cmp dword [rdx + JSTR_LEN], 0
+    je .template_piece
+    mov al, OP_STR
+    call jsc_op_u32
+    mov al, OP_ADD
+    call jsc_op
+    jmp .template_piece
+.template_expr:
+    mov rax, rsi
+    call jsc_expr
+    mov al, OP_TOSTR
+    call jsc_op
+    mov al, OP_ADD
+    call jsc_op
+    jmp .template_piece
+.class:
+    call jsc_class
+    jmp .out
+.supercall:
+    call jsc_supercall
+    jmp .out
+.supermember:
+    mov rdx, [rbx + JN_B]
+    mov al, OP_SUPERGET
+    call jsc_op_u32
+    jmp .out
+.chain:
+    ; a?.b...: every ?. jumps here with undefined
+    push qword [jsc_chain]
+    mov qword [jsc_chain], 0
+    mov rax, [rbx + JN_A]
+    call jsc_expr
+    mov rax, [jsc_chain]
+    mov rdx, [jsc_code_ptr]
+    call jsc_resolve_patches
+    pop qword [jsc_chain]
 .out:
     pop rdi
     pop rsi
@@ -1923,6 +2332,10 @@ jsc_assign:
     jne .compound
     ; plain assignment
     movzx eax, byte [rsi + JN_TYPE]
+    cmp eax, NT_APAT
+    je .set_pattern
+    cmp eax, NT_OPAT
+    je .set_pattern
     cmp eax, NT_MEMBER
     je .set_member
     cmp eax, NT_INDEX
@@ -1941,6 +2354,16 @@ jsc_assign:
     mov rdx, [rsi + JN_B]
     mov al, OP_SETPROP
     call jsc_op_u32
+    jmp .out
+.set_pattern:
+    ; [a, b] = value: the value is also the result
+    mov rax, [rbx + JN_B]
+    call jsc_expr
+    mov al, OP_DUP
+    call jsc_op
+    mov rax, rsi
+    xor edi, edi
+    call jsc_destructure
     jmp .out
 .set_index:
     mov rax, [rsi + JN_A]
@@ -2093,6 +2516,178 @@ jsc_assign:
     pop rax
     ret
 
+; ------------------------------------------------------------------------------
+; jsc_class: RBX = NT_CLASS -> code leaving the constructor on the stack:
+;   [parent] CLASS flags, code; then per member: DUP [GETPROP prototype]
+;   closure METHOD key, kind   (static fields: DUP value INITPROP POP)
+; ------------------------------------------------------------------------------
+jsc_class:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    xor ecx, ecx
+    mov rax, [rbx + JN_B]
+    test rax, rax
+    jz .ctor
+    call jsc_expr
+    mov ecx, 1
+.ctor:
+    mov rax, [rbx + JN_D]
+    call jsc_function
+    mov rdx, rax
+    mov al, OP_CLASS
+    call jsc_op
+    mov al, cl
+    call jsc_op
+    mov eax, edx
+    call jsc_u32
+    mov rsi, [rbx + JN_C]
+.member:
+    test rsi, rsi
+    jz .done
+    mov al, OP_DUP
+    call jsc_op
+    test byte [rsi + JN_OP], CM_STATIC
+    jnz .target
+    mov rdx, [atom_prototype]
+    mov al, OP_GETPROP
+    call jsc_op_u32_cache
+.target:
+    test byte [rsi + JN_OP], CM_FIELD
+    jz .method
+    ; a static field
+    mov rax, [rsi + JN_B]
+    test rax, rax
+    jnz .field_value
+    mov al, OP_UNDEF
+    call jsc_op
+    jmp .field_store
+.field_value:
+    mov rdx, [rsi + JN_A]
+    call jsc_named_expr
+.field_store:
+    mov rdx, [rsi + JN_A]
+    mov al, OP_INITPROP
+    call jsc_op_u32
+    mov al, OP_POP
+    call jsc_op
+    jmp .next
+.method:
+    xor ecx, ecx
+    test byte [rsi + JN_OP], CM_GET
+    jz .not_get
+    mov ecx, 1
+.not_get:
+    test byte [rsi + JN_OP], CM_SET
+    jz .kind
+    mov ecx, 2
+.kind:
+    test byte [rsi + JN_OP], CM_COMPUTED
+    jnz .computed
+    mov rax, [rsi + JN_B]
+    call jsc_expr
+    mov rdx, [rsi + JN_A]
+    mov al, OP_METHOD
+    call jsc_op_u32
+    mov al, cl
+    call jsc_op
+    jmp .next
+.computed:
+    mov rax, [rsi + JN_A]
+    call jsc_expr
+    mov rax, [rsi + JN_B]
+    call jsc_expr
+    mov al, OP_METHODE
+    call jsc_op
+    mov al, cl
+    call jsc_op
+.next:
+    mov rsi, [rsi + JN_NEXT]
+    jmp .member
+.done:
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; jsc_supercall: RBX = NT_SUPERCALL -> the parent constructor called on this,
+; then the derived class's fields; the value is this
+jsc_supercall:
+    push rax
+    push rdx
+    mov al, OP_SUPERFN
+    call jsc_op
+    mov al, OP_THIS
+    call jsc_op
+    xor edx, edx
+    mov al, OP_SUPERCALL
+    call jsc_args
+    mov al, OP_POP
+    call jsc_op
+    mov rax, [jsc_fi]
+    test dword [rax + JFI_FLAGS], FIF_DERIVED
+    jz .this
+    call jsc_fields
+.this:
+    mov al, OP_THIS
+    call jsc_op
+    pop rdx
+    pop rax
+    ret
+
+; jsc_fields: RAX = class constructor's function info -> this.field = value
+; for each instance field
+jsc_fields:
+    push rax
+    push rdx
+    push rsi
+    mov rsi, [rax + JFI_FIELDS]
+.field:
+    test rsi, rsi
+    jz .done
+    mov al, OP_THIS
+    call jsc_op
+    mov rax, [rsi + JN_B]
+    test rax, rax
+    jnz .value
+    mov al, OP_UNDEF
+    call jsc_op
+    jmp .store
+.value:
+    mov rdx, [rsi + JN_A]
+    call jsc_named_expr
+.store:
+    mov rdx, [rsi + JN_A]
+    mov al, OP_INITPROP
+    call jsc_op_u32
+    mov al, OP_POP
+    call jsc_op
+    mov rsi, [rsi + JN_NEXT]
+    jmp .field
+.done:
+    pop rsi
+    pop rdx
+    pop rax
+    ret
+
+; jsc_optional: RBX = member / index / call node -> if it follows ?. (the
+; object is on the stack), a jump to the chain's end when it is null/undefined
+jsc_optional:
+    test word [rbx + JN_FLAGS], JNF_OPTIONAL
+    jz .ret
+    push rax
+    push rbx
+    mov al, OP_JNULLISH
+    call jsc_jump
+    lea rbx, [jsc_chain]
+    call jsc_add_patch
+    pop rbx
+    pop rax
+.ret:
+    ret
+
 ; jsc_call: RBX = NT_CALL
 jsc_call:
     push rax
@@ -2106,6 +2701,8 @@ jsc_call:
     je .method
     cmp eax, NT_INDEX
     je .method_index
+    cmp eax, NT_SUPERMEMBER
+    je .super_method
     cmp eax, NT_IDENT
     jne .plain
     mov rdx, [rsi + JN_A]
@@ -2118,32 +2715,45 @@ jsc_call:
 .method:
     mov rax, [rsi + JN_A]
     call jsc_expr
+    push rbx
+    mov rbx, rsi
+    call jsc_optional               ; a?.b()
+    pop rbx
     mov rdx, [rsi + JN_B]
     mov al, OP_GETMETHOD
     call jsc_op_u32
     jmp .args
+.super_method:
+    mov rdx, [rsi + JN_B]
+    mov al, OP_SUPERGET
+    call jsc_op_u32
+    mov al, OP_THIS
+    call jsc_op
+    jmp .args
 .method_index:
     mov rax, [rsi + JN_A]
     call jsc_expr
+    push rbx
+    mov rbx, rsi
+    call jsc_optional
+    pop rbx
     mov rax, [rsi + JN_B]
     call jsc_expr
     mov al, OP_GETMETHODE
     call jsc_op
 .args:
-    mov rax, [rbx + JN_B]
-.arg:
-    test rax, rax
-    jz .emit
-    call jsc_expr
-    mov rax, [rax + JN_NEXT]
-    jmp .arg
-.emit:
+    test word [rbx + JN_FLAGS], JNF_OPTIONAL
+    jz .not_optional
+    ; f?.(): nothing to call -> undefined at the chain's end
+    push rbx
+    mov al, OP_JNULLCALL
+    call jsc_jump
+    lea rbx, [jsc_chain]
+    call jsc_add_patch
+    pop rbx
+.not_optional:
     mov al, OP_CALL
-    call jsc_op
-    mov al, [rbx + JN_C]
-    call jsc_op
-    mov eax, edx
-    call jsc_u32
+    call jsc_args
     pop rsi
     pop rdx
     pop rcx
@@ -2169,6 +2779,23 @@ jsc_new:
     call jsc_expr
     mov al, OP_UNDEF                ; the slot for `this`
     call jsc_op
+    mov al, OP_NEW
+    call jsc_args
+    pop rsi
+    pop rdx
+    pop rax
+    ret
+
+; jsc_args: RBX = call / new node, AL = OP_CALL / OP_NEW, EDX = name for
+; errors -> the arguments and the call. With ...spread they go in an array
+; and OP_CALLA / OP_NEWA spread it.
+jsc_args:
+    push rax
+    push rcx
+    push rsi
+    mov cl, al
+    test word [rbx + JN_FLAGS], JNF_SPREAD
+    jnz .spread
     mov rax, [rbx + JN_B]
 .arg:
     test rax, rax
@@ -2177,12 +2804,251 @@ jsc_new:
     mov rax, [rax + JN_NEXT]
     jmp .arg
 .emit:
-    mov al, OP_NEW
+    mov al, cl
     call jsc_op
     mov al, [rbx + JN_C]
     call jsc_op
     mov eax, edx
     call jsc_u32
+    jmp .out
+.spread:
+    mov al, OP_ARRAY
+    call jsc_op
+    mov rsi, [rbx + JN_B]
+.item:
+    test rsi, rsi
+    jz .emit_array
+    cmp byte [rsi + JN_TYPE], NT_SPREAD
+    je .item_spread
+    mov rax, rsi
+    call jsc_expr
+    mov al, OP_APPEND
+    call jsc_op
+    jmp .item_next
+.item_spread:
+    mov rax, [rsi + JN_A]
+    call jsc_expr
+    mov al, OP_SPREAD
+    call jsc_op
+.item_next:
+    mov rsi, [rsi + JN_NEXT]
+    jmp .item
+.emit_array:
+    mov al, OP_CALLA
+    cmp cl, OP_CALL
+    je .emit_a
+    mov al, OP_NEWA
+    cmp cl, OP_NEW
+    je .emit_a
+    mov al, OP_SUPERCALLA
+.emit_a:
+    call jsc_op_u32
+.out:
+    pop rsi
+    pop rcx
+    pop rax
+    ret
+
+; ------------------------------------------------------------------------------
+; jsc_destructure: RAX = target (name, a.b, a[b], [..] or {..} pattern), EDI =
+; 1 when it declares -> code that stores the value on top of the stack into
+; it, taking the value off the stack
+; ------------------------------------------------------------------------------
+jsc_destructure:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    mov rbx, rax
+    movzx eax, byte [rbx + JN_TYPE]
+    cmp eax, NT_APAT
+    je .array
+    cmp eax, NT_OPAT
+    je .object
+    cmp eax, NT_IDENT
+    jne .member
+    mov rdx, [rbx + JN_A]
+    call jsc_store
+    mov al, OP_POP
+    call jsc_op
+    jmp .out
+.member:
+    mov rax, rbx
+    call jsc_store_top
+    jmp .out
+.array:
+    xor ecx, ecx                    ; index
+    mov rsi, [rbx + JN_A]
+.item:
+    test rsi, rsi
+    jz .done
+    cmp qword [rsi + JN_A], 0
+    je .item_next                   ; a hole
+    mov al, OP_DUP
+    call jsc_op
+    test byte [rsi + JN_OP], 1
+    jnz .rest
+    mov al, OP_NUM
+    call jsc_op
+    push rcx
+    cvtsi2sd xmm0, rcx
+    movq rax, xmm0
+    call jsc_u64
+    pop rcx
+    mov al, OP_GETELEM
+    call jsc_op
+    jmp .value
+.rest:
+    mov al, OP_ARRREST
+    mov edx, ecx
+    call jsc_op_u32
+    jmp .value
+.item_next:
+    inc ecx
+    mov rsi, [rsi + JN_NEXT]
+    jmp .item
+.value:
+    ; the default, then the target
+    call jsc_default
+    mov rax, [rsi + JN_A]
+    call jsc_destructure
+    cmp byte [rbx + JN_TYPE], NT_OPAT
+    je .prop_next
+    jmp .item_next
+.object:
+    mov rsi, [rbx + JN_A]
+.prop:
+    test rsi, rsi
+    jz .done
+    mov al, OP_DUP
+    call jsc_op
+    test byte [rsi + JN_OP], 1
+    jnz .object_rest
+    test byte [rsi + JN_OP], 2
+    jnz .computed
+    mov rdx, [rsi + JN_C]
+    mov al, OP_GETPROP
+    call jsc_op_u32_cache
+    jmp .value
+.computed:
+    mov rax, [rsi + JN_C]
+    call jsc_expr
+    mov al, OP_GETELEM
+    call jsc_op
+    jmp .value
+.object_rest:
+    ; the named keys before it are left out
+    xor ecx, ecx
+    mov rax, [rbx + JN_A]
+.excluded:
+    cmp rax, rsi
+    je .excluded_done
+    test byte [rax + JN_OP], 2
+    jnz .excluded_next
+    mov rdx, [rax + JN_C]
+    push rax
+    mov al, OP_STR
+    call jsc_op_u32
+    pop rax
+    inc ecx
+.excluded_next:
+    mov rax, [rax + JN_NEXT]
+    jmp .excluded
+.excluded_done:
+    mov al, OP_OBJREST
+    call jsc_op
+    mov eax, ecx
+    call jsc_u16
+    jmp .value
+.prop_next:
+    mov rsi, [rsi + JN_NEXT]
+    jmp .prop
+.done:
+    mov al, OP_POP
+    call jsc_op
+.out:
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; jsc_default: RSI = pattern element / parameter with a default in JN_B;
+; the value is on the stack -> it is replaced by the default when undefined
+jsc_default:
+    cmp qword [rsi + JN_B], 0
+    je .ret
+    push rax
+    push rdx
+    mov al, OP_DUP
+    call jsc_op
+    mov al, OP_UNDEF
+    call jsc_op
+    mov al, OP_SEQ
+    call jsc_op
+    mov al, OP_JF
+    call jsc_jump
+    push rax
+    mov al, OP_POP
+    call jsc_op
+    ; a function default gets the target's name
+    xor edx, edx
+    mov rax, [rsi + JN_A]
+    test rax, rax
+    jz .named
+    cmp byte [rax + JN_TYPE], NT_IDENT
+    jne .named
+    mov rdx, [rax + JN_A]
+.named:
+    mov rax, [rsi + JN_B]
+    test rdx, rdx
+    jz .plain
+    call jsc_named_expr
+    jmp .patch
+.plain:
+    call jsc_expr
+.patch:
+    pop rax
+    call jsc_patch_here
+    pop rdx
+    pop rax
+.ret:
+    ret
+
+; jsc_param_code: RBX = function info -> defaults and patterns of its
+; parameters, at the start of the function
+jsc_param_code:
+    push rax
+    push rdx
+    push rsi
+    push rdi
+    mov edi, 1
+    mov rsi, [rbx + JFI_PARAMS]
+.param:
+    test rsi, rsi
+    jz .done
+    ; the variable that received the argument
+    mov rax, [rsi + JN_A]
+    mov rdx, [rsi + JN_E]           ; a pattern's hidden name
+    cmp byte [rax + JN_TYPE], NT_IDENT
+    jne .load
+    test byte [rsi + JN_OP], 1
+    jnz .next                       ; ...rest name: filled in by the call
+    cmp qword [rsi + JN_B], 0
+    je .next                        ; a plain name
+    mov rdx, [rax + JN_A]
+.load:
+    call jsc_load
+    call jsc_default
+    mov rax, [rsi + JN_A]
+    call jsc_destructure            ; a name: stores the default back
+.next:
+    mov rsi, [rsi + JN_NEXT]
+    jmp .param
+.done:
+    pop rdi
     pop rsi
     pop rdx
     pop rax

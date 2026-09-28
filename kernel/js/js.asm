@@ -42,6 +42,9 @@ jsi_empty_item:         db " empty item", 0
 jsi_more_items:         db " more items", 0
 jsi_minus_zero:         db "-0", 0
 jsi_iterator:           db "[iterator]", 0
+jsi_getter:             db "[Getter]", 0
+jsi_setter:             db "[Setter]", 0
+jsi_getter_setter:      db "[Getter/Setter]", 0
 
 section .text
 
@@ -77,8 +80,10 @@ js_eval_body:
     mov rax, JS_UNDEF
     mov [vm_completion], rax
     mov dword [vm_line], 0
+    inc dword [jsgc_off]            ; no collections while compiling
     call jsp_parse_script
     call jsc_compile_script
+    dec dword [jsgc_off]
     xor edx, edx
     call jsfn_new
     BOX rax, rdx, JS_OBJ_BITS
@@ -111,10 +116,16 @@ js_protected:
     push r8
     mov r8d, [vm_nesting]
     push r8
+    mov r8d, [vm_handler_count]
+    push r8
+    mov r8d, [jsgc_off]             ; (an error while compiling leaves it raised)
+    push r8
     push qword [js_catch_rsp]
     mov [js_catch_rsp], rsp
     cmp dword [js_depth], 0
     jne .nested
+    mov dword [vm_handler_count], 0
+    mov byte [js_throwing], 0
     mov qword [vm_sp], JS_STACK_ADDR
     mov qword [vm_fp], JS_FRAMES_ADDR
     mov dword [vm_nesting], 0
@@ -136,6 +147,10 @@ js_protected_out:
     dec dword [js_depth]            ; (keeps CF)
     pop qword [js_catch_rsp]
     pop r8
+    mov [jsgc_off], r8d
+    pop r8
+    mov [vm_handler_count], r8d
+    pop r8
     mov [vm_nesting], r8d
     pop r8
     mov [vm_line], r8d
@@ -156,6 +171,59 @@ js_protected_out:
     pop rdx
     pop rcx
     pop rbx
+    ret
+
+; js_compile_dump: RSI = source, RCX = length -> the script's bytecode printed
+; as hex, and each function's with its line (debugging: `js -d code`)
+js_compile_dump:
+    lea rbx, [.body]
+    push rbx
+    jmp js_protected
+.body:
+    inc dword [jsgc_off]
+    call jsp_parse_script
+    call jsc_compile_script
+    dec dword [jsgc_off]
+    mov rax, [jsc_script]
+    call .function
+    ret
+; .function: RAX = function info (compiled) -> its code, then its inner ones
+.function:
+    push rax
+    push rbx
+    push rcx
+    push rsi
+    mov rbx, [rax + JFI_TEMPLATE]
+    call jsout_reset
+    mov eax, [rbx + JCODE_LINE]
+    call jsout_u64
+    mov al, ':'
+    call jsout_byte
+    mov ecx, [rbx + JCODE_LEN]
+    mov rsi, [rbx + JCODE_CODE]
+.byte:
+    test ecx, ecx
+    jz .flush
+    mov al, ' '
+    call jsout_byte
+    movzx eax, byte [rsi]
+    push rax
+    shr eax, 4
+    call jsnum_digit_char
+    call jsout_byte
+    pop rax
+    and eax, 15
+    call jsnum_digit_char
+    call jsout_byte
+    inc rsi
+    dec ecx
+    jmp .byte
+.flush:
+    call jsout_flush
+    pop rsi
+    pop rcx
+    pop rbx
+    pop rax
     ret
 
 ; ------------------------------------------------------------------------------
@@ -197,6 +265,8 @@ js_print_error:
     call jsout_cstr
     jmp .line
 .value:
+    call jsi_error                  ; Error objects: "Name: message"
+    jnc .line
     xor ecx, ecx
     mov edx, 1
     call jsi_value
@@ -215,6 +285,77 @@ js_print_error:
     pop rdx
     pop rcx
     pop rax
+    ret
+
+; jsi_error: RAX = value -> CF=0 if it is an error object, printed as
+; "Name: message" (read without running any JavaScript)
+jsi_error:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    mov rcx, rax
+    shr rcx, 48
+    cmp ecx, JS_TAG_OBJECT
+    jne .no
+    mov eax, eax
+    cmp dword [rax + JOBJ_CLASS], JC_ERROR
+    jne .no
+    mov rcx, rax
+    mov rdx, [atom_name]
+    call jsobj_lookup
+    jc .no_name
+    bt qword [rbx + JPE_KEY], 34
+    jc .no_name
+    mov rax, [rbx + JPE_VAL]
+    call .string
+.no_name:
+    mov rax, rcx
+    mov rdx, [atom_message]
+    call jsobj_lookup
+    jc .done
+    bt qword [rbx + JPE_KEY], 34
+    jc .done
+    mov rax, [rbx + JPE_VAL]
+    mov rdx, rax
+    shr rdx, 48
+    cmp edx, JS_TAG_STRING
+    jne .done
+    mov edx, eax
+    cmp dword [rdx + JSTR_LEN], 0
+    je .done
+    push rax
+    mov al, ':'
+    call jsout_byte
+    mov al, ' '
+    call jsout_byte
+    pop rax
+    call .string
+.done:
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    clc
+    ret
+.no:
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    stc
+    ret
+; .string: RAX = value; appended if it is a string
+.string:
+    push rdx
+    mov rdx, rax
+    shr rdx, 48
+    cmp edx, JS_TAG_STRING
+    jne .string_done
+    mov eax, eax
+    call jsout_str
+.string_done:
+    pop rdx
     ret
 
 ; js_print_console: the default js_print_hook. RSI = text, RCX = length
@@ -385,6 +526,11 @@ jsi_value:
     je .iterator
     cmp esi, JK_OBJECT
     jne .not_host
+    cmp dword [rbx + JOBJ_CLASS], JC_ERROR
+    jne .not_error
+    call jsi_error
+    jmp .out
+.not_error:
     cmp dword [rbx + JOBJ_CLASS], JC_HOST
     jb .not_host
     call jsd_inspect
@@ -842,8 +988,27 @@ jsi_props:
     mov al, ' '
     call jsout_byte
     mov rax, [rsi + JPE_VAL]
+    bt qword [rsi + JPE_KEY], 34
+    jc .accessor
     mov edx, 1
     call jsi_value
+    jmp .printed
+.accessor:
+    ; [Getter], [Setter] or [Getter/Setter]
+    push rsi
+    mov rdx, JS_UNDEF
+    lea rsi, [jsi_getter_setter]
+    cmp [rax + JACC_SET], rdx
+    jne .has_setter
+    lea rsi, [jsi_getter]
+.has_setter:
+    cmp [rax + JACC_GET], rdx
+    jne .accessor_text
+    lea rsi, [jsi_setter]
+.accessor_text:
+    call jsout_cstr
+    pop rsi
+.printed:
     inc ebx
 .next:
     add rsi, JPE_SIZE

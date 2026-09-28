@@ -56,6 +56,7 @@ JSNATIVE js_object_proto, "toString", jsb_object_to_string, 0
 JSNATIVE js_object_proto, "valueOf", jsb_object_value_of, 0
 JSNATIVE js_object_proto, "hasOwnProperty", jsb_object_has_own, 1
 JSNATIVE js_function_proto, "toString", jsb_function_to_string, 0
+JSNATIVE js_error_protos, "toString", jsb_error_to_string, 0
 JSNATIVE js_array_proto, "push", jsb_array_push, 1
 JSNATIVE js_array_proto, "pop", jsb_array_pop, 0
 JSNATIVE js_array_proto, "join", jsb_array_join, 1
@@ -126,6 +127,8 @@ JSCONST jsb_number_ctor, "MIN_VALUE", 5e-324
     %%s: db %5
     %%e:
 %endmacro
+jsb_error_ctors:
+    dq jsb_error_ctor_0, jsb_error_ctor_1, jsb_error_ctor_2, jsb_error_ctor_3, jsb_error_ctor_4
 jsb_ctors:
 JSCTOR jsb_object_ctor, jsb_object, 1, js_object_proto, "Object"
 JSCTOR jsb_array_ctor, jsb_array, 1, js_array_proto, "Array"
@@ -248,6 +251,7 @@ js_init_builtins:
     lea r8, [r8 + rcx + 26]
     jmp .ctor
 .ctors_done:
+    call jsb_init_errors
     ; global values
     mov rax, [js_global]
     mov rcx, rax
@@ -288,6 +292,7 @@ js_init_builtins:
     ; methods
     lea r8, [jsb_natives]
     call jsb_define_natives
+    call jsl_init
     ; constants
     lea r8, [jsb_constants]
 .constant:
@@ -319,6 +324,183 @@ js_init_builtins:
     pop rcx
     pop rbx
     pop rax
+    ret
+
+; jsb_init_errors: Error, TypeError, RangeError, SyntaxError, ReferenceError:
+; constructors on the global object, prototypes chained to Error.prototype
+; (each with its name and an empty message)
+jsb_init_errors:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    xor r8d, r8d
+.kind:
+    mov rax, [js_object_proto]
+    test r8d, r8d
+    jz .proto
+    mov rax, [js_error_protos]
+.proto:
+    call jsobj_new
+    mov rdi, rax                    ; the prototype
+    lea rbx, [js_error_protos]
+    mov [rbx + r8*8], rdi
+    lea rsi, [jsvm_kind_names]
+    mov rsi, [rsi + r8*8]
+    call jsstr_from_cstr
+    mov rbx, rax                    ; the name
+    mov rcx, rbx
+    BOX rcx, rdx, JS_STR_BITS
+    mov rax, rdi
+    mov rdx, [atom_name]
+    call jsobj_define_hidden
+    mov rcx, [atom_empty]
+    BOX rcx, rdx, JS_STR_BITS
+    mov rdx, [atom_message]
+    call jsobj_define_hidden
+    ; the constructor
+    lea rax, [jsb_error_ctors]
+    mov rax, [rax + r8*8]
+    mov ecx, 1
+    mov rdx, rbx
+    call jsfn_native
+    mov rsi, rax
+    mov rcx, rsi
+    BOX rcx, rdx, JS_OBJ_BITS
+    mov rax, [js_global]
+    mov rdx, rbx
+    call jsobj_define_hidden
+    mov rcx, rdi
+    BOX rcx, rdx, JS_OBJ_BITS
+    mov rax, rsi
+    mov rdx, [atom_prototype]
+    call jsobj_define_hidden
+    mov rcx, rsi
+    BOX rcx, rdx, JS_OBJ_BITS
+    mov rax, rdi
+    mov rdx, [atom_constructor]
+    call jsobj_define_hidden
+    inc r8d
+    cmp r8d, JE_COUNT
+    jb .kind
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; Error(message) and friends; under `new` from a derived class's super()
+; (R8D = 2) they fill in `this` instead of making a new object
+jsb_error_ctor_0:
+    push r9
+    mov r9d, 0
+    jmp jsb_error_common
+jsb_error_ctor_1:
+    push r9
+    mov r9d, 1
+    jmp jsb_error_common
+jsb_error_ctor_2:
+    push r9
+    mov r9d, 2
+    jmp jsb_error_common
+jsb_error_ctor_3:
+    push r9
+    mov r9d, 3
+    jmp jsb_error_common
+jsb_error_ctor_4:
+    push r9
+    mov r9d, 4
+jsb_error_common:
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+    xor ebx, ebx                    ; the message (0 = none)
+    test ecx, ecx
+    jz .have
+    mov rax, [rdi]
+    mov rcx, JS_UNDEF
+    cmp rax, rcx
+    je .have
+    call js_to_string
+    mov rbx, rax
+.have:
+    cmp r8d, 2
+    jne .new
+    mov rax, rdx
+    mov rcx, rax
+    shr rcx, 48
+    cmp ecx, JS_TAG_OBJECT
+    jne .new
+    mov eax, eax
+    mov dword [rax + JOBJ_CLASS], JC_ERROR
+    mov rdi, rbx
+    mov edx, r9d
+    call js_error_fill
+    BOX rax, rcx, JS_OBJ_BITS
+    jmp .out
+.new:
+    mov rax, rbx
+    mov edx, r9d
+    call js_make_error
+.out:
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop r9
+    ret
+
+; Error.prototype.toString: "Name: message"
+jsb_error_to_string:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    mov rbx, rdx                    ; this
+    call jsout_save
+    mov rax, rbx
+    mov rdx, [atom_name]
+    call js_get
+    mov rcx, JS_UNDEF
+    cmp rax, rcx
+    jne .name
+    lea rsi, [jsvm_kind_names]
+    mov rsi, [rsi]
+    call jsout_cstr
+    jmp .message
+.name:
+    call js_to_string
+    call jsout_str
+.message:
+    mov rax, rbx
+    mov rdx, [atom_message]
+    call js_get
+    mov rcx, JS_UNDEF
+    cmp rax, rcx
+    je .done
+    call js_to_string
+    cmp dword [rax + JSTR_LEN], 0
+    je .done
+    push rax
+    mov al, ':'
+    call jsout_byte
+    mov al, ' '
+    call jsout_byte
+    pop rax
+    call jsout_str
+.done:
+    call jsout_take
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
     ret
 
 ; jsb_define_natives: R8 = a JSNATIVE table -> its functions defined (hidden)

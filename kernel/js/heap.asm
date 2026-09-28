@@ -75,10 +75,15 @@ JSATOM atom_prototype,   "prototype"
 JSATOM atom_constructor, "constructor"
 JSATOM atom_name,        "name"
 JSATOM atom_message,     "message"
+JSATOM atom_stack,       "stack"
 JSATOM atom_tostring,    "toString"
 JSATOM atom_valueof,     "valueOf"
 JSATOM atom_arguments,   "arguments"
 JSATOM atom_of,          "of"
+JSATOM atom_static,      "static"
+JSATOM atom_get,         "get"
+JSATOM atom_set,         "set"
+JSATOM atom_rest_args,   " args"
 JSATOM atom_undefined,   "undefined"
 JSATOM atom_object,      "object"
 JSATOM atom_boolean,     "boolean"
@@ -224,6 +229,7 @@ js_heap_reset:
     push rcx
     push rsi
     push rdi
+    call jsgc_reset
     mov qword [js_heap_ptr], JS_HEAP_ADDR
     mov qword [js_heap_end], JS_HEAP_ADDR + JS_HEAP_SIZE
     lea rdi, [jsstr_buckets]
@@ -258,34 +264,7 @@ js_heap_reset:
     pop rax
     ret
 
-; ------------------------------------------------------------------------------
-; js_alloc: ECX = bytes -> RAX = zeroed block, 8-byte aligned.
-; Throws a RangeError when the heap is full.
-; ------------------------------------------------------------------------------
-js_alloc:
-    push rcx
-    push rdi
-    add ecx, 7
-    and ecx, ~7
-    mov rax, [js_heap_ptr]
-    lea rdi, [rax + rcx]
-    cmp rdi, [js_heap_end]
-    ja .full
-    mov [js_heap_ptr], rdi
-    mov rdi, rax
-    push rax
-    shr ecx, 3
-    xor eax, eax
-    rep stosq
-    pop rax
-    pop rdi
-    pop rcx
-    ret
-.full:
-    mov edx, JE_RANGE
-    lea rsi, [jsmsg_out_of_memory]
-    xor edi, edi
-    jmp js_throw
+; (js_alloc, the allocator, is in gc.asm)
 
 ; ==============================================================================
 ; Strings
@@ -298,6 +277,7 @@ jsstr_alloc:
     push rcx
     add ecx, JSTR_DATA + 1
     call js_alloc
+    or byte [rax - 8 + GCH_FLAGS], GCF_LEAF
     pop rcx
     mov byte [rax + JH_KIND], JK_STRING
     mov [rax + JSTR_LEN], ecx
@@ -460,6 +440,7 @@ jsstr_atom:
     call jsstr_new
     mov [rax + JSTR_HASH], edx
     or byte [rax + JH_FLAGS], JSF_ATOM
+    or byte [rax - 8 + GCH_FLAGS], GCF_PERM
     mov edx, [rbx]
     mov [rax + JSTR_NEXT], edx
     mov [rbx], eax

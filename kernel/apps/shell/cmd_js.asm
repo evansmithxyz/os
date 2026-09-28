@@ -22,6 +22,8 @@ cmd_js:
     je .usage
     cmp qword [mem_total_bytes], JS_MIN_RAM
     jb .no_ram
+    cmp word [rsi], '-d'
+    je .dump
     ; a single word ending in .js that names a file: run the file
     call strlen
     mov rcx, rax
@@ -65,6 +67,14 @@ cmd_js:
     call js_print_error
     pop rax
     mov [con_attr], al
+    ret
+.dump:
+    ; js -d <code>: the compiled script's bytecode in hex (debugging)
+    add rsi, 3
+    call strlen
+    mov rcx, rax
+    call js_reset
+    call js_compile_dump
     ret
 .usage:
     mov bl, COLOR_YELLOW

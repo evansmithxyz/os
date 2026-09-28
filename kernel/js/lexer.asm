@@ -14,6 +14,8 @@ TK_NAME                 equ 1           ; tok_val = atom
 TK_NUM                  equ 2           ; tok_val = double bits
 TK_STR                  equ 3           ; tok_val = atom
 TK_PUNCT                equ 4           ; tok_val = P_*
+TK_TEMPLATE             equ 5           ; tok_val = atom of a template piece, tok_tail
+                                        ; = 1 if it ended with ` (else with ${)
 
 P_LBRACE                equ 1
 P_RBRACE                equ 2
@@ -152,6 +154,7 @@ jsmsg_unterminated_str: db "Invalid or unexpected token (unterminated string)", 
 jsmsg_unterminated_cmt: db "Unterminated comment", 0
 jsmsg_bad_number:       db "Invalid number", 0
 jsmsg_bigint:           db "BigInt literals are not supported yet", 0
+jsmsg_unterminated_tpl: db "Unterminated template literal", 0
 
 section .bss
 alignb 8
@@ -166,6 +169,7 @@ tok_kw:                 resd 1          ; KW_* of a TK_NAME keyword, else 0
 tok_val:                resq 1
 tok_start:              resq 1
 tok_nl:                 resb 1
+tok_tail:               resb 1          ; TK_TEMPLATE: the last piece
 JSLEX_STATE_SIZE        equ $ - jslex_state
 alignb 8
 jslex_saved:            resb 64
@@ -498,8 +502,20 @@ jslex_next:
     mov [tok_val], rax
     mov dword [tok_type], TK_STR
     jmp .done
+.template:
+    inc rsi
+    call jslex_template
+    cmp byte [tok_tail], 0
+    jne .template_tail
+    inc rsi                         ; past the '{' of ${
+.template_tail:
+    mov [tok_val], rax
+    mov dword [tok_type], TK_TEMPLATE
+    jmp .done
 
 .punct:
+    cmp al, '`'
+    je .template
     lea rbx, [jslex_puncts]
     mov rcx, rdi
     sub rcx, rsi                    ; bytes left
@@ -563,6 +579,80 @@ jslex_next:
 .bigint:
     lea rsi, [jsmsg_bigint]
     jmp jslex_error
+
+; ------------------------------------------------------------------------------
+; jslex_template: RSI = start of a template piece (after ` or }), RDI = end of
+; source -> RAX = atom of its text (escapes decoded), RSI past the ` or ${ that
+; ends it, tok_tail = 1 for `
+; ------------------------------------------------------------------------------
+jslex_template:
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+    push r8
+    push r9
+    push r10
+    mov r9, rdi
+    mov rbx, rsi
+.find:
+    cmp rbx, r9
+    jae .unterminated
+    mov al, [rbx]
+    cmp al, '`'
+    je .tail
+    cmp al, 10
+    jne .not_line
+    inc dword [jslex_line]
+.not_line:
+    cmp al, '$'
+    jne .not_dollar
+    lea rax, [rbx + 1]
+    cmp rax, r9
+    jae .not_dollar
+    cmp byte [rax], '{'
+    je .head
+.not_dollar:
+    cmp al, '\'
+    jne .next
+    inc rbx
+.next:
+    inc rbx
+    jmp .find
+.tail:
+    mov byte [tok_tail], 1
+    jmp jslex_string.found          ; decode [RSI, RBX); RSI = RBX + 1
+.head:
+    mov byte [tok_tail], 0
+    jmp jslex_string.found          ; (the caller skips the '{' as well)
+.unterminated:
+    lea rsi, [jsmsg_unterminated_tpl]
+    jmp jslex_error
+
+; jslex_template_resume: the current token is the '}' that ends a ${...}
+; -> the next template piece becomes the current token
+jslex_template_resume:
+    push rax
+    push rsi
+    push rdi
+    mov rsi, [jslex_pos]
+    mov rdi, [jslex_end]
+    mov [tok_start], rsi
+    mov eax, [jslex_line]
+    mov [tok_line], eax
+    call jslex_template
+    cmp byte [tok_tail], 0
+    jne .tail
+    inc rsi
+.tail:
+    mov [tok_val], rax
+    mov dword [tok_type], TK_TEMPLATE
+    mov dword [tok_kw], 0
+    mov [jslex_pos], rsi
+    pop rdi
+    pop rsi
+    pop rax
+    ret
 
 ; jslex_is_ident_start: AL = byte -> CF=1 for a-z A-Z $ _ and bytes >= 0x80
 jslex_is_ident_start:

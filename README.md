@@ -34,8 +34,10 @@ windowed desktop with i3-style workspaces.
   Mozilla root store, the CMOS clock and the host name.
 - **Shell:** about 30 commands, Tab completion, history (Up/Down) and Ctrl+C.
 - **JavaScript:** an engine written in assembly (`kernel/js/`): a parser,
-  a bytecode compiler and an interpreter, with closures, objects, arrays,
-  prototypes and correctly rounded number formatting. Run it with `js`.
+  a bytecode compiler, an interpreter and a garbage collector, with
+  classes, closures, exceptions, destructuring, the everyday standard
+  library (array and string methods, `Object.*`, `JSON`, `Math`) and
+  correctly rounded number formatting. Run it with `js`; web pages run it too.
 - **Desktop:**
   - 1024×768×32 graphics through the Bochs/QEMU display adapter.
   - Movable and resizable windows with minimize and maximize, and 4
@@ -247,16 +249,43 @@ optimising compilers:
    doubles with exact big-integer arithmetic where needed, so numbers print
    exactly as in a browser (`1e+21`, `5e-324`, `(1.005).toFixed(2)` is
    `1.00`).
+6. `gc.asm` collects garbage: a mark-sweep collector that never moves
+   anything. It marks conservatively (any word on the stacks, in the
+   kernel's variables, in DOM nodes or inside a live block that points at a
+   heap block keeps it), so the rest of the engine needs no bookkeeping.
+   Freed blocks are joined and reused; each collection logs
+   `[klog] js gc: live bytes ...`.
 
-Supported: `var`/`let`/`const`, functions, closures, `arguments`, `this`,
-`new` and prototypes, objects and arrays (with holes), every operator
-including `**`, `??` and the logical assignments, `if`/`for`/`for-in`/
-`for-of`/`while`/`do`/`switch`, labels, `break`/`continue`, `throw`
-(uncaught), and built-ins: `console.log`, `Math`, `parseInt`,
-`parseFloat`, `isNaN`, `isFinite`, `String`, `Number`, `Boolean`,
-`Object.keys`, `Array.isArray`, `push`/`pop`/`join`/`indexOf`/`slice`,
-`charAt`/`charCodeAt`/`indexOf`/`slice`/`substring`/`toUpperCase`/
-`toLowerCase`/`trim`, `toFixed`, `toString(radix)`.
+The language: `var`/`let`/`const`, functions, arrow functions, closures,
+default and rest parameters, `arguments`, `this`, `new`, prototypes,
+`class` (fields, `static`, getters and setters, `extends`, `super`, also
+`extends Error`), object literals with methods, getters, setters, computed
+keys and spread, destructuring (declarations, parameters, `for-of`,
+`catch`, assignments), spread in arrays and calls, template literals,
+optional chaining, every operator including `**`, `??` and the logical
+assignments, `if`/`for`/`for-in`/`for-of`/`while`/`do`/`switch`, labels,
+and `try`/`catch`/`finally` with `Error`, `TypeError`, `RangeError`,
+`SyntaxError` and `ReferenceError`.
+
+The library: `console.log`, `Math` (all functions), `JSON.stringify` (with
+a replacer function, indent and `toJSON`) and `JSON.parse`, `parseInt`,
+`parseFloat`, `isNaN`, `isFinite`, `String`, `Number` (`isInteger`,
+`isSafeInteger`, ...), `Boolean`; `Object.keys`/`values`/`entries`/
+`assign`/`create`/`getPrototypeOf`/`setPrototypeOf`/`defineProperty`/
+`defineProperties`/`getOwnPropertyNames`/`getOwnPropertyDescriptor`/
+`fromEntries`/`freeze`/`is`; `call`/`apply`/`bind`; arrays: `push`,
+`pop`, `shift`, `unshift`, `splice`, `slice`, `concat`, `join`,
+`reverse`, `sort` (stable), `indexOf`, `lastIndexOf`, `includes`, `find`,
+`findIndex`, `findLast`, `findLastIndex`, `forEach`, `map`, `filter`,
+`reduce`, `reduceRight`, `some`, `every`, `fill`, `flat`, `flatMap`,
+`at`, `Array.from`, `Array.of`, `Array.isArray`; strings: `split`,
+`replace`/`replaceAll` (string patterns, `$&` and friends, or a
+function), `includes`, `startsWith`, `endsWith`, `indexOf`,
+`lastIndexOf`, `slice`, `substring`, `padStart`, `padEnd`, `repeat`,
+`trim`/`trimStart`/`trimEnd`, `at`, `charAt`, `charCodeAt`, `concat`,
+`toUpperCase`, `toLowerCase`, `localeCompare`; `toFixed` and
+`toString(radix)`. Not yet: regular expressions, `Date`, `Map`/`Set`,
+generators, timers and promises (the next steps).
 
 Not yet (the parser says so): arrow functions, classes, `try`/`catch`,
 template literals, destructuring, spread, getters/setters, optional
@@ -290,7 +319,9 @@ kernel/
   web/                  dom (HTML parser), css (style sheets, cascade), layout (display list),
                         ua.css / builtin.css (the browser's own style sheets)
   js/                   JavaScript engine: lexer, parser, compiler (bytecode), vm,
-                        heap (strings, atoms), object, number, builtins, js (API, printing)
+                        heap (strings, atoms), gc (allocator, collector), object, number,
+                        builtins + stdlib (the standard library), jsdom (the DOM API),
+                        js (API, printing)
   gfx/                  clipped 2D drawing, font, back buffer, mouse pointer
   gui/                  window manager + event loop, taskbar/footer, theme colours
   apps/                 terminal, browser, canvas, sysmon windows
@@ -345,7 +376,8 @@ docs/                   CONVENTIONS.md, screenshots
 | `0x600000` / `0xA00000` / `0xC00000` | DOM nodes / CSS rules / layout display list |
 | `0x1000000` | GUI back buffer, wallpaper, canvas (3 MB each) |
 | `0x2000000` | JavaScript: value stack, call frames, source, compiler scratch, syntax tree |
-| `0x3000000` | JavaScript heap (64 MB) |
+| `0x3000000` | JavaScript heap (62 MB) |
+| `0x6E00000` / `0x6F00000` | the garbage collector's start bitmap / mark stack |
 | `0xFD000000` | framebuffer (from the display adapter's PCI BAR0) |
 
 ### Console and input

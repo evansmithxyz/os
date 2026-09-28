@@ -69,6 +69,34 @@ NT_SWITCH               equ 44          ; A = discriminant, B = first NT_CASE, E
 NT_CASE                 equ 45          ; A = test (0 = default), B = first statement
 NT_THROW                equ 46          ; A = value
 NT_LABELED              equ 47          ; A = label atom, B = statement
+NT_TRY                  equ 48          ; A = block, B = catch name atom / pattern (OP 1) or 0,
+                                        ; C = catch block (0 = none), D = finally, E = catch scope
+NT_TEMPLATE             equ 49          ; A = first piece: NT_STR and expressions, alternating
+NT_SPREAD               equ 50          ; ...A (array literals, arguments)
+NT_CHAIN                equ 51          ; A = an expression with ?. in it (they jump to its end)
+NT_APAT                 equ 52          ; [a, b = 1, ...c]: A = first NT_PELEM
+NT_OPAT                 equ 53          ; {a, b: c, ...d}: A = first NT_PELEM
+NT_PELEM                equ 54          ; A = target (0 = hole), B = default, C = key atom or
+                                        ; expression; OP bit 0 = rest, bit 1 = computed key
+NT_PARAM                equ 55          ; A = target (NT_IDENT or pattern), B = default,
+                                        ; OP 1 = rest, E = hidden variable atom of a pattern
+
+NT_CLASS                equ 56          ; A = name atom or 0, B = parent expression or 0,
+                                        ; C = first NT_CLASSMEM, D = constructor's function
+                                        ; info; OP 1 = a declaration
+NT_CLASSMEM             equ 57          ; OP = CM_*, A = key atom (or expression), B =
+                                        ; NT_FUNC or a field's initial value (or 0)
+NT_SUPERCALL            equ 58          ; super(B...), C = argument count
+NT_SUPERMEMBER          equ 59          ; super.B (B = atom)
+CM_STATIC               equ 1
+CM_GET                  equ 2
+CM_SET                  equ 4
+CM_FIELD                equ 8
+CM_COMPUTED             equ 16
+
+JNF_PATTERN             equ 1           ; NT_DECL: A is a pattern node
+JNF_OPTIONAL            equ 2           ; member / index / call after ?.
+JNF_SPREAD              equ 4           ; NT_CALL / NT_NEW: an argument is ...spread
 
 UPD_PREINC              equ 0
 UPD_PREDEC              equ 1
@@ -115,11 +143,18 @@ JFI_LAST_SCOPE          equ 56
 JFI_TEMPLATE            equ 64          ; the compiled JK_CODE (compiler)
 JFI_GLOBALS             equ 72          ; script: JVR list of top-level declarations
 JFI_NGLOBALS            equ 80          ; dword (JFI_GLOBALS works as a scope's JSC_VARS)
-JFI_SIZE                equ 88
+JFI_PARAMS              equ 88          ; first NT_PARAM
+JFI_REST                equ 96          ; the variable of a ...rest parameter, or 0
+JFI_FIELDS              equ 104         ; class constructor: first instance field (NT_CLASSMEM)
+JFI_SIZE                equ 112
 FIF_INNER               equ 1           ; contains function definitions
 FIF_ARGS                equ 2           ; uses `arguments`
 FIF_SELF                equ 4           ; named function expression
 FIF_SCRIPT              equ 8           ; the top-level script
+FIF_ARROW               equ 16          ; an arrow function (this and arguments from outside)
+FIF_PARAMCODE           equ 32          ; defaults or patterns in its parameters
+FIF_CLASSCTOR           equ 64          ; a class's constructor
+FIF_DERIVED             equ 128         ; ... of a class that extends another
 
 JSP_MAX_DEPTH           equ 1500        ; nesting limit (~250 bytes of kernel stack each)
 
@@ -150,6 +185,8 @@ jsp_func:               resq 1          ; current function info
 jsp_scope:              resq 1          ; current scope
 jsp_depth:              resd 1
 jsp_no_in:              resd 1          ; 1 = `in` is not an operator (for-init)
+jsp_ahead_tpl:          resd 32         ; jsp_arrow_ahead: depths of open ${
+jsp_ahead_saved:        resb 64
 
 section .rodata
 jsmsg_unexpected:       db "Unexpected token '%'", 0
@@ -162,23 +199,13 @@ jsmsg_too_many_args:    db "Too many arguments (255 at most)", 0
 jsmsg_unsupported:      db "% is not supported yet", 0
 jsmsg_need_name:        db "Function statements require a function name", 0
 jsmsg_default_twice:    db "More than one default clause in switch statement", 0
-jsfeat_arrow:           db "=> (arrow functions)", 0
-jsfeat_template:        db "`template literals`", 0
+jsmsg_try_alone:        db "Missing catch or finally after try", 0
 jsfeat_regex:           db "/regular expressions/", 0
-jsfeat_class:           db "class", 0
-jsfeat_try:             db "try/catch", 0
-jsfeat_spread:          db "... (spread)", 0
 jsfeat_destructuring:   db "destructuring", 0
-jsfeat_optional:        db "?. (optional chaining)", 0
-jsfeat_accessor:        db "get/set accessors", 0
 jsfeat_module:          db "import/export", 0
 jsfeat_with:            db "with", 0
-jsfeat_super:           db "super", 0
 jsfeat_private:         db "#private fields", 0
 jsfeat_decorator:       db "@decorators", 0
-jsfeat_default_param:   db "default parameters", 0
-jsfeat_get:             db "get", 0
-jsfeat_set:             db "set", 0
 
 section .text
 
@@ -562,7 +589,7 @@ jsp_statement_inner:
     cmp eax, KW_SWITCH
     je jsp_switch
     cmp eax, KW_TRY
-    je .try
+    je jsp_try
     cmp eax, KW_CLASS
     je .class
     cmp eax, KW_IMPORT
@@ -621,18 +648,86 @@ jsp_statement_inner:
     mov rax, rbx
     pop rbx
     ret
-.try:
-    lea rdi, [jsfeat_try]
-    jmp jsp_unsupported
 .class:
-    lea rdi, [jsfeat_class]
-    jmp jsp_unsupported
+    push rcx
+    mov ecx, 1
+    call jsp_class
+    pop rcx
+    ret
 .module:
     lea rdi, [jsfeat_module]
     jmp jsp_unsupported
 .with:
     lea rdi, [jsfeat_with]
     jmp jsp_unsupported
+
+; jsp_try: try { } [catch [(name)] { }] [finally { }]
+jsp_try:
+    push rbx
+    push rcx
+    push rdx
+    mov al, NT_TRY
+    call jsp_node
+    mov rbx, rax
+    call jslex_next
+    AT_PUNCT P_LBRACE
+    jne jsp_unexpected
+    call jsp_block
+    mov [rbx + JN_A], rax
+    xor ecx, ecx                    ; saw catch or finally
+    AT_KW KW_CATCH
+    jne .finally
+    inc ecx
+    call jslex_next
+    ; the catch variable lives in its own scope around the block
+    mov al, SK_BLOCK
+    call jsp_push_scope
+    mov [rbx + JN_E], rax
+    AT_PUNCT P_LPAREN
+    jne .catch_block
+    call jslex_next
+    push rcx
+    mov cl, VK_LET
+    cmp dword [tok_type], TK_NAME
+    jne .catch_pattern
+    call jsp_ident
+    mov [rbx + JN_B], rax
+    mov rdx, rax
+    call jsp_declare
+    jmp .catch_named
+.catch_pattern:
+    call jsp_binding_pattern
+    mov [rbx + JN_B], rax
+    mov byte [rbx + JN_OP], 1
+.catch_named:
+    pop rcx
+    EXPECT P_RPAREN
+.catch_block:
+    AT_PUNCT P_LBRACE
+    jne jsp_unexpected
+    call jsp_block
+    mov [rbx + JN_C], rax
+    call jsp_pop_scope
+.finally:
+    AT_KW KW_FINALLY
+    jne .end
+    inc ecx
+    call jslex_next
+    AT_PUNCT P_LBRACE
+    jne jsp_unexpected
+    call jsp_block
+    mov [rbx + JN_D], rax
+.end:
+    test ecx, ecx
+    jz .alone
+    mov rax, rbx
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+.alone:
+    lea rsi, [jsmsg_try_alone]
+    jmp jslex_error
 
 ; jsp_expression_statement: expression ';'
 jsp_expression_statement:
@@ -708,12 +803,25 @@ jsp_declarations:
 .decl:
     mov al, NT_DECL
     call jsp_node
+    AT_PUNCT P_LBRACK
+    je .pattern
+    AT_PUNCT P_LBRACE
+    je .pattern
     push rax
     call jsp_ident
     mov rdx, rax
     pop rax
     mov [rax + JN_A], rdx
     call jsp_declare
+    jmp .declared
+.pattern:
+    push rax
+    call jsp_binding_pattern
+    mov rdx, rax
+    pop rax
+    mov [rax + JN_A], rdx
+    or word [rax + JN_FLAGS], JNF_PATTERN
+.declared:
     test r8, r8
     jz .first
     mov [r8 + JN_NEXT], rax
@@ -916,15 +1024,12 @@ jsp_for:
     EXPECT P_RPAREN
     jmp .body
 .forin_target:
-    ; the target must be assignable
-    movzx eax, byte [rdx + JN_TYPE]
-    cmp eax, NT_IDENT
-    je .target_ok
-    cmp eax, NT_MEMBER
-    je .target_ok
-    cmp eax, NT_INDEX
-    jne .bad_target
-.target_ok:
+    ; the target must be assignable (a literal becomes a pattern)
+    push rcx
+    mov rax, rdx
+    call jsp_to_target
+    pop rcx
+    mov rdx, rax
     mov [rbx + JN_A], rdx
 .forin:
     mov byte [rbx + JN_TYPE], NT_FORIN
@@ -1092,26 +1197,7 @@ jsp_function_rest:
     mov [rbx + JFI_NAME], rdx
     mov rsi, rdx                    ; name
     mov edi, ecx                    ; expression?
-    ; parameters
-    EXPECT P_LPAREN
-.param:
-    AT_PUNCT P_RPAREN
-    je .params_done
-    AT_PUNCT P_ELLIPSIS
-    je .rest_param
-    call jsp_ident
-    mov rdx, rax
-    mov cl, VK_PARAM
-    call jsp_declare
-    inc dword [rbx + JFI_NPARAMS]
-    AT_PUNCT P_ASSIGN
-    je .default_param
-    AT_PUNCT P_RPAREN
-    je .params_done
-    EXPECT P_COMMA
-    jmp .param
-.params_done:
-    call jslex_next
+    call jsp_params
     ; body
     EXPECT P_LBRACE
     call jsp_statement_list
@@ -1149,12 +1235,601 @@ jsp_function_rest:
     pop rcx
     pop rbx
     ret
-.rest_param:
-    lea rdi, [jsfeat_spread]
-    jmp jsp_unsupported
-.default_param:
-    lea rdi, [jsfeat_default_param]
-    jmp jsp_unsupported
+; ------------------------------------------------------------------------------
+; jsp_params: RBX = the new function's info; current token '(' -> each
+; parameter declared in its function scope (plain names, patterns, defaults,
+; ...rest), JFI_PARAMS / JFI_NPARAMS / JFI_REST set; past the ')'
+; ------------------------------------------------------------------------------
+jsp_params:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    EXPECT P_LPAREN
+    xor r8d, r8d                    ; last NT_PARAM
+    xor r9d, r9d                    ; index
+.param:
+    AT_PUNCT P_RPAREN
+    je .done
+    mov al, NT_PARAM
+    call jsp_node
+    mov r10, rax
+    test r8, r8
+    jz .first
+    mov [r8 + JN_NEXT], r10
+    jmp .linked
+.first:
+    mov [rbx + JFI_PARAMS], r10
+.linked:
+    mov r8, r10
+    xor edi, edi                    ; rest?
+    AT_PUNCT P_ELLIPSIS
+    jne .target
+    call jslex_next
+    mov edi, 1
+    mov byte [r10 + JN_OP], 1
+.target:
+    cmp dword [tok_type], TK_NAME
+    jne .pattern
+    ; a name: its own slot
+    call jsp_ident
+    mov rdx, rax
+    mov al, NT_IDENT
+    call jsp_node
+    mov [rax + JN_A], rdx
+    mov [r10 + JN_A], rax
+    jmp .declare
+.pattern:
+    mov cl, VK_VAR
+    call jsp_binding_pattern
+    mov [r10 + JN_A], rax
+    or dword [rbx + JFI_FLAGS], FIF_PARAMCODE
+    mov ecx, r9d
+    call jsp_hidden_name
+    mov rdx, rax
+    mov [r10 + JN_E], rdx
+.declare:
+    ; RDX = the name that gets the argument
+    push rbx
+    mov rbx, [rbx + JFI_SCOPE]
+    mov cl, VK_PARAM
+    test edi, edi
+    jz .add
+    mov cl, VK_VAR
+.add:
+    call jsp_scope_add
+    pop rbx
+    test edi, edi
+    jnz .rest
+    inc dword [rbx + JFI_NPARAMS]
+    AT_PUNCT P_ASSIGN
+    jne .next
+    call jslex_next
+    call jsp_assign
+    mov [r10 + JN_B], rax
+    or dword [rbx + JFI_FLAGS], FIF_PARAMCODE
+.next:
+    inc r9d
+    AT_PUNCT P_RPAREN
+    je .done
+    EXPECT P_COMMA
+    jmp .param
+.rest:
+    mov [rbx + JFI_REST], rax
+    AT_PUNCT P_RPAREN
+    je .done
+    lea rsi, [jsmsg_rest_last]
+    jmp jslex_error
+.done:
+    call jslex_next
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; jsp_hidden_name: ECX = parameter index -> RAX = an atom no script can name
+; (" p" + two letters), for the argument a pattern takes apart
+jsp_hidden_name:
+    push rcx
+    push rsi
+    sub rsp, 8
+    mov byte [rsp], ' '
+    mov byte [rsp + 1], 'p'
+    mov eax, ecx
+    shr eax, 4
+    and eax, 15
+    add al, 'a'
+    mov [rsp + 2], al
+    mov eax, ecx
+    and eax, 15
+    add al, 'a'
+    mov [rsp + 3], al
+    mov rsi, rsp
+    mov ecx, 4
+    call jsstr_atom
+    add rsp, 8
+    pop rsi
+    pop rcx
+    ret
+
+; ------------------------------------------------------------------------------
+; jsp_binding_pattern: current token '[' or '{', CL = VK_* for the names in it
+; -> RAX = NT_APAT / NT_OPAT (names declared)
+; jsp_binding_target: a name (declared, -> NT_IDENT) or a nested pattern
+; ------------------------------------------------------------------------------
+jsp_binding_target:
+    cmp dword [tok_type], TK_NAME
+    jne jsp_binding_pattern
+    push rdx
+    call jsp_ident
+    mov rdx, rax
+    call jsp_declare
+    mov al, NT_IDENT
+    call jsp_node
+    mov [rax + JN_A], rdx
+    pop rdx
+    ret
+
+jsp_binding_pattern:
+    call jsp_enter
+    push rbx
+    push rdx
+    push r8
+    push r9
+    AT_PUNCT P_LBRACK
+    je .array
+    AT_PUNCT P_LBRACE
+    jne jsp_unexpected
+    ; { key: target = default, name = default, [expr]: target, ...rest }
+    mov al, NT_OPAT
+    call jsp_node
+    mov rbx, rax
+    call jslex_next
+    xor r8d, r8d
+.prop:
+    AT_PUNCT P_RBRACE
+    je .end
+    call .element
+    AT_PUNCT P_ELLIPSIS
+    jne .key
+    call jslex_next
+    mov byte [r9 + JN_OP], 1
+    call jsp_binding_target
+    mov [r9 + JN_A], rax
+    jmp .prop_next
+.key:
+    AT_PUNCT P_LBRACK
+    je .computed
+    mov eax, [tok_type]
+    cmp eax, TK_NAME
+    je .key_name
+    cmp eax, TK_STR
+    je .key_atom
+    cmp eax, TK_NUM
+    jne jsp_unexpected
+    mov rax, [tok_val]
+    call js_number_to_atom
+    mov [r9 + JN_C], rax
+    call jslex_next
+    jmp .colon
+.key_atom:
+    mov rax, [tok_val]
+    mov [r9 + JN_C], rax
+    call jslex_next
+    jmp .colon
+.key_name:
+    mov rdx, [tok_val]
+    mov [r9 + JN_C], rdx
+    call jslex_next
+    AT_PUNCT P_COLON
+    je .colon
+    ; shorthand {a} / {a = 1}: the key is the name
+    call jsp_declare
+    mov al, NT_IDENT
+    call jsp_node
+    mov [rax + JN_A], rdx
+    mov [r9 + JN_A], rax
+    jmp .default
+.computed:
+    or byte [r9 + JN_OP], 2
+    call jslex_next
+    call jsp_assign
+    mov [r9 + JN_C], rax
+    EXPECT P_RBRACK
+.colon:
+    EXPECT P_COLON
+    call jsp_binding_target
+    mov [r9 + JN_A], rax
+.default:
+    AT_PUNCT P_ASSIGN
+    jne .prop_next
+    call jslex_next
+    call jsp_assign
+    mov [r9 + JN_B], rax
+.prop_next:
+    AT_PUNCT P_RBRACE
+    je .end
+    EXPECT P_COMMA
+    jmp .prop
+.array:
+    ; [target = default, , ...rest]
+    mov al, NT_APAT
+    call jsp_node
+    mov rbx, rax
+    call jslex_next
+    xor r8d, r8d
+.item:
+    AT_PUNCT P_RBRACK
+    je .end
+    call .element
+    AT_PUNCT P_COMMA
+    je .hole
+    AT_PUNCT P_ELLIPSIS
+    jne .item_target
+    call jslex_next
+    mov byte [r9 + JN_OP], 1
+.item_target:
+    call jsp_binding_target
+    mov [r9 + JN_A], rax
+    AT_PUNCT P_ASSIGN
+    jne .item_next
+    call jslex_next
+    call jsp_assign
+    mov [r9 + JN_B], rax
+.item_next:
+    AT_PUNCT P_RBRACK
+    je .end
+.hole:
+    EXPECT P_COMMA
+    jmp .item
+.end:
+    call jslex_next
+    mov rax, rbx
+    pop r9
+    pop r8
+    pop rdx
+    pop rbx
+    call jsp_leave
+    ret
+; .element: a new NT_PELEM appended to RBX's list -> R9 (R8 = the last one)
+.element:
+    push rax
+    mov al, NT_PELEM
+    call jsp_node
+    mov r9, rax
+    test r8, r8
+    jz .el_first
+    mov [r8 + JN_NEXT], r9
+    jmp .el_done
+.el_first:
+    mov [rbx + JN_A], r9
+.el_done:
+    mov r8, r9
+    pop rax
+    ret
+
+; ------------------------------------------------------------------------------
+; jsp_to_pattern: RAX = an array or object literal on the left of '=' (or of
+; for-of) -> RAX = the same as an assignment pattern
+; ------------------------------------------------------------------------------
+jsp_to_pattern:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push r8
+    push r9
+    mov rsi, rax
+    mov al, NT_APAT
+    cmp byte [rsi + JN_TYPE], NT_ARRAY
+    je .make
+    mov al, NT_OPAT
+.make:
+    call jsp_node
+    mov rbx, rax
+    xor r8d, r8d
+    mov rsi, [rsi + JN_A]           ; elements / properties
+.item:
+    test rsi, rsi
+    jz .done
+    mov al, NT_PELEM
+    call jsp_node
+    mov r9, rax
+    test r8, r8
+    jz .first
+    mov [r8 + JN_NEXT], r9
+    jmp .linked
+.first:
+    mov [rbx + JN_A], r9
+.linked:
+    mov r8, r9
+    cmp byte [rbx + JN_TYPE], NT_OPAT
+    je .property
+    ; array element
+    cmp byte [rsi + JN_TYPE], NT_HOLE
+    je .next
+    mov rax, rsi
+    cmp byte [rsi + JN_TYPE], NT_SPREAD
+    jne .value
+    mov byte [r9 + JN_OP], 1
+    mov rax, [rsi + JN_A]
+    jmp .value
+.property:
+    cmp byte [rsi + JN_OP], 2
+    jne .keyed
+    mov byte [r9 + JN_OP], 1        ; ...rest
+    mov rax, [rsi + JN_A]
+    jmp .value
+.keyed:
+    mov rax, [rsi + JN_A]
+    mov [r9 + JN_C], rax
+    cmp byte [rsi + JN_OP], 1
+    jne .key_done
+    or byte [r9 + JN_OP], 2
+.key_done:
+    mov rax, [rsi + JN_B]
+.value:
+    ; target = default
+    cmp byte [rax + JN_TYPE], NT_ASSIGN
+    jne .target
+    cmp byte [rax + JN_OP], P_ASSIGN
+    jne .target
+    mov rcx, [rax + JN_B]
+    mov [r9 + JN_B], rcx
+    mov rax, [rax + JN_A]
+.target:
+    call jsp_to_target
+    mov [r9 + JN_A], rax
+.next:
+    mov rsi, [rsi + JN_NEXT]
+    jmp .item
+.done:
+    mov rax, rbx
+    pop r9
+    pop r8
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; jsp_to_target: RAX = expression that must be assignable -> RAX = the target
+; (a name, a.b, a[b], or a nested literal made a pattern)
+jsp_to_target:
+    cmp byte [rax + JN_TYPE], NT_IDENT
+    je .ok
+    cmp byte [rax + JN_TYPE], NT_MEMBER
+    je .ok
+    cmp byte [rax + JN_TYPE], NT_INDEX
+    je .ok
+    cmp byte [rax + JN_TYPE], NT_ARRAY
+    je jsp_to_pattern
+    cmp byte [rax + JN_TYPE], NT_OBJECT
+    je jsp_to_pattern
+    lea rsi, [jsmsg_bad_target]
+    jmp jslex_error
+.ok:
+    ret
+
+; ------------------------------------------------------------------------------
+; jsp_arrow: RDX = the single parameter's name (x => ...), or 0 with the
+; current token '(' -> RAX = NT_FUNC of an arrow function
+; ------------------------------------------------------------------------------
+jsp_arrow:
+    push rbx
+    push rcx
+    push rdx
+    push r8
+    push r9
+    push r10
+    mov r8, [jsp_func]
+    mov r9, [jsp_scope]
+    push qword [jsp_no_in]
+    mov dword [jsp_no_in], 0
+    mov al, NT_FUNC
+    call jsp_node
+    mov r10, rax
+    call jsp_new_func
+    mov rbx, rax
+    or dword [rbx + JFI_FLAGS], FIF_ARROW
+    mov [r10 + JN_A], rbx
+    test rdx, rdx
+    jz .list
+    ; x => ...
+    push rbx
+    mov rbx, [rbx + JFI_SCOPE]
+    mov cl, VK_PARAM
+    call jsp_scope_add
+    pop rbx
+    mov dword [rbx + JFI_NPARAMS], 1
+    jmp .arrow
+.list:
+    call jsp_params
+.arrow:
+    EXPECT P_ARROW
+    AT_PUNCT P_LBRACE
+    je .block
+    ; an expression: the value it returns
+    mov al, NT_RETURN
+    call jsp_node
+    mov rcx, rax
+    call jsp_assign
+    mov [rcx + JN_A], rax
+    mov [rbx + JFI_BODY], rcx
+    jmp .done
+.block:
+    call jslex_next
+    call jsp_statement_list
+    mov [rbx + JFI_BODY], rax
+    AT_PUNCT P_RBRACE
+    jne jsp_unexpected
+    call jslex_next
+.done:
+    pop qword [jsp_no_in]
+    mov [jsp_func], r8
+    mov [jsp_scope], r9
+    mov rax, r10
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; ------------------------------------------------------------------------------
+; jsp_arrow_ahead: current token '(' -> CF=1 if the parentheses are an arrow
+; function's parameters (the ')' is followed by =>). Looks ahead with the
+; lexer and comes back.
+; ------------------------------------------------------------------------------
+jsp_arrow_ahead:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    lea rsi, [jslex_state]
+    lea rdi, [jsp_ahead_saved]
+    mov ecx, JSLEX_STATE_SIZE
+    rep movsb
+    xor edx, edx                    ; bracket depth
+    xor ecx, ecx                    ; open ${ (their depths on jsp_ahead_tpl)
+.token:
+    mov eax, [tok_type]
+    cmp eax, TK_EOF
+    je .no
+    cmp eax, TK_TEMPLATE
+    jne .punct
+    cmp byte [tok_tail], 0
+    jne .next
+    ; ${ ... }: remember the depth it opened at
+    cmp ecx, 32
+    jae .no
+    lea rsi, [jsp_ahead_tpl]
+    mov [rsi + rcx*4], edx
+    inc ecx
+    inc edx
+    jmp .next
+.punct:
+    cmp eax, TK_PUNCT
+    jne .next
+    mov rax, [tok_val]
+    cmp eax, P_LPAREN
+    je .open
+    cmp eax, P_LBRACK
+    je .open
+    cmp eax, P_LBRACE
+    je .open
+    cmp eax, P_RPAREN
+    je .close
+    cmp eax, P_RBRACK
+    je .close
+    cmp eax, P_RBRACE
+    jne .next
+    ; the end of a ${ }?
+    test ecx, ecx
+    jz .close
+    lea rsi, [jsp_ahead_tpl]
+    lea eax, [edx - 1]
+    cmp eax, [rsi + rcx*4 - 4]
+    jne .close
+    dec ecx
+    dec edx
+    call jslex_template_resume
+    jmp .token
+.open:
+    inc edx
+    jmp .next
+.close:
+    dec edx
+    jnz .next
+    ; the matching ')': is => next?
+    call jslex_next
+    AT_PUNCT P_ARROW
+    je .yes
+    jmp .no
+.next:
+    call jslex_next
+    jmp .token
+.yes:
+    call .restore
+    stc
+    jmp .out
+.no:
+    call .restore
+    clc
+.out:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+.restore:
+    push rcx
+    lea rsi, [jsp_ahead_saved]
+    lea rdi, [jslex_state]
+    mov ecx, JSLEX_STATE_SIZE
+    rep movsb
+    pop rcx
+    ret
+
+; ------------------------------------------------------------------------------
+; jsp_template: current token is a template's first piece -> RAX = NT_TEMPLATE
+; ------------------------------------------------------------------------------
+jsp_template:
+    push rbx
+    push rcx
+    push rdx
+    mov al, NT_TEMPLATE
+    call jsp_node
+    mov rbx, rax
+    xor ecx, ecx                    ; last piece
+.piece:
+    mov al, NT_STR
+    call jsp_node
+    mov rdx, [tok_val]
+    mov [rax + JN_A], rdx
+    call .append
+    cmp byte [tok_tail], 0
+    jne .end
+    call jslex_next
+    push qword [jsp_no_in]
+    mov dword [jsp_no_in], 0
+    call jsp_expression
+    pop qword [jsp_no_in]
+    call .append
+    AT_PUNCT P_RBRACE
+    jne jsp_unexpected
+    call jslex_template_resume
+    jmp .piece
+.end:
+    call jslex_next
+    mov rax, rbx
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+; .append: RAX = node after the last one (RCX)
+.append:
+    test rcx, rcx
+    jz .first
+    mov [rcx + JN_NEXT], rax
+    mov rcx, rax
+    ret
+.first:
+    mov [rbx + JN_A], rax
+    mov rcx, rax
+    ret
 
 ; ==============================================================================
 ; Expressions
@@ -1206,12 +1881,17 @@ jsp_assign:
     je .target_ok
     cmp ebx, NT_INDEX
     je .target_ok
+    cmp ecx, P_ASSIGN
+    jne .bad_target
     cmp ebx, NT_ARRAY
-    je .destructure
+    je .pattern
     cmp ebx, NT_OBJECT
-    je .destructure
+    je .pattern
+.bad_target:
     lea rsi, [jsmsg_bad_target]
     jmp jslex_error
+.pattern:
+    call jsp_to_pattern
 .target_ok:
     mov rbx, rax
     mov al, NT_ASSIGN
@@ -1229,11 +1909,7 @@ jsp_assign:
     call jsp_leave
     ret
 .arrow:
-    lea rdi, [jsfeat_arrow]
-    jmp jsp_unsupported
-.destructure:
-    lea rdi, [jsfeat_destructuring]
-    jmp jsp_unsupported
+    jmp jsp_unexpected              ; `a + b => c`
 
 ; jsp_conditional: binary ['?' assign ':' assign] -> RAX
 jsp_conditional:
@@ -1529,6 +2205,8 @@ jsp_postfix:
 jsp_call:
     push rbx
     push rcx
+    push r8
+    xor r8d, r8d                    ; 1 = the chain has a ?.
     AT_KW KW_NEW
     jne .primary
     call jsp_new
@@ -1549,10 +2227,18 @@ jsp_call:
     je .call
     cmp ecx, P_QDOT
     je .optional
-    cmp ecx, P_BACKTICK
-    je .template
 .done:
+    cmp dword [tok_type], TK_TEMPLATE
+    je .template
     mov rax, rbx
+    test r8d, r8d
+    jz .plain
+    ; a ?. somewhere: the whole chain is its jump target
+    mov al, NT_CHAIN
+    call jsp_node
+    mov [rax + JN_A], rbx
+.plain:
+    pop r8
     pop rcx
     pop rbx
     ret
@@ -1570,16 +2256,37 @@ jsp_call:
     call jsp_arguments
     jmp .loop
 .optional:
-    lea rdi, [jsfeat_optional]
-    jmp jsp_unsupported
+    mov r8d, 1
+    call jslex_next
+    AT_PUNCT P_LPAREN
+    je .optional_call
+    AT_PUNCT P_LBRACK
+    je .optional_index
+    call jsp_member_name
+    or word [rbx + JN_FLAGS], JNF_OPTIONAL
+    jmp .loop
+.optional_index:
+    call jsp_member_index
+    or word [rbx + JN_FLAGS], JNF_OPTIONAL
+    jmp .loop
+.optional_call:
+    mov al, NT_CALL
+    call jsp_node
+    mov [rax + JN_A], rbx
+    or word [rax + JN_FLAGS], JNF_OPTIONAL
+    mov rbx, rax
+    call jsp_arguments
+    jmp .loop
 .template:
-    lea rdi, [jsfeat_template]
+    lea rdi, [jsfeat_tagged]
     jmp jsp_unsupported
 
 ; jsp_member_dot: RBX = object; current token '.' -> RBX = NT_MEMBER
+; jsp_member_name: the same with the name as the current token (after ?.)
 jsp_member_dot:
-    push rax
     call jslex_next
+jsp_member_name:
+    push rax
     cmp dword [tok_type], TK_NAME
     je .name
     AT_PUNCT P_HASH
@@ -1632,6 +2339,11 @@ jsp_arguments:
     AT_PUNCT P_ELLIPSIS
     je .spread
     call jsp_assign
+    jmp .have
+.spread:
+    call jsp_spread
+    or word [rbx + JN_FLAGS], JNF_SPREAD
+.have:
     test rcx, rcx
     jz .first
     mov [rcx + JN_NEXT], rax
@@ -1655,9 +2367,6 @@ jsp_arguments:
     pop rcx
     pop rax
     ret
-.spread:
-    lea rdi, [jsfeat_spread]
-    jmp jsp_unsupported
 .too_many:
     lea rsi, [jsmsg_too_many_args]
     jmp jslex_error
@@ -1720,6 +2429,8 @@ jsp_primary:
     je .string
     cmp eax, TK_NAME
     je .name
+    cmp eax, TK_TEMPLATE
+    je .template
     cmp eax, TK_PUNCT
     jne jsp_unexpected
     mov rcx, [tok_val]
@@ -1791,7 +2502,7 @@ jsp_primary:
     mov [rbx + JN_A], rdx
     call jslex_next
     AT_PUNCT P_ARROW
-    je .arrow
+    je .single_arrow
     cmp rdx, [atom_arguments]
     jne .ident_done
     call jsp_use_arguments
@@ -1816,17 +2527,22 @@ jsp_primary:
     mov [rbx + JN_A], rax
     mov rax, rbx
     jmp .done
+.single_arrow:
+    call jsp_arrow                  ; x => ...
+    jmp .done
 .paren:
+    call jsp_arrow_ahead
+    jnc .group
+    xor edx, edx
+    call jsp_arrow                  ; (a, b) => ...
+    jmp .done
+.group:
     call jslex_next
-    AT_PUNCT P_RPAREN
-    je .arrow                       ; () => ...
     push qword [jsp_no_in]
     mov dword [jsp_no_in], 0
     call jsp_expression
     pop qword [jsp_no_in]
     EXPECT P_RPAREN
-    AT_PUNCT P_ARROW
-    je .arrow
     jmp .done
 .array:
     call jsp_array
@@ -1841,21 +2557,37 @@ jsp_primary:
     pop rcx
     pop rbx
     ret
-.arrow:
-    lea rdi, [jsfeat_arrow]
-    jmp jsp_unsupported
+.template:
+    call jsp_template
+    jmp .done
 .regex:
     lea rdi, [jsfeat_regex]
     jmp jsp_unsupported
-.template:
-    lea rdi, [jsfeat_template]
-    jmp jsp_unsupported
 .class:
-    lea rdi, [jsfeat_class]
-    jmp jsp_unsupported
+    xor ecx, ecx
+    call jsp_class
+    jmp .done
 .super:
-    lea rdi, [jsfeat_super]
-    jmp jsp_unsupported
+    call jslex_next
+    AT_PUNCT P_LPAREN
+    je .super_call
+    AT_PUNCT P_DOT
+    jne jsp_unexpected
+    call jslex_next
+    cmp dword [tok_type], TK_NAME
+    jne jsp_unexpected
+    mov al, NT_SUPERMEMBER
+    call jsp_node
+    mov rcx, [tok_val]
+    mov [rax + JN_B], rcx
+    jmp .next_done
+.super_call:
+    mov al, NT_SUPERCALL
+    call jsp_node
+    mov rbx, rax
+    call jsp_arguments
+    mov rax, rbx
+    jmp .done
 .decorator:
     lea rdi, [jsfeat_decorator]
     jmp jsp_unsupported
@@ -1870,6 +2602,12 @@ jsp_use_arguments:
     push rcx
     push rdx
     mov rcx, [jsp_func]
+.function:
+    test dword [rcx + JFI_FLAGS], FIF_ARROW
+    jz .own
+    mov rcx, [rcx + JFI_PARENT]     ; arrows use the enclosing function's
+    jmp .function
+.own:
     test dword [rcx + JFI_FLAGS], FIF_SCRIPT
     jnz .done                       ; a global name at the top level
     mov rbx, [rcx + JFI_SCOPE]
@@ -1906,6 +2644,9 @@ jsp_array:
     je .spread
     call jsp_assign
     jmp .append
+.spread:
+    call jsp_spread
+    jmp .append
 .hole:
     mov al, NT_HOLE
     call jsp_node
@@ -1929,9 +2670,316 @@ jsp_array:
     pop rcx
     pop rbx
     ret
-.spread:
-    lea rdi, [jsfeat_spread]
+
+; ------------------------------------------------------------------------------
+; jsp_class: current token `class`, ECX = 1 for a declaration -> RAX = NT_CLASS.
+; The constructor's function info is made first, so instance field values
+; are parsed as if they were at the start of the constructor.
+; ------------------------------------------------------------------------------
+jsp_class:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    mov r11d, ecx                   ; declaration?
+    mov al, NT_CLASS
+    call jsp_node
+    mov rbx, rax
+    mov [rbx + JN_OP], r11b
+    call jslex_next                 ; `class`
+    xor edx, edx
+    cmp dword [tok_type], TK_NAME
+    jne .named
+    AT_KW KW_EXTENDS
+    je .named
+    call jsp_ident
+    mov rdx, rax
+    mov [rbx + JN_A], rdx
+    test r11d, r11d
+    jz .named
+    mov cl, VK_LET
+    call jsp_declare
+.named:
+    test r11d, r11d
+    jz .heritage
+    test rdx, rdx
+    jz .no_name
+.heritage:
+    AT_KW KW_EXTENDS
+    jne .body
+    call jslex_next
+    call jsp_call
+    mov [rbx + JN_B], rax
+.body:
+    EXPECT P_LBRACE
+    mov r8, [jsp_func]
+    mov r9, [jsp_scope]
+    call jsp_new_func
+    mov r10, rax                    ; the constructor
+    mov [r10 + JFI_NAME], rdx
+    or dword [r10 + JFI_FLAGS], FIF_CLASSCTOR
+    cmp qword [rbx + JN_B], 0
+    je .base
+    or dword [r10 + JFI_FLAGS], FIF_DERIVED
+.base:
+    mov [jsp_func], r8              ; members are parsed outside it
+    mov [jsp_scope], r9
+    mov [rbx + JN_D], r10
+    xor esi, esi                    ; last member
+    xor edi, edi                    ; last instance field
+    mov qword [rbx + JN_E], 0       ; 1 = it has a constructor
+.member:
+    AT_PUNCT P_RBRACE
+    je .end
+    AT_PUNCT P_SEMI
+    jne .member_start
+    call jslex_next
+    jmp .member
+.member_start:
+    mov al, NT_CLASSMEM
+    call jsp_node
+    mov rcx, rax
+    ; static
+    cmp dword [tok_type], TK_NAME
+    jne .key
+    mov rax, [tok_val]
+    cmp rax, [atom_static]
+    jne .accessor
+    call jslex_peek
+    cmp dword [peek_type], TK_PUNCT
+    jne .is_static
+    cmp qword [peek_val], P_LPAREN
+    je .key                         ; a method named static
+    cmp qword [peek_val], P_ASSIGN
+    je .key
+    cmp qword [peek_val], P_SEMI
+    je .key
+.is_static:
+    or byte [rcx + JN_OP], CM_STATIC
+    call jslex_next
+.accessor:
+    cmp dword [tok_type], TK_NAME
+    jne .key
+    mov rax, [tok_val]
+    mov dl, CM_GET
+    cmp rax, [atom_get]
+    je .maybe_accessor
+    mov dl, CM_SET
+    cmp rax, [atom_set]
+    jne .key
+.maybe_accessor:
+    call jslex_peek
+    cmp dword [peek_type], TK_NAME
+    je .is_accessor
+    cmp dword [peek_type], TK_STR
+    je .is_accessor
+    cmp dword [peek_type], TK_NUM
+    je .is_accessor
+    cmp dword [peek_type], TK_PUNCT
+    jne .key
+    cmp qword [peek_val], P_LBRACK
+    jne .key
+.is_accessor:
+    or [rcx + JN_OP], dl
+    call jslex_next
+.key:
+    AT_PUNCT P_LBRACK
+    je .computed
+    AT_PUNCT P_HASH
+    je .private
+    mov eax, [tok_type]
+    cmp eax, TK_NAME
+    je .key_atom
+    cmp eax, TK_STR
+    je .key_atom
+    cmp eax, TK_NUM
+    jne jsp_unexpected
+    mov rax, [tok_val]
+    call js_number_to_atom
+    mov [rcx + JN_A], rax
+    call jslex_next
+    jmp .after_key
+.key_atom:
+    mov rax, [tok_val]
+    mov [rcx + JN_A], rax
+    call jslex_next
+    jmp .after_key
+.computed:
+    or byte [rcx + JN_OP], CM_COMPUTED
+    call jslex_next
+    call jsp_assign
+    mov [rcx + JN_A], rax
+    EXPECT P_RBRACK
+.after_key:
+    AT_PUNCT P_LPAREN
+    jne .field
+    ; the constructor?
+    test byte [rcx + JN_OP], CM_STATIC | CM_GET | CM_SET | CM_COMPUTED
+    jnz .method
+    mov rax, [rcx + JN_A]
+    cmp rax, [atom_constructor]
+    jne .method
+    mov [jsp_func], r10
+    mov rax, [r10 + JFI_SCOPE]
+    mov [jsp_scope], rax
+    push rbx
+    mov rbx, r10
+    call jsp_params
+    pop rbx
+    EXPECT P_LBRACE
+    call jsp_statement_list
+    mov [r10 + JFI_BODY], rax
+    AT_PUNCT P_RBRACE
+    jne jsp_unexpected
+    call jslex_next
+    mov [jsp_func], r8
+    mov [jsp_scope], r9
+    mov qword [rbx + JN_E], 1
+    jmp .member
+.method:
+    xor edx, edx
+    test byte [rcx + JN_OP], CM_COMPUTED
+    jnz .method_fn
+    mov rdx, [rcx + JN_A]
+.method_fn:
+    push rcx
+    mov al, NT_FUNC
+    call jsp_node
+    push rax
+    xor ecx, ecx
+    call jsp_function_rest
+    mov rdx, rax
+    pop rax
+    mov [rax + JN_A], rdx
+    pop rcx
+    mov [rcx + JN_B], rax
+    jmp .link
+.field:
+    or byte [rcx + JN_OP], CM_FIELD
+    AT_PUNCT P_ASSIGN
+    jne .field_end
+    call jslex_next
+    test byte [rcx + JN_OP], CM_STATIC
+    jnz .static_value
+    ; an instance field's value belongs to the constructor
+    mov [jsp_func], r10
+    mov rax, [r10 + JFI_SCOPE]
+    mov [jsp_scope], rax
+    call jsp_assign
+    mov [jsp_func], r8
+    mov [jsp_scope], r9
+    jmp .field_value
+.static_value:
+    call jsp_assign
+.field_value:
+    mov [rcx + JN_B], rax
+.field_end:
+    call jsp_semicolon
+    test byte [rcx + JN_OP], CM_STATIC
+    jnz .link
+    ; instance fields: the constructor's list
+    test rdi, rdi
+    jz .first_field
+    mov [rdi + JN_NEXT], rcx
+    jmp .field_linked
+.first_field:
+    mov [r10 + JFI_FIELDS], rcx
+.field_linked:
+    mov rdi, rcx
+    jmp .member
+.link:
+    test rsi, rsi
+    jz .first_member
+    mov [rsi + JN_NEXT], rcx
+    jmp .linked
+.first_member:
+    mov [rbx + JN_C], rcx
+.linked:
+    mov rsi, rcx
+    jmp .member
+.end:
+    call jslex_next
+    cmp qword [rbx + JN_E], 0
+    jne .done
+    cmp qword [rbx + JN_B], 0
+    je .done
+    ; a derived class without a constructor: constructor(... args) { super(... args) }
+    mov [jsp_func], r10
+    mov rax, [r10 + JFI_SCOPE]
+    mov [jsp_scope], rax
+    push rbx
+    mov rbx, rax
+    mov rdx, [atom_rest_args]
+    mov cl, VK_VAR
+    call jsp_scope_add
+    pop rbx
+    mov [r10 + JFI_REST], rax
+    mov al, NT_IDENT
+    call jsp_node
+    mov [rax + JN_A], rdx
+    mov rcx, rax
+    mov al, NT_PARAM
+    call jsp_node
+    mov byte [rax + JN_OP], 1
+    mov [rax + JN_A], rcx
+    mov [r10 + JFI_PARAMS], rax
+    mov al, NT_IDENT
+    call jsp_node
+    mov [rax + JN_A], rdx
+    mov rcx, rax
+    mov al, NT_SPREAD
+    call jsp_node
+    mov [rax + JN_A], rcx
+    mov rcx, rax
+    mov al, NT_SUPERCALL
+    call jsp_node
+    mov [rax + JN_B], rcx
+    mov qword [rax + JN_C], 1
+    or word [rax + JN_FLAGS], JNF_SPREAD
+    mov rcx, rax
+    mov al, NT_EXPR
+    call jsp_node
+    mov [rax + JN_A], rcx
+    mov [r10 + JFI_BODY], rax
+    mov [jsp_func], r8
+    mov [jsp_scope], r9
+.done:
+    mov qword [rbx + JN_E], 0
+    mov rax, rbx
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+.no_name:
+    lea rsi, [jsmsg_class_name]
+    jmp jslex_error
+.private:
+    lea rdi, [jsfeat_private]
     jmp jsp_unsupported
+
+; jsp_spread: current token '...' -> RAX = NT_SPREAD of the expression after it
+jsp_spread:
+    push rbx
+    mov al, NT_SPREAD
+    call jsp_node
+    mov rbx, rax
+    call jslex_next
+    call jsp_assign
+    mov [rbx + JN_A], rax
+    mov rax, rbx
+    pop rbx
+    ret
 
 ; jsp_object: '{' properties '}' -> RAX = NT_OBJECT
 jsp_object:
@@ -1950,8 +2998,6 @@ jsp_object:
 .property:
     AT_PUNCT P_RBRACE
     je .done
-    AT_PUNCT P_ELLIPSIS
-    je .spread
     mov al, NT_PROP
     call jsp_node
     test r8, r8
@@ -1962,7 +3008,15 @@ jsp_object:
     mov [rbx + JN_A], rax
 .linked:
     mov r8, rax
-    ; the key
+    AT_PUNCT P_ELLIPSIS
+    jne .key
+    ; ...spread: its own enumerable properties
+    mov byte [r8 + JN_OP], 2
+    call jslex_next
+    call jsp_assign
+    mov [r8 + JN_A], rax
+    jmp .next
+.key:
     mov eax, [tok_type]
     cmp eax, TK_NAME
     je .key_name
@@ -1976,26 +3030,23 @@ jsp_object:
 .key_name:
     ; get/set accessors: `get name(` ...
     mov rdx, [tok_val]
+    cmp rdx, [atom_get]
+    je .maybe_accessor
+    cmp rdx, [atom_set]
+    jne .key_atom
+.maybe_accessor:
     call jslex_peek
     cmp dword [peek_type], TK_NAME
-    je .maybe_accessor
+    je .accessor
     cmp dword [peek_type], TK_STR
-    je .maybe_accessor
+    je .accessor
+    cmp dword [peek_type], TK_NUM
+    je .accessor
 .key_atom:
     mov rdx, [tok_val]
     mov [r8 + JN_A], rdx
     call jslex_next
     jmp .value
-.maybe_accessor:
-    lea rsi, [jsfeat_get]
-    call jsstr_from_cstr
-    cmp rdx, rax
-    je .accessor
-    lea rsi, [jsfeat_set]
-    call jsstr_from_cstr
-    cmp rdx, rax
-    je .accessor
-    jmp .key_atom
 .key_number:
     mov rax, [tok_val]
     call js_number_to_atom
@@ -2022,8 +3073,22 @@ jsp_object:
     mov [rax + JN_A], rdx
     mov [r8 + JN_B], rax
     cmp rdx, [atom_arguments]
-    jne .next
+    jne .cover
     call jsp_use_arguments
+.cover:
+    ; {a = 1} is only valid as a pattern ({a = 1} = obj)
+    AT_PUNCT P_ASSIGN
+    jne .next
+    mov al, NT_ASSIGN
+    call jsp_node
+    mov byte [rax + JN_OP], P_ASSIGN
+    mov rdx, [r8 + JN_B]
+    mov [rax + JN_A], rdx
+    mov [r8 + JN_B], rax
+    mov rdx, rax
+    call jslex_next
+    call jsp_assign
+    mov [rdx + JN_B], rax
     jmp .next
 .colon:
     call jslex_next
@@ -2060,12 +3125,36 @@ jsp_object:
     pop rcx
     pop rbx
     ret
-.spread:
-    lea rdi, [jsfeat_spread]
-    jmp jsp_unsupported
 .accessor:
-    lea rdi, [jsfeat_accessor]
-    jmp jsp_unsupported
+    ; get key() { } / set key(value) { }
+    mov byte [r8 + JN_OP], 3
+    cmp rdx, [atom_get]
+    je .accessor_key
+    mov byte [r8 + JN_OP], 4
+.accessor_key:
+    call jslex_next
+    mov rdx, [tok_val]
+    cmp dword [tok_type], TK_NUM
+    jne .accessor_name
+    mov rax, rdx
+    call js_number_to_atom
+    mov rdx, rax
+.accessor_name:
+    mov [r8 + JN_A], rdx
+    call jslex_next
+    mov al, NT_FUNC
+    call jsp_node
+    push rax
+    xor ecx, ecx
+    call jsp_function_rest
+    mov rcx, rax
+    pop rax
+    mov [rax + JN_A], rcx
+    mov [r8 + JN_B], rax
+    jmp .next
 
 section .rodata
 jsfeat_generator:       db "function* (generators)", 0
+jsfeat_tagged:          db "tagged templates", 0
+jsmsg_rest_last:        db "Rest parameter must be last formal parameter", 0
+jsmsg_class_name:       db "A class declaration needs a name", 0

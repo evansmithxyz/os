@@ -18,6 +18,7 @@ js_string_proto:        resq 1
 js_number_proto:        resq 1
 js_boolean_proto:       resq 1
 js_global:              resq 1          ; the global object
+js_error_protos:        resq JE_COUNT   ; Error.prototype, TypeError.prototype, ... (JE_*)
 
 section .text
 
@@ -178,6 +179,63 @@ jsobj_define:
     pop rbx
     ret
 
+; ------------------------------------------------------------------------------
+; jsobj_define_accessor: RAX = object, RDX = key (atom | attributes << 32),
+; RCX = function, R8D = 1 getter / 2 setter -> that half of the own accessor
+; property set (made if needed; a data property there is replaced)
+; ------------------------------------------------------------------------------
+jsobj_define_accessor:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+    call jsobj_find_own
+    jc .new
+    bt qword [rbx + JPE_KEY], 34
+    jnc .new_cell
+    mov rdi, [rbx + JPE_VAL]
+    jmp .set
+.new:
+    xor ebx, ebx
+.new_cell:
+    push rax
+    push rcx
+    mov ecx, JACC_SIZE
+    call js_alloc
+    mov byte [rax + JH_KIND], JK_ACCESSOR
+    mov rcx, JS_UNDEF
+    mov [rax + JACC_GET], rcx
+    mov [rax + JACC_SET], rcx
+    mov rdi, rax
+    pop rcx
+    pop rax
+    bts rdx, 34                     ; JPA_ACCESSOR
+    test rbx, rbx
+    jz .add
+    mov [rbx + JPE_KEY], rdx
+    mov [rbx + JPE_VAL], rdi
+    jmp .set
+.add:
+    push rcx
+    mov rcx, rdi
+    call jsobj_add
+    pop rcx
+.set:
+    cmp r8d, 1
+    jne .setter
+    mov [rdi + JACC_GET], rcx
+    jmp .done
+.setter:
+    mov [rdi + JACC_SET], rcx
+.done:
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
 ; jsobj_define_hidden: RAX = object, EDX = atom, RCX = value (not enumerable)
 jsobj_define_hidden:
     push rdx
@@ -220,8 +278,8 @@ jsobj_delete:
     push rbx
     call jsobj_find_own
     jc .gone
-    bt qword [rbx + JPE_KEY], 33
-    jc .keep
+    test byte [rbx + JPE_KEY + 4], JPA_READONLY | JPA_FIXED
+    jnz .keep
     mov qword [rbx + JPE_KEY], 0
     mov qword [rbx + JPE_VAL], 0
 .gone:
