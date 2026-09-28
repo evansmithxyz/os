@@ -26,7 +26,12 @@ windowed desktop with i3-style workspaces.
 - **Storage:** ATA PIO driver and AntigravityFS (AFS1), with files that
   persist on disk.
 - **Network:** RTL8139 driver plus Ethernet, ARP, IPv4, ICMP (`ping`), UDP,
-  DNS, TCP, an HTTP client (`curl`) and an HTTP server (`tcplisten`).
+  DNS, TCP, an HTTP/HTTPS client (`curl`) and an HTTP server (`tcplisten`).
+- **TLS 1.3 (phase 1):** `https://` in `curl` and the browser, using X25519
+  and ChaCha20-Poly1305 written in assembly. **Certificates are not verified
+  yet**, so the connection is encrypted but the server could be an impostor.
+  The browser marks every HTTPS page `UNVERIFIED TLS`, and `curl` prints a
+  warning.
 - **Shell:** about 30 commands, Tab completion, history (Up/Down) and Ctrl+C.
 - **Desktop:**
   - 1024×768×32 graphics through the Bochs/QEMU display adapter.
@@ -34,7 +39,8 @@ windowed desktop with i3-style workspaces.
     workspaces.
   - Apps:
     - a terminal that runs the same shell as the text console
-    - the CyberSurf web browser (built-in pages, `afs://` files and real HTTP)
+    - the CyberSurf web browser (built-in pages, `afs://` files, real HTTP and
+      HTTPS, redirects)
     - a paint canvas
     - a live system monitor
 
@@ -101,9 +107,15 @@ into the browser.
 The terminal window runs the real shell, so every command works there too.
 `ws [n]` and `ws move n` control workspaces from inside it.
 
-**Web.** `curl example.com/`, or type a URL into the browser.
-`tcplisten` serves a page that your host can open at
+**Web.** `curl example.com/` or `curl https://www.google.com/`, or type a
+URL into the browser. `tcplisten` serves a page that your host can open at
 <http://localhost:8888>.
+
+HTTPS speaks TLS 1.3 with one cipher suite, `TLS_CHACHA20_POLY1305_SHA256`,
+and one key exchange, X25519. Servers that only offer AES-GCM (rare, since
+TLS 1.3 servers normally support ChaCha20) fail with a handshake alert. The
+server's certificate and signature are not checked yet, only the Finished
+messages. `cryptotest` runs the crypto primitives on the RFC test vectors.
 
 ## Project layout
 
@@ -121,7 +133,8 @@ kernel/
   drivers/              serial, vga_text, keyboard, mouse, pci, ata, rtl8139, bga
   console/console.asm   output routing (VGA / GUI terminal / serial) and the key queue
   fs/afs.asm            AntigravityFS
-  net/                  eth (ARP), ipv4 (ICMP), udp (DNS), tcp (HTTP), url
+  net/                  eth (ARP), ipv4 (ICMP), udp (DNS), tcp (HTTP), url, tls (TLS 1.3 client)
+  crypto/               sha256 + HMAC, chacha20poly1305, x25519, random
   gfx/                  clipped 2D drawing, font, back buffer, mouse pointer
   gui/                  window manager + event loop, taskbar/footer, theme colours
   apps/                 terminal, browser, canvas, sysmon windows

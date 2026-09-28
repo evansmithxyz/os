@@ -1,8 +1,9 @@
 ; ==============================================================================
 ; Antigravity OS - URL parsing and host name resolution
 ; ------------------------------------------------------------------------------
-; url_parse understands   [http://]host[:port][/path]
-; and fills url_host / url_port / url_path. Used by `curl` and the browser.
+; url_parse understands   [http://|https://]host[:port][/path]
+; and fills url_https / url_host / url_port / url_path. Used by `curl` and the
+; browser.
 ; ==============================================================================
 
 [bits 64]
@@ -12,6 +13,7 @@ URL_PATH_MAX            equ 160
 
 section .data
 url_port:               dw 80
+url_https:              db 0        ; 1 = https:// (TLS, default port 443)
 
 section .bss
 url_host:               resb URL_HOST_MAX
@@ -20,6 +22,7 @@ url_ip:                 resb 4
 
 section .rodata
 url_http_prefix:        db "http://", 0
+url_https_prefix:       db "https://", 0
 
 section .text
 ; ------------------------------------------------------------------------------
@@ -32,13 +35,22 @@ url_parse:
     push rdi
 
     mov word [url_port], 80
+    mov byte [url_https], 0
     mov byte [url_host], 0
     mov word [url_path], '/'        ; "/" + NUL
 
     lea rdi, [url_http_prefix]
     call str_has_prefix
-    jne .host
+    jne .try_https
     add rsi, 7
+    jmp .host
+.try_https:
+    lea rdi, [url_https_prefix]
+    call str_has_prefix
+    jne .host
+    add rsi, 8
+    mov byte [url_https], 1
+    mov word [url_port], 443
 
 .host:
     lea rdi, [url_host]

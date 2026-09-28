@@ -42,6 +42,9 @@ class HostWebServer:
         (self.root / "hello.html").write_text(HELLO_HTML)
         (self.root / "big.html").write_text(BIG_HTML)
         (self.root / "nohead.html").write_text(NO_HEAD_END_HTML)
+        # GET /sub answers "301 Location: /sub/" (http.server adds the slash)
+        (self.root / "sub").mkdir(exist_ok=True)
+        (self.root / "sub" / "index.html").write_text("<html><body><p>Sub page</p></body></html>")
         handler = partial(_QuietHandler, directory=str(self.root))
         self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.port = self.httpd.server_address[1]

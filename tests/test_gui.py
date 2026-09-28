@@ -169,6 +169,13 @@ class DesktopTest(OSTestCase):
             self.vm.expect("browser status: HTTP/1.0 200 OK | 10.0.2.2", timeout=20)
             self.vm.expect("browser text: Still visible")
 
+    def test_browser_follows_redirect(self):
+        with HostWebServer() as web:
+            self.vm.send(f"browser http://10.0.2.2:{web.port}/sub\r")
+            self.vm.expect(f"browser: redirect -> http://10.0.2.2:{web.port}/sub/", timeout=20)
+            self.vm.expect("browser status: HTTP/1.0 200 OK | 10.0.2.2", timeout=20)
+            self.vm.expect("browser text: Sub page")
+
     @unittest.skipUnless(os.environ.get("AGOS_TEST_INTERNET"), "set AGOS_TEST_INTERNET=1")
     def test_browser_google(self):
         self.vm.send("browser http://www.google.com/\r")

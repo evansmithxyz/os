@@ -70,7 +70,7 @@ COMMAND "arp",       cmd_arp,       0,            "arp                 ARP cache
 COMMAND "ping",      cmd_ping,      0,            "ping <host>         ICMP echo (IP address or domain name)"
 COMMAND "dns",       cmd_dns,       0,            "dns <domain>        Resolve a name with DNS"
 ALIAS   "nslookup",  cmd_dns,       0
-COMMAND "curl",      cmd_curl,      0,            "curl <url> [port]   HTTP GET, e.g. curl example.com/index.html"
+COMMAND "curl",      cmd_curl,      0,            "curl <url> [port]   HTTP(S) GET, e.g. curl https://example.com/"
 ALIAS   "http",      cmd_curl,      0
 COMMAND "tcplisten", cmd_tcplisten, 0,            "tcplisten [port]    Serve a web page (host: http://localhost:8888)"
 
@@ -87,6 +87,7 @@ COMMAND "uptime",    cmd_uptime,    0,            "uptime              Time sinc
 ALIAS   "ticks",     cmd_uptime,    0
 COMMAND "reboot",    cmd_reboot,    0,            "reboot              Restart the machine"
 COMMAND "halt",      cmd_halt,      0,            "halt                Stop the CPU"
+COMMAND "cryptotest", cmd_cryptotest, 0,           "cryptotest          Run the TLS crypto self-test (hex output)"
 ALIAS   "crash",     cmd_crash,     CMDF_HIDDEN   ; crash [ud|gp|pf|de] - tests the panic handler
 
 HEADING "Desktop"
@@ -105,3 +106,4 @@ section .text
 %include "apps/shell/cmd_net.asm"
 %include "apps/shell/cmd_sys.asm"
 %include "apps/shell/cmd_desktop.asm"
+%include "apps/shell/cmd_crypto.asm"

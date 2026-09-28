@@ -18,6 +18,7 @@ BROWSER_PAGE_BUF_MAX    equ 131072
 BROWSER_MAX_LINKS       equ 16
 BROWSER_LINK_SIZE       equ 80      ; x1, y1, x2, y2 (dd) + 64-byte target URL
 BROWSER_LOG_MAX         equ 80      ; visible text reported by "[klog] browser text:"
+BROWSER_MAX_REDIRECTS   equ 5
 
 ; Colors for Browser UI
 BROWSER_CLR_TOOLBAR     equ 0x00131D2E   ; Deep Navy Toolbar
@@ -35,6 +36,8 @@ browser_url_focused:    db 0        ; 1 = URL bar has keyboard focus
 browser_in_link:        db 0
 browser_href_set:       db 0        ; current <a> tag had an href
 browser_log_text:       db 0        ; 1 = next render logs the page's first text
+browser_page_tls:       db 0        ; 1 = page came over TLS; certificate NOT verified
+browser_redirects:      db 0        ; redirects followed for the current navigation
 align 4
 browser_log_len:        dd 0
 browser_log_y:          dd 0        ; y of the last logged glyph
@@ -65,6 +68,7 @@ browser_page_title:     resb 64
 browser_status_text:    resb 96
 browser_temp_href:      resb 64
 browser_scratch:        resb 160
+browser_redirect_buf:   resb 384    ; [0] built URL, [256] Location value
 browser_log_buf:        resb BROWSER_LOG_MAX + 2
 browser_links:          resb BROWSER_MAX_LINKS * BROWSER_LINK_SIZE
 browser_page_buf:       resb BROWSER_PAGE_BUF_MAX + 1
@@ -248,6 +252,7 @@ browser_navigate:
     push r8
 
     mov byte [browser_pending_nav], 0
+    mov byte [browser_page_tls], 0
     mov dword [browser_link_count], 0
     lea rsi, [browser_url_buf]
     call strlen
@@ -347,7 +352,10 @@ browser_navigate:
     ret
 
 ; ------------------------------------------------------------------------------
-; browser_fetch_http: HTTP GET of browser_url_buf into the page buffer
+; browser_fetch_http: GET browser_url_buf (http:// or https://) into the page
+; buffer, following up to BROWSER_MAX_REDIRECTS redirects. An https:// page
+; sets browser_page_tls: its certificate was NOT verified, which the address
+; bar, the status bar and the badge all show.
 ; ------------------------------------------------------------------------------
 browser_fetch_http:
     push rax
@@ -357,6 +365,8 @@ browser_fetch_http:
     push rdi
     push r8
 
+    mov byte [browser_redirects], 0
+.fetch:
     lea rsi, [browser_url_buf]
     call url_parse
     jc .bad_url
@@ -377,12 +387,42 @@ browser_fetch_http:
     lea rdi, [url_host]
     movzx edx, word [url_port]
     lea r8, [url_path]
+    cmp byte [url_https], 1
+    je .https
     call tcp_http_client
     mov byte [http_quiet], 0
     test rax, rax
     jnz .fail
+    jmp .fetched
+.https:
+    call tls_https_get
+    mov byte [http_quiet], 0
+    test rax, rax
+    jnz .tls_fail
+.fetched:
     cmp dword [http_resp_len], 0
     je .fail
+
+    ; 3xx with a Location header: fetch the new URL instead
+    cmp byte [browser_redirects], BROWSER_MAX_REDIRECTS
+    jae .show
+    call browser_redirect_target
+    jc .show
+    inc byte [browser_redirects]
+    lea rsi, [klog_browser_redirect]
+    lea rdi, [browser_url_buf]
+    call klog2
+    lea rsi, [browser_url_buf]
+    lea rdi, [browser_page_url]
+    mov ecx, BROWSER_URL_MAX
+    call strlcpy
+    call strlen
+    mov [browser_url_len], eax
+    jmp .fetch
+
+.show:
+    mov al, [url_https]
+    mov [browser_page_tls], al
 
     ; Body = everything after the blank line that ends the headers
     lea rsi, [http_resp_buf]
@@ -408,8 +448,9 @@ browser_fetch_http:
     mov ecx, BROWSER_PAGE_BUF_MAX + 1
     call strlcpy
 
-    ; Title "CyberSurf - host", status = HTTP status line + host. Built in a
-    ; scratch buffer, then copied with a bound (host names can be 63 chars).
+    ; Title "CyberSurf - host", status = [TLS warning] HTTP status line + host.
+    ; Built in a scratch buffer, then copied with a bound (host names can be
+    ; 63 chars).
     lea rdi, [browser_scratch]
     lea rsi, [STR_TITLE_PREFIX]
     call fmt_str
@@ -420,6 +461,12 @@ browser_fetch_http:
     mov ecx, 64
     call strlcpy
     lea rdi, [browser_scratch]
+    mov byte [rdi], 0
+    cmp byte [browser_page_tls], 0
+    je .status_start
+    lea rsi, [STR_STATUS_UNVERIFIED]
+    call fmt_str
+.status_start:
     lea rsi, [http_resp_buf]
     xor ecx, ecx
 .status_line:
@@ -459,6 +506,18 @@ browser_fetch_http:
     lea rdx, [STR_STATUS_DNS_FAIL]
     call browser_set_page
     jmp .done
+.tls_fail:
+    ; status = "Error: TLS <reason>"
+    lea rdi, [browser_scratch]
+    lea rsi, [STR_STATUS_TLS_FAIL]
+    call fmt_str
+    mov rsi, [tls_error_msg]
+    call fmt_str
+    lea rsi, [PAGE_TLS_FAIL_HTML]
+    lea rdi, [STR_TITLE_TLS_FAIL]
+    lea rdx, [browser_scratch]
+    call browser_set_page
+    jmp .done
 .fail:
     mov byte [http_quiet], 0
     lea rsi, [PAGE_CONN_FAIL_HTML]
@@ -472,6 +531,135 @@ browser_fetch_http:
     pop rdx
     pop rcx
     pop rax
+    ret
+
+; ------------------------------------------------------------------------------
+; browser_redirect_target: if http_resp_buf is a 3xx response with a Location
+; header, put the absolute target URL in browser_url_buf. A target starting
+; with '/' is relative to the request (url_https, url_host, url_port).
+; Output: CF=1 if there is nothing to follow (or the URL would not fit)
+; ------------------------------------------------------------------------------
+browser_redirect_target:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+
+    lea rsi, [http_resp_buf]
+    cmp dword [rsi], 'HTTP'
+    jne .no
+    cmp byte [rsi + 9], '3'         ; "HTTP/1.x 3xx"
+    jne .no
+.line:
+    ; to the start of the next header line
+    mov al, [rsi]
+    test al, al
+    jz .no
+    inc rsi
+    cmp al, 0x0A
+    jne .line
+    cmp byte [rsi], 0x0D            ; blank line: end of the headers
+    je .no
+    cmp byte [rsi], 0x0A
+    je .no
+    ; "location:" in any case
+    lea rdi, [STR_HDR_LOCATION]
+    xor ecx, ecx
+.name:
+    mov al, [rdi + rcx]
+    test al, al
+    jz .found
+    mov dl, [rsi + rcx]
+    cmp dl, 'A'
+    jb .cmp_char
+    cmp dl, 'Z'
+    ja .cmp_char
+    add dl, 32
+.cmp_char:
+    cmp dl, al
+    jne .line
+    inc ecx
+    jmp .name
+.found:
+    add rsi, rcx
+.skip_space:
+    cmp byte [rsi], ' '
+    jne .value
+    inc rsi
+    jmp .skip_space
+.value:
+    ; the value, up to the end of the line, into browser_redirect_buf + 256
+    lea rdi, [browser_redirect_buf + 256]
+    xor ecx, ecx
+.value_char:
+    mov al, [rsi + rcx]
+    cmp al, ' '
+    jbe .value_end                  ; CR, LF, NUL or space
+    cmp ecx, 126
+    jae .no                         ; too long for us
+    mov [rdi + rcx], al
+    inc ecx
+    jmp .value_char
+.value_end:
+    mov byte [rdi + rcx], 0
+    mov rsi, rdi
+    lea rdi, [url_http_prefix]
+    call str_has_prefix
+    je .absolute
+    lea rdi, [url_https_prefix]
+    call str_has_prefix
+    je .absolute
+    cmp byte [rsi], '/'
+    jne .no
+    cmp byte [rsi + 1], '/'         ; "//host/path" is not supported
+    je .no
+    ; scheme://host[:port]path
+    lea rdi, [browser_redirect_buf]
+    push rsi
+    lea rsi, [url_http_prefix]
+    mov edx, 80
+    cmp byte [url_https], 0
+    je .scheme
+    lea rsi, [url_https_prefix]
+    mov edx, 443
+.scheme:
+    call fmt_str
+    lea rsi, [url_host]
+    call fmt_str
+    movzx eax, word [url_port]
+    cmp eax, edx
+    je .default_port
+    push rax
+    mov al, ':'
+    call fmt_char
+    pop rax
+    call fmt_dec
+.default_port:
+    pop rsi
+    call fmt_str
+    lea rsi, [browser_redirect_buf]
+.absolute:
+    call strlen
+    cmp eax, BROWSER_URL_MAX - 1
+    jae .no
+    lea rdi, [browser_url_buf]
+    mov ecx, BROWSER_URL_MAX
+    call strlcpy
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    clc
+    ret
+.no:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    stc
     ret
 
 ; ------------------------------------------------------------------------------
@@ -696,6 +884,11 @@ browser_draw_window:
     add edx, 37
     lea rsi, [STR_URL_ICON]
     mov eax, THEME_GREEN
+    cmp byte [browser_page_tls], 0
+    je .url_icon
+    lea rsi, [STR_URL_ICON_TLS]     ; encrypted, but the server is not verified
+    mov eax, THEME_YELLOW
+.url_icon:
     mov ebx, -1
     call gfx_print_string
 
@@ -905,6 +1098,10 @@ browser_draw_window:
     sub edx, 16
     lea rsi, [browser_status_text]
     mov eax, THEME_GREEN
+    cmp byte [browser_page_tls], 0
+    je .status_color
+    mov eax, THEME_YELLOW
+.status_color:
     mov ebx, -1
     call gfx_print_string
 
@@ -917,6 +1114,11 @@ browser_draw_window:
     sub edx, 16
     lea rsi, [STR_STATUS_BADGE]
     mov eax, THEME_TEXT_MUTED
+    cmp byte [browser_page_tls], 0
+    je .badge
+    lea rsi, [STR_BADGE_UNVERIFIED]
+    mov eax, THEME_RED
+.badge:
     mov ebx, -1
     call gfx_print_string
 
@@ -1989,6 +2191,23 @@ PAGE_CONN_FAIL_HTML:
     db "<p><a href='http://antigravity.os/'>Return to Home Portal</a></p>", 0x0A
     db "</body></html>", 0
 
+PAGE_TLS_FAIL_HTML:
+    db "<html><head><title>Secure Connection Failed</title></head>", 0x0A
+    db "<body>", 0x0A
+    db "<h1>Secure Connection Failed</h1>", 0x0A
+    db "<p>The TLS 1.3 handshake did not complete. The reason is in the status bar.</p>", 0x0A
+    db "<p>CyberSurf speaks TLS 1.3 with ChaCha20-Poly1305 and X25519 only.</p>", 0x0A
+    db "<hr>", 0x0A
+    db "<p><a href='http://antigravity.os/'>Return to Home Portal</a></p>", 0x0A
+    db "</body></html>", 0
+
+STR_TITLE_TLS_FAIL:     db "CyberSurf - Secure Connection Failed", 0
+STR_STATUS_TLS_FAIL:    db "Error: TLS ", 0
+STR_STATUS_UNVERIFIED:  db "CERT NOT VERIFIED | ", 0
+STR_BADGE_UNVERIFIED:   db "UNVERIFIED TLS", 0
+STR_URL_ICON_TLS:       db "TLS", 0
+STR_HDR_LOCATION:       db "location:", 0
+klog_browser_redirect:  db "browser: redirect -> ", 0
 STR_TITLE_PREFIX:       db "CyberSurf - ", 0
 STR_STATUS_SEP:         db " | ", 0
 STR_STATUS_RESOLVING:   db "Resolving host name...", 0

@@ -148,6 +148,10 @@ kernel_report_boot:
 ; ------------------------------------------------------------------------------
 %include "lib/string.asm"
 %include "lib/format.asm"
+%include "crypto/sha256.asm"
+%include "crypto/chacha20poly1305.asm"
+%include "crypto/x25519.asm"
+%include "crypto/random.asm"
 %include "core/gdt.asm"
 %include "core/idt.asm"
 %include "core/panic.asm"
@@ -168,6 +172,7 @@ kernel_report_boot:
 %include "net/udp.asm"
 %include "net/tcp.asm"
 %include "net/url.asm"
+%include "net/tls.asm"
 %include "gfx/gfx.asm"
 %include "gui/wm.asm"
 %include "gui/desktop.asm"
