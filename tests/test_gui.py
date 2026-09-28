@@ -5,11 +5,12 @@ title bar y 52-79 with close/minimize/maximize dots at x 77/92/107, y 66;
 client area starts at (62, 80). Taskbar pills are laid out in gui/desktop.asm.
 """
 
+import os
 import time
 import unittest
 
 from tests.harness import PROMPT, OSTestCase
-from tests.test_net import HostWebServer
+from tests.test_net import BIG_HTML, HostWebServer
 
 # Theme colours (kernel/gui/theme.inc)
 ACCENT = 0x0284C7
@@ -149,8 +150,32 @@ class DesktopTest(OSTestCase):
             self.vm.expect("gui: started")
             self.vm.expect("browser: CyberSurf - 10.0.2.2", timeout=20)
             self.vm.expect("browser status: HTTP/1.0 200 OK | 10.0.2.2")
+            self.vm.expect("browser text: Hello from the host served by tests/test_net.py")
         time.sleep(0.5)
         self.vm.screenshot("host_page")
+
+    def test_browser_renders_page_with_long_head(self):
+        """Regression: a <head> longer than the response buffer (www.google.com) left the page blank."""
+        self.assertGreater(len(BIG_HTML), 32768)
+        with HostWebServer() as web:
+            self.vm.send(f"browser http://10.0.2.2:{web.port}/big.html\r")
+            self.vm.expect("browser status: HTTP/1.0 200 OK | 10.0.2.2", timeout=20)
+            line = self.vm.expect(r"browser text: [^\r\n]*\r?\n", regex=True)
+        self.assertIn("browser text: Big page body Fish & chips <3", line)
+
+    def test_browser_renders_page_without_head_end(self):
+        with HostWebServer() as web:
+            self.vm.send(f"browser http://10.0.2.2:{web.port}/nohead.html\r")
+            self.vm.expect("browser status: HTTP/1.0 200 OK | 10.0.2.2", timeout=20)
+            self.vm.expect("browser text: Still visible")
+
+    @unittest.skipUnless(os.environ.get("AGOS_TEST_INTERNET"), "set AGOS_TEST_INTERNET=1")
+    def test_browser_google(self):
+        self.vm.send("browser http://www.google.com/\r")
+        self.vm.expect("browser status: HTTP/1.0 200 OK | www.google.com", timeout=30)
+        line = self.vm.expect(r"browser text: [^\r\n]*\r?\n", regex=True)
+        self.assertRegex(line, r"browser text: \S", "something visible was drawn")
+        self.assertNotIn("function", line, "script source must not be drawn")
 
 
 if __name__ == "__main__":

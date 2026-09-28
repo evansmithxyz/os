@@ -25,7 +25,7 @@ TCP_STATE_CLOSE_WAIT    equ 7
 TCP_STATE_LAST_ACK      equ 8
 TCP_STATE_TIME_WAIT     equ 9
 
-HTTP_RESP_MAX           equ 16384   ; bytes of HTTP response kept for the browser
+HTTP_RESP_MAX           equ 131072  ; bytes of HTTP response kept for the browser
 TCP_RX_BUF_SIZE         equ 4096
 
 section .data
@@ -425,6 +425,11 @@ tcp_handle_packet:
     test edx, edx
     jz .check_fin
 
+    ; Only in-order data is kept. A retransmission or a segment after a lost
+    ; one is dropped and answered with our current ACK so the sender resends.
+    cmp r9d, [tcp_my_ack]
+    jne .out_of_order
+
     ; Copy incoming payload to tcp_rx_buf
     lea rdi, [tcp_rx_buf]
     push rsi
@@ -466,6 +471,12 @@ tcp_handle_packet:
 
     inc dword [tcp_my_seq]
     mov byte [tcp_active_state], TCP_STATE_LAST_ACK
+    jmp .drop
+
+.out_of_order:
+    mov al, TCP_FLAG_ACK
+    xor rcx, rcx
+    call tcp_send_segment
     jmp .drop
 
 .state_fin_wait:

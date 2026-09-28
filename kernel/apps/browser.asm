@@ -14,9 +14,10 @@
 [bits 64]
 
 BROWSER_URL_MAX         equ 96
-BROWSER_PAGE_BUF_MAX    equ 16384
+BROWSER_PAGE_BUF_MAX    equ 131072
 BROWSER_MAX_LINKS       equ 16
 BROWSER_LINK_SIZE       equ 80      ; x1, y1, x2, y2 (dd) + 64-byte target URL
+BROWSER_LOG_MAX         equ 80      ; visible text reported by "[klog] browser text:"
 
 ; Colors for Browser UI
 BROWSER_CLR_TOOLBAR     equ 0x00131D2E   ; Deep Navy Toolbar
@@ -33,7 +34,10 @@ browser_pending_nav:    db 0        ; navigate to browser_url_buf when opened
 browser_url_focused:    db 0        ; 1 = URL bar has keyboard focus
 browser_in_link:        db 0
 browser_href_set:       db 0        ; current <a> tag had an href
+browser_log_text:       db 0        ; 1 = next render logs the page's first text
 align 4
+browser_log_len:        dd 0
+browser_log_y:          dd 0        ; y of the last logged glyph
 browser_url_len:        dd 0
 browser_link_count:     dd 0
 browser_page_len:       dd 0
@@ -61,6 +65,7 @@ browser_page_title:     resb 64
 browser_status_text:    resb 96
 browser_temp_href:      resb 64
 browser_scratch:        resb 160
+browser_log_buf:        resb BROWSER_LOG_MAX + 2
 browser_links:          resb BROWSER_MAX_LINKS * BROWSER_LINK_SIZE
 browser_page_buf:       resb BROWSER_PAGE_BUF_MAX + 1
 
@@ -323,6 +328,9 @@ browser_navigate:
     call browser_set_page
 .done:
     mov byte [gui_dirty], 1
+    mov byte [browser_log_text], 1  ; the next render reports the visible text
+    mov dword [browser_log_len], 0
+    mov byte [browser_log_buf], 0
     lea rsi, [klog_browser]         ; "[klog] browser: <title>" for tests
     lea rdi, [browser_page_title]
     call klog2
@@ -990,12 +998,16 @@ browser_render_html_page:
     cmp al, 0x0D
     je .parse_loop
 
+    cmp al, '&'
+    je .entity
+
     ; Regular Printable ASCII Character (32 .. 126)
     cmp al, 32
     jb .parse_loop
     cmp al, 126
     ja .parse_loop
 
+.printable:
     ; Line wrap check: cur_x + 8 > right_margin
     mov ecx, [browser_cur_x]
     add ecx, 8
@@ -1022,6 +1034,7 @@ browser_render_html_page:
     jge .render_complete
 
     ; Render single glyph (AL already holds ASCII character)
+    call browser_log_char
     mov ecx, [browser_cur_x]      ; ECX = X
     mov edx, [browser_cur_y]      ; EDX = Y
     mov esi, [browser_text_color] ; ESI = FG Color
@@ -1031,6 +1044,33 @@ browser_render_html_page:
     add dword [browser_cur_x], 8
     jmp .parse_loop
 
+.entity:
+    ; "&name;" from browser_entities becomes its character; anything else
+    ; is drawn as a plain '&'
+    lea rsi, [browser_entities]
+.ent_next:
+    movzx ecx, byte [rsi]           ; length of the name, including ';'
+    test ecx, ecx
+    jz .ent_unknown
+    inc rsi
+    xor edx, edx
+.ent_cmp:
+    mov bl, [r12 + rdx]
+    cmp bl, [rsi + rdx]
+    jne .ent_skip
+    inc edx
+    cmp edx, ecx
+    jb .ent_cmp
+    mov al, [rsi + rcx]             ; the character it stands for
+    add r12, rcx
+    jmp .printable
+.ent_skip:
+    lea rsi, [rsi + rcx + 1]
+    jmp .ent_next
+.ent_unknown:
+    mov al, '&'
+    jmp .printable
+
 .handle_newline:
     mov ecx, [browser_vp_x]
     add ecx, 20
@@ -1039,6 +1079,24 @@ browser_render_html_page:
     jmp .parse_loop
 
 .handle_tag:
+    ; <!-- comment --> is skipped whole (it may contain '>' and text)
+    cmp byte [r12], '!'
+    jne .tag_name
+    cmp word [r12 + 1], '--'
+    jne .tag_name
+.skip_comment:
+    mov al, [r12]
+    test al, al
+    jz .render_complete
+    inc r12
+    cmp al, '-'
+    jne .skip_comment
+    cmp word [r12], '->'
+    jne .skip_comment
+    add r12, 2
+    jmp .parse_loop
+
+.tag_name:
     ; Read tag name until space or '>' (cleared first: "a < b" must not
     ; re-run the previous tag)
     mov byte [browser_href_set], 0
@@ -1142,15 +1200,51 @@ browser_render_html_page:
 
 .eval_tag:
     ; Check tag in browser_temp_href
-    ; 0. Skip <head>...</head>
-    cmp dword [browser_temp_href], 0x64616568 ; "head" (exactly: not "header")
-    jne .chk_h1
-    cmp byte [browser_temp_href + 4], 0
-    jne .chk_h1
-.skip_head:
+    ; 0. <script>, <style> and <title> hold no visible text: skip to the end tag
+    lea rsi, [browser_temp_href]
+    lea rdi, [STR_TAG_SCRIPT]
+    call strcmp
+    je .skip_raw
+    lea rdi, [STR_TAG_STYLE]
+    call strcmp
+    je .skip_raw
+    lea rdi, [STR_TAG_TITLE]
+    call strcmp
+    jne .chk_head
+.skip_raw:
+    ; RDI = tag name: find "</name" in any case, then its '>'
     mov al, [r12]
     test al, al
     jz .render_complete
+    inc r12
+    cmp al, '<'
+    jne .skip_raw
+    cmp byte [r12], '/'
+    jne .skip_raw
+    xor ecx, ecx
+.raw_cmp:
+    mov al, [rdi + rcx]
+    test al, al
+    jz .drain_end_tag
+    mov dl, [r12 + rcx + 1]
+    or dl, 0x20                     ; lower case
+    cmp dl, al
+    jne .skip_raw
+    inc ecx
+    jmp .raw_cmp
+
+.chk_head:
+    ; Skip <head>...</head>. When "</head>" is not in the buffer, parse the
+    ; head normally instead of rendering nothing.
+    cmp dword [browser_temp_href], 0x64616568 ; "head" (exactly: not "header")
+    jne .chk_div
+    cmp byte [browser_temp_href + 4], 0
+    jne .chk_div
+    mov r13, r12                    ; just after <head>
+.skip_head:
+    mov al, [r12]
+    test al, al
+    jz .no_head_end
     inc r12
     cmp al, '<'
     jne .skip_head
@@ -1160,13 +1254,34 @@ browser_render_html_page:
     jne .skip_head
     cmp byte [r12 + 5], '>'
     jne .skip_head
-.drain_head:
+.drain_end_tag:
     mov al, [r12]
     test al, al
     jz .render_complete
     inc r12
     cmp al, '>'
-    jne .drain_head
+    jne .drain_end_tag
+    jmp .parse_loop
+.no_head_end:
+    mov r12, r13
+    jmp .parse_loop
+
+.chk_div:
+    ; <div> and </div> start a new line unless already at the start of one
+    lea rsi, [browser_temp_href]
+    lea rdi, [STR_TAG_DIV]
+    call strcmp
+    je .block_break
+    lea rdi, [STR_TAG_DIV_END]
+    call strcmp
+    jne .chk_h1
+.block_break:
+    mov eax, [browser_vp_x]
+    add eax, 20
+    cmp [browser_cur_x], eax
+    jle .parse_loop
+    mov [browser_cur_x], eax
+    add dword [browser_cur_y], 14
     jmp .parse_loop
 
 .chk_h1:
@@ -1296,7 +1411,9 @@ browser_render_html_page:
     jmp .parse_loop
 
 .chk_li:
-    cmp word [browser_temp_href], 0x696C ; "li"
+    cmp word [browser_temp_href], 0x696C ; "li" (exactly: not "link")
+    jne .chk_li_end
+    cmp byte [browser_temp_href + 2], 0
     jne .chk_li_end
     mov eax, [browser_vp_x]
     add eax, 28
@@ -1315,7 +1432,7 @@ browser_render_html_page:
     jmp .parse_loop
 
 .chk_li_end:
-    cmp word [browser_temp_href], 0x6C2F ; "/l" (matches "/li")
+    cmp dword [browser_temp_href], 0x00696C2F ; "/li" (exactly: not "/label")
     jne .chk_b
     mov eax, [browser_vp_x]
     add eax, 20
@@ -1422,6 +1539,13 @@ browser_render_html_page:
     jmp .parse_loop
 
 .render_complete:
+    cmp byte [browser_log_text], 0
+    je .restore
+    mov byte [browser_log_text], 0
+    lea rsi, [klog_browser_text]    ; "[klog] browser text: <first visible text>"
+    lea rdi, [browser_log_buf]
+    call klog2
+.restore:
     pop r13
     pop r12
     pop r11
@@ -1434,6 +1558,55 @@ browser_render_html_page:
     pop rcx
     pop rbx
     pop rax
+    ret
+
+; ------------------------------------------------------------------------------
+; browser_log_char: AL = glyph about to be drawn at browser_cur_y. While
+; browser_log_text is set, collects the page's first visible text for the
+; "[klog] browser text:" line: runs of spaces and line changes become one space.
+; ------------------------------------------------------------------------------
+browser_log_char:
+    cmp byte [browser_log_text], 0
+    je .ret
+    push rcx
+    push rdx
+    push rdi
+    lea rdi, [browser_log_buf]
+    mov ecx, [browser_log_len]
+    cmp ecx, BROWSER_LOG_MAX
+    jae .done
+    test ecx, ecx
+    jz .check_space
+    cmp byte [rdi + rcx - 1], ' '
+    je .check_space
+    mov edx, [browser_cur_y]
+    cmp edx, [browser_log_y]
+    je .check_space
+    mov byte [rdi + rcx], ' '       ; new line
+    inc ecx
+    cmp al, ' '
+    je .terminate                   ; that space stands in for this one
+    jmp .store
+.check_space:
+    cmp al, ' '                     ; no leading or repeated spaces
+    jne .store
+    test ecx, ecx
+    jz .done
+    cmp byte [rdi + rcx - 1], ' '
+    je .done
+.store:
+    mov [rdi + rcx], al
+    inc ecx
+.terminate:
+    mov byte [rdi + rcx], 0
+    mov [browser_log_len], ecx
+    mov edx, [browser_cur_y]
+    mov [browser_log_y], edx
+.done:
+    pop rdi
+    pop rdx
+    pop rcx
+.ret:
     ret
 
 ; ------------------------------------------------------------------------------
@@ -1692,6 +1865,24 @@ section .rodata
 browser_label:          db "Browser", 0
 klog_browser:           db "browser: ", 0
 klog_browser_status:    db "browser status: ", 0
+klog_browser_text:      db "browser text: ", 0
+STR_TAG_SCRIPT:         db "script", 0
+STR_TAG_STYLE:          db "style", 0
+STR_TAG_TITLE:          db "title", 0
+STR_TAG_DIV:            db "div", 0
+STR_TAG_DIV_END:        db "/div", 0
+
+; HTML entities the renderer decodes: length of the name (with ';'), the
+; name, the character it stands for. A zero length ends the table.
+browser_entities:
+    db 4, "amp;", '&'
+    db 3, "lt;", '<'
+    db 3, "gt;", '>'
+    db 5, "quot;", '"'
+    db 5, "apos;", "'"
+    db 4, "#39;", "'"
+    db 5, "nbsp;", ' '
+    db 0
 STR_URL_HOME:           db "http://antigravity.os/", 0
 STR_URL_HOME_LEN        equ ($ - STR_URL_HOME - 1)
 STR_URL_HOME_NOSLASH:   db "http://antigravity.os", 0

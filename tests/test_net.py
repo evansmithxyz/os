@@ -18,6 +18,20 @@ from tests.harness import OUTPUT, PROMPT, OSTestCase
 
 HELLO_HTML = "<html><body><h1>Hello from the host</h1><p>served by tests/test_net.py</p></body></html>"
 
+# Shaped like www.google.com: a <head> much longer than the old 16 KB response
+# buffer, scripts and styles whose text must not be drawn, entities and divs.
+BIG_HTML = (
+    "<!doctype html><html><head><title>Big page</title>"
+    "<link rel='stylesheet' href='big.css'>"
+    "<script>" + "var hidden = 'SCRIPT TEXT MUST NOT SHOW';\n" * 1000 + "</script>"
+    "<style>body { color: red }</style></head>"
+    "<body><!-- comment > with text --><script>document.write('also hidden')</script>"
+    "<div>Big page body</div><p>Fish &amp; chips &lt;3</p></body></html>"
+)
+
+# No "</head>" at all: the page must still render instead of coming up blank
+NO_HEAD_END_HTML = "<html><head><title>Broken</title><body><p>Still visible</p></body></html>"
+
 
 class HostWebServer:
     """http.server on 127.0.0.1 (reachable from the guest as 10.0.2.2:<port>)."""
@@ -26,6 +40,8 @@ class HostWebServer:
         self.root = OUTPUT / "www"
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / "hello.html").write_text(HELLO_HTML)
+        (self.root / "big.html").write_text(BIG_HTML)
+        (self.root / "nohead.html").write_text(NO_HEAD_END_HTML)
         handler = partial(_QuietHandler, directory=str(self.root))
         self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.port = self.httpd.server_address[1]
