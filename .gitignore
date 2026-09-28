@@ -1,0 +1,10 @@
+# Build output (python tools/build.py)
+build/
+# Test artifacts: serial logs, screenshots, disk copies
+tests/output/
+__pycache__/
+*.pyc
+# Old layout artifacts
+bin/
+*.ppm
+*.lst

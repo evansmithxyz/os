@@ -1,0 +1,2 @@
+Welcome to Antigravity OS [64-bit Long Mode]!
+Persistent storage powered by AntigravityFS (AFS) and ATA PIO.

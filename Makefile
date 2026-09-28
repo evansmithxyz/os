@@ -1,38 +1,30 @@
-# ==============================================================================
-# Antigravity OS - Makefile
-# ==============================================================================
+# Antigravity OS - convenience targets. Everything is done by tools/build.py,
+# which also works directly on Windows: python tools/build.py [run|test|...]
 
-NASM      ?= nasm
-QEMU      ?= qemu-system-x86_64
-BIN_DIR   := bin
-BOOT_DIR  := boot
-KERNEL_DIR:= kernel
+PYTHON ?= python3
 
-BOOT_SRC  := $(BOOT_DIR)/bootloader.asm $(BOOT_DIR)/disk.asm $(BOOT_DIR)/gdt.asm $(BOOT_DIR)/a20.asm
-KERNEL_SRC:= $(KERNEL_DIR)/kernel.asm $(KERNEL_DIR)/vga.asm $(KERNEL_DIR)/idt.asm $(KERNEL_DIR)/isr.asm $(KERNEL_DIR)/keyboard.asm $(KERNEL_DIR)/shell.asm
+.PHONY: all fresh run headless test debug size clean
 
-BOOT_BIN  := $(BIN_DIR)/bootloader.bin
-KERNEL_BIN:= $(BIN_DIR)/kernel.bin
-OS_IMAGE  := $(BIN_DIR)/os-image.bin
+all:            ## build build/os.img (keeps files on the disk)
+	$(PYTHON) tools/build.py
 
-.PHONY: all run clean
+fresh:          ## rebuild and reformat the disk from rootfs/
+	$(PYTHON) tools/build.py --fresh
 
-all: $(OS_IMAGE)
+run:            ## boot in QEMU with a window (serial console in this terminal)
+	$(PYTHON) tools/build.py run
 
-$(BIN_DIR):
-	mkdir -p $(BIN_DIR)
+headless:       ## boot without a window; the serial console is the terminal
+	$(PYTHON) tools/build.py run --headless
 
-$(BOOT_BIN): $(BOOT_SRC) | $(BIN_DIR)
-	$(NASM) -f bin -i $(BOOT_DIR)/ $(BOOT_DIR)/bootloader.asm -o $@
+test:           ## run the automated QEMU test suite
+	$(PYTHON) tools/build.py test
 
-$(KERNEL_BIN): $(KERNEL_SRC) | $(BIN_DIR)
-	$(NASM) -f bin -i $(KERNEL_DIR)/ $(KERNEL_DIR)/kernel.asm -o $@
+debug:          ## boot paused, wait for gdb on localhost:1234
+	$(PYTHON) tools/build.py debug
 
-$(OS_IMAGE): $(BOOT_BIN) $(KERNEL_BIN)
-	cat $(BOOT_BIN) $(KERNEL_BIN) > $@
-
-run: $(OS_IMAGE)
-	$(QEMU) -drive format=raw,file=$(OS_IMAGE)
+size:           ## kernel image / .bss usage
+	$(PYTHON) tools/build.py size
 
 clean:
-	rm -rf $(BIN_DIR)
+	$(PYTHON) tools/build.py clean

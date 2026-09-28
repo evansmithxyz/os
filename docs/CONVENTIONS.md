@@ -1,0 +1,89 @@
+# Code conventions
+
+These are the rules the kernel follows. Keep them when adding code; the test
+suite and the reviewers (human or not) assume them.
+
+## Registers
+
+- **Normal routines preserve every general-purpose register** except the ones
+  documented as outputs (usually `RAX`). Save what you touch with `push`/`pop`.
+  Flags are *not* preserved.
+- **Status comes back in `CF`** when a routine can fail or "has/has not"
+  something: `key_get`, `serial_getc`, `url_parse`, `net_resolve_host`,
+  `bga_enable` and others. Set it with `stc`/`clc` as the last flag-changing
+  instruction; `pop` is fine after it, `add`/`cmp`/`test` are not.
+  Older routines that return 0/1 in `RAX` say so in their header.
+- **Two exceptions may clobber anything but `RSP`**, because their callers
+  save everything:
+  - shell command handlers and the `cmd_*` helpers in `kernel/apps/shell/cmd_*.asm`
+    (called from `shell_execute`)
+  - window callbacks: `WIN_DRAW`, `WIN_KEY`, `WIN_MOUSE`, `WIN_OPEN`,
+    `WIN_TICK` (called through the `wm_call_*` trampolines in `gui/wm.asm`)
+- Every routine starts with a comment block saying what it does, its inputs
+  and its outputs.
+
+## Sections and memory
+
+`kernel/kernel.asm` defines four sections; every file switches between them:
+
+| Section   | Use for                                   | In the image? |
+|-----------|-------------------------------------------|---------------|
+| `.text`   | code                                      | yes           |
+| `.rodata` | strings, tables, fonts                    | yes           |
+| `.cmdtab` | the shell command table only              | yes           |
+| `.data`   | variables with a non-zero initial value   | yes           |
+| `.bss`    | anything that starts as zero (`resb`)     | **no**, zeroed at boot |
+
+- **Never write `times N db 0` for a buffer**: put it in `.bss` with
+  `resb N`. That is what freed the kernel slot in the first place.
+- Fixed physical addresses (DMA rings, GUI buffers, stack, page tables) are
+  defined only in `include/memmap.inc`. Disk sector numbers only in
+  `include/layout.inc`. Nothing else hardcodes an address or an LBA.
+- `default rel` is on. Absolute addresses in memory operands need `abs`,
+  e.g. `[abs BOOTINFO_ADDR + BI_E820_COUNT]`.
+- Everything below 4 GB is identity mapped, so physical = virtual.
+
+## Output and input
+
+- Print with the console layer (`con_puts`, `con_puts_color`, `con_dec`,
+  `con_hex64`, `con_ip`, ...), never directly to VGA memory. The console
+  mirrors to the serial port and routes to the GUI terminal while the
+  desktop runs, so the same command works in both places.
+- Colours in console output are VGA attributes (`COLOR_*`); GUI colours are
+  `THEME_*` in `kernel/gui/theme.inc`.
+- `klog`, `klog2`, `klog_dec` write debug lines to the serial port only
+  (`[klog] ...`). Tests wait for them, so log anything a test might check.
+- Input arrives as key events (`AL` = ASCII or 0, `AH` = scancode) from
+  `key_get`. Interrupt handlers only decode and queue; they never print.
+- Long-running work must call `net_wait_step` or `con_idle` inside its loop
+  so the desktop keeps redrawing, and `con_check_cancel` if the user should be
+  able to stop it.
+- Timeouts use `TICKS(ms)` (the PIT runs at 1000 Hz).
+
+## Naming
+
+Routines are prefixed with their module: `con_`, `key_`, `serial_`, `vga_`,
+`kbd_`, `mouse_`, `ata_`, `pci_`, `net_`/`rtl_`, `bga_`, `fs_`, `eth_`/`arp_`,
+`ipv4_`/`icmp_`, `udp_`/`dns_`, `tcp_`/`http_`, `url_`, `gfx_`, `wm_`, `gui_`,
+`desktop_`, `term_`, `canvas_`, `sysmon_`, `browser_`, `shell_`, `cmd_`,
+`fmt_`, and plain names (`strlen`, `memcpy`) for `lib/string.asm`. Local
+labels use NASM's `.name` form.
+
+## Adding things
+
+- **A shell command:** write a handler in the right `kernel/apps/shell/cmd_*.asm`
+  and add one `COMMAND` line to `kernel/apps/shell/commands.asm`. Help and Tab
+  completion pick it up automatically.
+- **A window/app:** add a `WINDOW` line to `wm_windows` in `kernel/gui/wm.asm`
+  and a `WIN_*` id, write the callbacks in `kernel/apps/`, add an app pill in
+  `kernel/gui/desktop.asm` if it should have one.
+- **A file on the default disk:** drop it in `rootfs/` and build with `--fresh`.
+- **More kernel space:** raise `KERNEL_MAX_SECTORS` in `include/layout.inc`
+  and move the `FS_*` numbers up by the same amount (the kernel is loaded
+  below 640 KB, so the hard limit is about 512 KB).
+
+## Tests
+
+Every user-visible feature gets a test in `tests/` (see `tests/harness.py`).
+Prefer asserting on serial output or `[klog]` lines; use screenshots and
+pixel checks only for things that can't be seen any other way.

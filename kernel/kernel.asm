@@ -1,154 +1,212 @@
 ; ==============================================================================
-; Antigravity OS - 64-Bit Long Mode Kernel Entry & Main Event Loop
-; Loaded at physical address 0x0000000000008000 by the 64-bit Bootloader
+; Antigravity OS - 64-bit Kernel
+; ------------------------------------------------------------------------------
+; Entered from boot/stage2.asm in 64-bit long mode at KERNEL_ADDR with:
+;   RSP = KERNEL_STACK_TOP, RDI = BOOTINFO_ADDR, interrupts disabled,
+;   0 - 4 GB identity mapped with 2 MB pages.
+;
+; The kernel is assembled as one flat binary (nasm -f bin) from this file; every
+; other source file is %included below. Sections:
+;   .text    code                         (in the image, at KERNEL_ADDR)
+;   .rodata  strings, tables, fonts       (in the image, after .text)
+;   .cmdtab  shell command table          (in the image, after .rodata)
+;   .data    initialised mutable state    (in the image, after .rodata)
+;   .bss     zero-initialised buffers     (NOT in the image, at KERNEL_BSS_ADDR,
+;                                          zeroed by kernel_entry)
+; Put every buffer that starts out as zeros in .bss with `resb` so it does not
+; take up space in the kernel image. See docs/CONVENTIONS.md.
 ; ==============================================================================
 
-[org 0x8000]
+%include "layout.inc"
+%include "memmap.inc"
+
+[map symbols build/kernel.map]
+
+[org KERNEL_ADDR]
 [bits 64]
 default rel
 
-kernel_entry:
-    ; Initialize screen display
-    mov byte [current_attr], 0x0F   ; White on black
-    call vga_clear_screen
+section .text
+section .rodata follows=.text align=16
+section .cmdtab follows=.rodata align=16        ; shell command table (apps/shell/commands.asm)
+section .data   follows=.cmdtab align=16
+section .bss    nobits start=KERNEL_BSS_ADDR align=16
 
-    ; Print OS Welcome Banner
+section .bss
+bss_start:
+
+section .text
+
+; ------------------------------------------------------------------------------
+; kernel_entry: first instruction of the kernel image
+; ------------------------------------------------------------------------------
+kernel_entry:
+    cld
+    ; Zero .bss (it is not part of the image, so it holds garbage until now)
+    mov rdi, bss_start
+    mov rcx, bss_end
+    sub rcx, rdi
+    xor eax, eax
+    rep stosb
+
+    call gdt_init
+    call serial_init
+    call vga_init
+    mov byte [con_attr], COLOR_WHITE
+    call con_clear
     call kernel_print_banner
 
-    ; Initialize 64-bit Interrupt Descriptor Table & Remap 8259 PIC
-    mov bl, COLOR_LIGHT_BLUE
-    mov rsi, MSG_INIT_IDT
-    call vga_print_string_color
-
-    call idt64_init
-
-    mov bl, COLOR_LIGHT_GREEN
-    mov rsi, MSG_IDT_OK
-    call vga_print_string_color
-
-    ; Enable Hardware Interrupts (IRQ 0 Timer and IRQ 1 Keyboard)
+    call memory_init                ; parse the E820 map from stage 2
+    call idt_init                   ; exceptions + remapped PIC IRQs
+    call timer_init                 ; PIT at TIMER_HZ
     sti
+    call kernel_report_boot
 
-    ; Mount or format AntigravityFS (AFS) Storage Subsystem
     call fs_init
-
-    ; Initialize PCI Bus and Realtek RTL8139 Network Subsystem
     call net_init
     call arp_init
-
-    ; Initialize Bochs Graphics Adaptor (BGA) Subsystem
     call bga_init
 
     mov bl, COLOR_LIGHT_CYAN
-    lea rsi, [MSG_READY]
-    call vga_print_string_color
+    lea rsi, [msg_ready]
+    call con_puts_color
 
-    ; Display Initial 64-bit Shell Prompt
-    call shell_print_prompt
+    call shell_init
 
 ; ------------------------------------------------------------------------------
-; Main Kernel Event Loop: Low-power park via 'hlt' until hardware interrupt
+; kernel_loop: text-console main loop. Sleeps until the next interrupt (timer,
+; keyboard) and then services the network and any pending key presses.
 ; ------------------------------------------------------------------------------
 kernel_loop:
-    ; Poll network interface for background packets (ARP, ICMP ping replies, etc.)
     call net_poll
-
+.drain_keys:
+    call key_get                    ; CF=0 when the queue is empty
+    jnc .idle
+    call shell_key
+    jmp .drain_keys
+.idle:
     hlt
-
-    ; Check if Tab auto-completion was requested
-    cmp byte [tab_requested], 1
-    jne .check_enter
-    mov byte [tab_requested], 0
-    call shell_tab_complete
-    jmp kernel_loop
-
-.check_enter:
-    ; Check if keyboard ISR reported a completed line (Enter was pressed)
-    cmp byte [line_ready], 1
-    jne kernel_loop
-
-    ; Execute command in buffer
-    call shell_execute_command
-
-    ; Reset buffer state for next command
-    call keyboard_clear_buffer
-
-    ; Render prompt again
-    call shell_print_prompt
-
     jmp kernel_loop
 
 ; ------------------------------------------------------------------------------
-; kernel_print_banner: Renders stylized 64-bit OS startup logo
+; kernel_print_banner: ASCII-art logo on the console
 ; ------------------------------------------------------------------------------
 kernel_print_banner:
+    push rbx
+    push rsi
+    mov bl, COLOR_LIGHT_CYAN
+    lea rsi, [banner_logo]
+    call con_puts_color
+    mov bl, COLOR_YELLOW
+    lea rsi, [banner_subtitle]
+    call con_puts_color
+    pop rsi
+    pop rbx
+    ret
+
+; ------------------------------------------------------------------------------
+; kernel_report_boot: one line each for memory, interrupts and kernel size
+; ------------------------------------------------------------------------------
+kernel_report_boot:
     push rax
     push rbx
     push rsi
+    mov bl, COLOR_LIGHT_GREEN
+    lea rsi, [msg_mem]
+    call con_puts_color
+    mov rax, [mem_total_bytes]
+    shr rax, 20
+    call con_dec
+    lea rsi, [msg_boot_mem_mb]
+    call con_puts_color
+    movzx eax, word [abs BOOTINFO_ADDR + BI_E820_COUNT]
+    call con_dec
+    lea rsi, [msg_mem_regions]
+    call con_puts_color
 
-    ; Print logo in Cyan
-    mov bl, COLOR_LIGHT_CYAN
-    mov rsi, BANNER_LINE1
-    call vga_print_string_color
-    mov rsi, BANNER_LINE2
-    call vga_print_string_color
-    mov rsi, BANNER_LINE3
-    call vga_print_string_color
-    mov rsi, BANNER_LINE4
-    call vga_print_string_color
-    mov rsi, BANNER_LINE5
-    call vga_print_string_color
-    mov rsi, BANNER_LINE6
-    call vga_print_string_color
+    lea rsi, [msg_kernel]
+    call con_puts_color
+    mov rax, kernel_image_end - KERNEL_ADDR
+    shr rax, 10
+    call con_dec
+    lea rsi, [msg_kernel_kb]
+    call con_puts_color
+    mov rax, (KERNEL_MAX_SECTORS * SECTOR_SIZE) >> 10
+    call con_dec
+    lea rsi, [msg_kernel_slot]
+    call con_puts_color
 
-    ; Print subtitle in Yellow
-    mov bl, COLOR_YELLOW
-    mov rsi, BANNER_SUBTITLE
-    call vga_print_string_color
-
+    lea rsi, [msg_irq]
+    call con_puts_color
     pop rsi
     pop rbx
     pop rax
     ret
 
 ; ------------------------------------------------------------------------------
-; Included 64-Bit Kernel Subsystems
+; Subsystems (order does not matter for correctness; grouped by layer)
 ; ------------------------------------------------------------------------------
-%include "vga.asm"
-%include "idt.asm"
-%include "isr.asm"
-%include "keyboard.asm"
-%include "ata.asm"
-%include "fs.asm"
-%include "pci.asm"
-%include "net.asm"
-%include "eth.asm"
-%include "ipv4.asm"
-%include "udp.asm"
-%include "tcp.asm"
-%include "bga.asm"
-%include "mouse.asm"
-%include "gfx.asm"
-%include "gui.asm"
-%include "browser.asm"
-%include "shell.asm"
+%include "lib/string.asm"
+%include "lib/format.asm"
+%include "core/gdt.asm"
+%include "core/idt.asm"
+%include "core/panic.asm"
+%include "core/timer.asm"
+%include "core/memory.asm"
+%include "drivers/serial.asm"
+%include "drivers/vga_text.asm"
+%include "drivers/keyboard.asm"
+%include "drivers/mouse.asm"
+%include "drivers/pci.asm"
+%include "drivers/ata.asm"
+%include "drivers/rtl8139.asm"
+%include "drivers/bga.asm"
+%include "console/console.asm"
+%include "fs/afs.asm"
+%include "net/eth.asm"
+%include "net/ipv4.asm"
+%include "net/udp.asm"
+%include "net/tcp.asm"
+%include "net/url.asm"
+%include "gfx/gfx.asm"
+%include "gui/wm.asm"
+%include "gui/desktop.asm"
+%include "apps/terminal.asm"
+%include "apps/sysmon.asm"
+%include "apps/canvas.asm"
+%include "apps/browser.asm"
+%include "apps/shell/shell.asm"
+%include "apps/shell/commands.asm"
 
 ; ------------------------------------------------------------------------------
-; Kernel Static Data Strings
+; Kernel strings
 ; ------------------------------------------------------------------------------
-BANNER_LINE1: db "    ___          __  _                         _ __          ____  _____ ", 0x0A, 0
-BANNER_LINE2: db "   /   |  ____  / /_(_)___ __________ __   __ (_) /___  __  / __ \/ ___/ ", 0x0A, 0
-BANNER_LINE3: db "  / /| | / __ \/ __/ / __ `/ ___/ __ `/ | / // / __/ / / / / / / /\__ \  ", 0x0A, 0
-BANNER_LINE4: db " / ___ |/ / / / /_/ / /_/ / /  / /_/ /| |/ // / /_/ /_/ / / /_/ /___/ /  ", 0x0A, 0
-BANNER_LINE5: db "/_/  |_/_/ /_/\__/_/\__, /_/   \__,_/ |___//_/\__/\__, /  \____//____/   ", 0x0A, 0
-BANNER_LINE6: db "                   /____/                        /____/                  ", 0x0A, 0
-BANNER_SUBTITLE: db "        ===[ 64-Bit Bare-Metal Long Mode Operating System ]===          ", 0x0A, 0x0A, 0
+section .rodata
+banner_logo:
+    db "    ___          __  _                         _ __          ____  _____ ", 0x0A
+    db "   /   |  ____  / /_(_)___ __________ __   __ (_) /___  __  / __ \/ ___/ ", 0x0A
+    db "  / /| | / __ \/ __/ / __ `/ ___/ __ `/ | / // / __/ / / / / / / /\__ \  ", 0x0A
+    db " / ___ |/ / / / /_/ / /_/ / /  / /_/ /| |/ // / /_/ /_/ / / /_/ /___/ /  ", 0x0A
+    db "/_/  |_/_/ /_/\__/_/\__, /_/   \__,_/ |___//_/\__/\__, /  \____//____/   ", 0x0A
+    db "                   /____/                        /____/                  ", 0x0A, 0
+banner_subtitle:
+    db "        ===[ 64-Bit Bare-Metal Long Mode Operating System ]===", 0x0A, 0x0A, 0
 
-MSG_INIT_IDT: db "[KERNEL] Initializing 64-bit IDT and remapping 8259 PIC...", 0x0A, 0
-MSG_IDT_OK:   db "[KERNEL] 64-bit Long Mode active. Hardware IRQs running (IRQ0, IRQ1).", 0x0A, 0
-MSG_READY:    db "[KERNEL] System ready. Type 'help' to see available commands.", 0x0A, 0x0A, 0
+msg_mem:         db "[BOOT] Memory: ", 0
+msg_boot_mem_mb: db " MB usable (", 0
+msg_mem_regions: db " E820 regions)", 0x0A, 0
+msg_kernel:      db "[BOOT] Kernel: ", 0
+msg_kernel_kb:   db " KB of ", 0
+msg_kernel_slot: db " KB slot", 0x0A, 0
+msg_irq:         db "[BOOT] IDT loaded, PIC remapped, PIT at 1000 Hz", 0x0A, 0
+msg_ready:       db "[KERNEL] System ready. Type 'help' to see available commands.", 0x0A, 0x0A, 0
 
 ; ------------------------------------------------------------------------------
-; Pad kernel to exactly 128 sectors (65,536 bytes) to match bootloader load size
+; End markers (must stay at the very end of this file)
 ; ------------------------------------------------------------------------------
-times (128 * 512) - ($ - $$) db 0
+section .data
+kernel_image_end:
+
+section .bss
+alignb 16
+bss_end:                            ; tools/build.py checks bss_end - bss_start <= KERNEL_BSS_MAX
