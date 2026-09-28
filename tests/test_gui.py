@@ -136,7 +136,7 @@ class DesktopTest(OSTestCase):
         self.vm.expect("wm: workspace 2")
         self.vm.mouse_home()
         self.vm.drag(300, 65, 140, 65)      # window x: 60 -> -100
-        self.vm.click(20, 270)              # the visible end of the "Showcase Demo" link
+        self.vm.click(20, 231)              # the visible end of the "Showcase Demo" link
         self.vm.expect("browser: CyberSurf - HTML Showcase Demo")
 
     def test_browser_command_opens_afs_file(self):
@@ -188,6 +188,63 @@ class DesktopTest(OSTestCase):
         self.assertIn("browser: style sheet bytes", self.vm.output, "extra.css fetched")
         self.assertIn("browser text: SHOWN0 SHOWNA SHOWNB SHOWNC SHOWN1 SHOWN2 SHOWN3 SHOWN4", line)
         self.assertNotIn("HIDDEN", line)
+
+    # --- page scripts (kernel/js/jsdom.asm), pages from tests/test_net.py --------
+    def test_browser_runs_page_scripts(self):
+        with HostWebServer() as web:
+            line = self.open_page(web, "js.html")
+        out = self.vm.output
+        for expected in (
+            "js: head object loading null",
+            "js: items 3 two",
+            'js: html <li class="a">one</li><li class="b">two</li><li class="c">three</li>',
+            "js: style color: red; background-color: blue red",
+            "js: class y true false",
+            "js: tree BODY list 3",
+            "js: external JS test /js.html",
+            "js: Uncaught SyntaxError: Unexpected token 'is' (line 1)",
+            "js: after an error P",
+            "js: loaded ready NEW & <ok>",
+        ):
+            self.assertIn(expected, out)
+        self.assertIn("browser text: NEW & <ok> one two three box WRITTEN", line)
+
+    def test_browser_dom_api(self):
+        with HostWebServer() as web:
+            line = self.open_page(web, "dom.html")
+            out = self.vm.output
+            for expected in (
+                "js: ids i1,i2,i3 2 UL tail & end",
+                "js: clone 3 null one",
+                "js: after replace onetwo3! null",
+                "js: notes 2 1",
+                "js: closest host true false",
+                'js: html <ul><li id="i1">one</li><li id="i2">two</li>3!</ul><span>tail &amp; end</span>',
+                "js alert: hello DOM",
+                "js: window load complete",
+            ):
+                self.assertIn(expected, out)
+            self.assertNotIn("js: never", out)
+            self.assertIn("browser text: GO TO HELLO one two 3! tail & end N1 N2 N3", line)
+            self.assertNotIn("VISIBLE UNTIL HIDDEN", line)
+            # the first line runs location.href = 'hello.html' when clicked
+            self.vm.mouse_home()
+            self.vm.click(100, 148)
+            self.vm.expect(f"js: navigate -> http://10.0.2.2:{web.port}/hello.html")
+            self.vm.expect("browser text: Hello from the host", timeout=20)
+
+    def test_browser_click_events(self):
+        with HostWebServer() as web:
+            self.open_page(web, "click.html")
+            self.vm.mouse_home()
+            self.vm.click(100, 148)         # the first line: onclick="" plus listeners
+            self.vm.expect("js: listener click big big")
+            self.vm.expect("js: bubbled to body big")
+            self.vm.expect("browser text: CLICKED 1")
+            self.vm.click(100, 170)         # a link whose handler calls preventDefault()
+            self.vm.expect("js: link cancelled")
+            time.sleep(1.5)
+        self.assertNotIn("Hello from the host", self.vm.output)
 
     def test_browser_scrolls_with_keys_and_wheel(self):
         with HostWebServer() as web:

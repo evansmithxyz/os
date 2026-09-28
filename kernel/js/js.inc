@@ -65,6 +65,13 @@ JC_ARGUMENTS            equ 1
 JC_MATH                 equ 2
 JC_GLOBAL               equ 3
 JC_CONSOLE              equ 4
+JC_HOST                 equ 5           ; classes from here on are host objects (jsdom.asm)
+JC_NODE                 equ 5           ; a DOM node (JSD_NODE = its index)
+JC_STYLE                equ 6           ; element.style
+JC_CLASSLIST            equ 7           ; element.classList
+JC_LOCATION             equ 8           ; window.location
+JSD_NODE                equ 32          ; dword: node index in a host object
+JSD_SIZE                equ 40
 
 ; Property entry: key = atom pointer in the low 32 bits, attributes above.
 ; A deleted entry has key 0.

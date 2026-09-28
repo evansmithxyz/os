@@ -43,7 +43,8 @@ N_CLSH                  equ 52      ; 6 x dd class hashes
 DOM_MAX_CLASSES         equ 6
 N_STYLE_LEN             equ 76      ; dd style="" text
 N_STYLE                 equ 80      ; dq
-; 88-127: computed style, filled in by css.asm (S_*)
+; 88-117: computed style, filled in by css.asm (S_*)
+N_JSOBJ                 equ 120     ; dd the node's JavaScript object (kernel/js/jsdom.asm), 0 = none
 
 ; tag table flags
 TF_VOID                 equ 0x01    ; no content, no close tag
@@ -99,6 +100,8 @@ dom_text_start:         resq 1      ; start of pending text, 0 = none
 dom_tag_start:          resq 1
 dom_attr_end:           resq 1
 dom_self_closing:       resb 1
+alignb 4
+dom_root:               resd 1      ; parsing stays inside this element (0 = whole document)
 
 section .text
 ; ------------------------------------------------------------------------------
@@ -255,9 +258,10 @@ dom_build:
     mov byte [rbx + N_TYPE], NODE_ELEMENT
     mov dword [dom_current], 0
 
+    mov dword [dom_root], 0
     lea r12, [abs browser_page_buf]
     cmp byte [browser_page_plain], 0
-    je .loop
+    je .html
     ; plain text: <pre>text</pre>
     call dom_new
     jc .done
@@ -266,6 +270,8 @@ dom_build:
     lea rsi, [dom_pre_name]
     mov [rbx + N_NAME], rsi
     mov dword [rbx + N_NAME_LEN], 3
+    lea rsi, [dom_no_attrs]
+    mov [rbx + N_ATTRS], rsi
     mov ecx, 3
     call dom_hash
     mov [rbx + N_TAGH], eax
@@ -280,7 +286,27 @@ dom_build:
     add rsi, rax
     call dom_flush_text
     jmp .done
+.html:
+    call dom_parse
+.done:
+    pop r12
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
 
+; ------------------------------------------------------------------------------
+; dom_parse: R12 = NUL-terminated HTML -> its nodes appended to dom_current
+; (tags never close anything outside dom_root). The text must stay in memory
+; while the nodes exist.
+; ------------------------------------------------------------------------------
+dom_parse:
+    push rax
+    push rsi
+    push r12
 .loop:
     mov al, [r12]
     test al, al
@@ -317,13 +343,30 @@ dom_build:
 .end:
     mov rsi, r12
     call dom_flush_text
-.done:
     pop r12
-    pop rdi
     pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
+    pop rax
+    ret
+
+; ------------------------------------------------------------------------------
+; dom_parse_into: RSI = NUL-terminated HTML (kept while the nodes exist),
+; EAX = element -> the parsed nodes appended to its children
+; ------------------------------------------------------------------------------
+dom_parse_into:
+    push rax
+    push r12
+    push qword [dom_current]
+    push qword [dom_root]
+    mov [dom_current], eax
+    mov [dom_root], eax
+    mov qword [dom_text_start], 0
+    mov r12, rsi
+    call dom_parse
+    pop rax
+    mov [dom_root], eax
+    pop rax
+    mov [dom_current], eax
+    pop r12
     pop rax
     ret
 
@@ -431,8 +474,8 @@ dom_tag:
     ; the nearest open element with this name, then its parent
     mov eax, [dom_current]
 .find_open:
-    test eax, eax
-    jz .skip_to_gt                  ; nothing open matches: ignore it
+    cmp eax, [dom_root]
+    je .skip_to_gt                  ; nothing open matches: ignore it
     call dom_node
     cmp [rbx + N_TAGH], edx
     je .found_open
@@ -863,8 +906,8 @@ dom_implicit_close:
     push rbx
     mov eax, [dom_current]
 .up:
-    test eax, eax
-    jz .close_done
+    cmp eax, [dom_root]
+    je .close_done
     call dom_node
     mov bl, [rbx + N_TAG]
     cmp bl, dh
@@ -883,6 +926,285 @@ dom_implicit_close:
 .close_done:
     pop rbx
     pop rax
+    ret
+
+; ==============================================================================
+; Changing the tree (JavaScript, kernel/js/jsdom.asm)
+; A detached node has N_PARENT 0 and is not in the document's child list.
+; ==============================================================================
+
+; dom_index: RBX = node record -> EAX = its index
+dom_index:
+    mov rax, rbx
+    sub rax, DOM_ADDR
+    shr rax, 7
+    ret
+
+; ------------------------------------------------------------------------------
+; dom_detach: EAX = node -> taken out of its parent's children (if it has a
+; parent or is a child of the document)
+; ------------------------------------------------------------------------------
+dom_detach:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    mov edx, eax                    ; EDX = node
+    call dom_node
+    mov rsi, rbx                    ; RSI = its record
+    mov eax, [rsi + N_PARENT]
+    call dom_node                   ; RBX = parent (the document when 0)
+    xor ecx, ecx                    ; previous sibling
+    mov eax, [rbx + N_FIRST]
+.find:
+    test eax, eax
+    jz .done                        ; not there: already detached
+    cmp eax, edx
+    je .found
+    mov ecx, eax
+    push rbx
+    call dom_node
+    mov eax, [rbx + N_NEXT]
+    pop rbx
+    jmp .find
+.found:
+    mov eax, [rsi + N_NEXT]
+    test ecx, ecx
+    jnz .middle
+    mov [rbx + N_FIRST], eax
+    jmp .last
+.middle:
+    push rbx
+    push rax
+    mov eax, ecx
+    call dom_node
+    pop rax
+    mov [rbx + N_NEXT], eax
+    pop rbx
+.last:
+    cmp [rbx + N_LAST], edx
+    jne .done
+    mov [rbx + N_LAST], ecx
+.done:
+    mov dword [rsi + N_PARENT], 0
+    mov dword [rsi + N_NEXT], 0
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; ------------------------------------------------------------------------------
+; dom_insert: EAX = node, EDX = new parent, ECX = the child to insert it before
+; (0 = at the end). The node is detached from where it was first.
+; ------------------------------------------------------------------------------
+dom_insert:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    call dom_detach
+    mov esi, eax                    ; ESI = node
+    call dom_node
+    mov [rbx + N_PARENT], edx
+    mov rdi, rbx                    ; RDI = node record
+    mov eax, edx
+    call dom_node                   ; RBX = parent
+    test ecx, ecx
+    jz .append
+    ; before ECX: find the child in front of it
+    xor edx, edx
+    mov eax, [rbx + N_FIRST]
+.find:
+    test eax, eax
+    jz .append                      ; not a child: append instead
+    cmp eax, ecx
+    je .found
+    mov edx, eax
+    push rbx
+    call dom_node
+    mov eax, [rbx + N_NEXT]
+    pop rbx
+    jmp .find
+.found:
+    mov [rdi + N_NEXT], ecx
+    test edx, edx
+    jnz .after
+    mov [rbx + N_FIRST], esi
+    jmp .done
+.after:
+    mov eax, edx
+    call dom_node
+    mov [rbx + N_NEXT], esi
+    jmp .done
+.append:
+    mov dword [rdi + N_NEXT], 0
+    mov eax, [rbx + N_LAST]
+    mov [rbx + N_LAST], esi
+    test eax, eax
+    jnz .sibling
+    mov [rbx + N_FIRST], esi
+    jmp .done
+.sibling:
+    call dom_node
+    mov [rbx + N_NEXT], esi
+.done:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; dom_contains: EAX = node, EDX = possible descendant -> CF=1 if EDX is EAX or
+; inside it
+dom_contains:
+    push rbx
+    push rdx
+.up:
+    cmp edx, eax
+    je .yes
+    test edx, edx
+    jz .no
+    push rax
+    mov eax, edx
+    call dom_node
+    pop rax
+    mov edx, [rbx + N_PARENT]
+    jmp .up
+.yes:
+    pop rdx
+    pop rbx
+    stc
+    ret
+.no:
+    pop rdx
+    pop rbx
+    clc
+    ret
+
+; dom_connected: EAX = node -> CF=1 if it is in the document
+dom_connected:
+    push rax
+    push rbx
+    push rdx
+.up:
+    test eax, eax
+    jz .yes                         ; reached the document
+    mov edx, eax
+    call dom_node
+    mov eax, [rbx + N_PARENT]
+    test eax, eax
+    jnz .up
+    ; a child of the document, or detached?
+    xor eax, eax
+    call dom_node
+    mov eax, [rbx + N_FIRST]
+.child:
+    test eax, eax
+    jz .no
+    cmp eax, edx
+    je .yes
+    call dom_node
+    mov eax, [rbx + N_NEXT]
+    jmp .child
+.yes:
+    pop rdx
+    pop rbx
+    pop rax
+    stc
+    ret
+.no:
+    pop rdx
+    pop rbx
+    pop rax
+    clc
+    ret
+
+; ------------------------------------------------------------------------------
+; dom_new_element: RSI = tag name (lower case, kept), ECX = its length
+; -> EAX = a detached element, RBX = its record; CF=1 if the DOM is full
+; ------------------------------------------------------------------------------
+dom_new_element:
+    push rdx
+    call dom_new
+    jc .full
+    mov byte [rbx + N_TYPE], NODE_ELEMENT
+    mov [rbx + N_NAME], rsi
+    mov [rbx + N_NAME_LEN], ecx
+    push rax
+    push rsi
+    lea rsi, [dom_no_attrs]
+    mov [rbx + N_ATTRS], rsi
+    pop rsi
+    call dom_hash
+    mov [rbx + N_TAGH], eax
+    mov edx, eax
+    call dom_tag_lookup
+    mov [rbx + N_TAG], al
+    pop rax
+    clc
+.full:
+    pop rdx
+    ret
+
+; dom_new_text: RSI = text (as HTML source: entities are decoded when drawn),
+; ECX = length -> EAX = a detached text node, RBX = its record; CF=1 if full
+dom_new_text:
+    call dom_new
+    jc .full
+    mov byte [rbx + N_TYPE], NODE_TEXT
+    mov [rbx + N_NAME], rsi
+    mov [rbx + N_NAME_LEN], ecx
+    clc
+.full:
+    ret
+
+; ------------------------------------------------------------------------------
+; dom_set_attrs: EAX = element, RSI = new attribute text (name="value" ...,
+; NUL-terminated, kept) -> recorded, with its id, classes and style="" again
+; ------------------------------------------------------------------------------
+dom_set_attrs:
+    push rax
+    push rbx
+    push r12
+    call dom_node
+    mov dword [rbx + N_IDH], 0
+    mov byte [rbx + N_NCLS], 0
+    mov qword [rbx + N_STYLE], 0
+    mov dword [rbx + N_STYLE_LEN], 0
+    mov r12, rsi
+    call dom_attributes
+    pop r12
+    pop rbx
+    pop rax
+    ret
+
+; dom_is_raw: EAX = element -> CF=1 if its content is raw text (script, style,
+; textarea, title, ...), not HTML
+dom_is_raw:
+    push rax
+    push rbx
+    call dom_node
+    movzx eax, byte [rbx + N_TAG]
+    test eax, eax
+    jz .no
+    lea rbx, [dom_tag_flags]
+    test byte [rbx + rax], TF_RAW
+    jz .no
+    pop rbx
+    pop rax
+    stc
+    ret
+.no:
+    pop rbx
+    pop rax
+    clc
     ret
 
 ; ------------------------------------------------------------------------------
@@ -978,6 +1300,7 @@ dom_attr:
 
 section .rodata
 dom_pre_name:           db "pre"
+dom_no_attrs:           db 0
 
 ; hash, id, flags (built by tools? no: hashes are computed at startup by
 ; dom_init from dom_tag_names)

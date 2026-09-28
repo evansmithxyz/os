@@ -254,6 +254,10 @@ jslex_next:
     jbe .space
     cmp al, '/'
     je .slash
+    cmp al, '<'
+    je .html_open
+    cmp al, '-'
+    je .html_close
     cmp al, 0x80
     jb .token
     ; U+00A0, U+FEFF, U+2028/2029 count as white space / line breaks
@@ -294,6 +298,26 @@ jslex_next:
     inc dword [jslex_line]
     mov byte [tok_nl], 1
     jmp .skip
+.html_open:
+    ; <!-- starts a line comment (old pages hide scripts in HTML comments)
+    lea rdx, [rsi + 4]
+    cmp rdx, rdi
+    ja .token
+    cmp dword [rsi], '<!--'
+    jne .token
+    jmp .line_comment
+.html_close:
+    ; --> at the start of a line is a line comment too
+    lea rdx, [rsi + 3]
+    cmp rdx, rdi
+    ja .token
+    cmp word [rsi + 1], '->'
+    jne .token
+    cmp byte [tok_nl], 0
+    jne .line_comment
+    cmp rsi, [jslex_src]
+    je .line_comment
+    jmp .token
 .slash:
     lea rdx, [rsi + 1]
     cmp rdx, rdi

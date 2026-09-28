@@ -25,7 +25,7 @@ BIG_HTML = (
     "<link rel='stylesheet' href='big.css'>"
     "<script>" + "var hidden = 'SCRIPT TEXT MUST NOT SHOW';\n" * 1000 + "</script>"
     "<style>body { color: red }</style></head>"
-    "<body><!-- comment > with text --><script>document.write('also hidden')</script>"
+    "<body><!-- comment > with text --><script>var alsoHidden = 'also hidden'</script>"
     "<div>Big page body</div><p>Fish &amp; chips &lt;3</p></body></html>"
 )
 
@@ -84,6 +84,88 @@ EXTRA_CSS = ".fromsheet { display: none }\n"
 # A relative link at the top left of the page
 LINKS_HTML = "<html><body><a href='sub'>Go to sub</a> <a href='features.html'>Features</a></body></html>"
 
+# Page scripts and the DOM (tests/test_gui.py): console.log goes to "[klog] js: ..."
+JS_HTML = """<html><head><title>JS test</title>
+<script>
+console.log('head', typeof document, document.readyState, document.body);
+var steps = [];
+document.addEventListener('DOMContentLoaded', function () { steps.push('ready') });
+window.onload = function () { console.log('loaded', steps.join(), document.getElementById('out').textContent) };
+</script></head>
+<body>
+<p id="out">OLD TEXT</p>
+<ul id="list"><li class="a">one</li><li class="b">two</li></ul>
+<div id="box" style="color: red">box</div>
+<script>
+var out = document.getElementById('out');
+out.textContent = 'NEW & <ok>';
+var li = document.createElement('li');
+li.className = 'c';
+li.appendChild(document.createTextNode('three'));
+document.getElementById('list').appendChild(li);
+console.log('items', document.querySelectorAll('#list li').length, document.querySelector('ul .b').textContent);
+console.log('html', document.getElementById('list').innerHTML);
+document.write('<p id="written">WRITTEN</p>');
+var box = document.getElementById('box');
+box.style.backgroundColor = 'blue';
+console.log('style', box.getAttribute('style'), box.style.color);
+box.classList.add('x'); box.classList.toggle('y'); box.classList.remove('x');
+console.log('class', box.className, box.classList.contains('y'), box.classList.contains('x'));
+console.log('tree', out.parentNode.tagName, out.nextElementSibling.id, out.nextSibling.nodeType);
+</script>
+<script src="extra.js"></script>
+<script>this is not javascript</script>
+<script>console.log('after an error', document.getElementById('written').tagName)</script>
+</body></html>"""
+EXTRA_JS = "console.log('external', document.title, location.pathname);\n"
+
+# More of the DOM: tree changes, queries, styles, window
+DOM_HTML = """<html><head><title>DOM</title></head><body>
+<div id="nav" onclick="location.href = 'hello.html'">GO TO HELLO</div>
+<div id="top">TOP</div>
+<div id="host"></div>
+<p class="note first">N1</p><p class="note">N2</p><p class="other">N3</p>
+<div id="hideme">VISIBLE UNTIL HIDDEN</div>
+<script>
+var host = document.getElementById('host');
+host.innerHTML = '<ul><li id="i1">one</li><li id="i3">three</li></ul><span>tail &amp; end</span>';
+var two = document.createElement('li'); two.id = 'i2'; two.textContent = 'two';
+host.querySelector('ul').insertBefore(two, document.getElementById('i3'));
+var items = host.getElementsByTagName('li');
+var ids = []; for (var i = 0; i < items.length; i++) ids.push(items[i].id);
+console.log('ids', ids.join(), host.children.length, host.firstChild.tagName, host.lastChild.textContent);
+var copy = host.querySelector('ul').cloneNode(true);
+console.log('clone', copy.children.length, copy.parentNode, copy.firstChild.textContent);
+var three = document.getElementById('i3');
+host.querySelector('ul').replaceChild(document.createTextNode('3!'), three);
+console.log('after replace', host.querySelector('ul').textContent, document.getElementById('i3'));
+console.log('notes', document.getElementsByClassName('note').length, document.getElementsByClassName('note first').length);
+console.log('closest', two.closest('div').id, two.matches('li#i2'), two.matches('p'));
+document.body.removeChild(document.getElementById('top'));
+document.getElementById('hideme').style.display = 'none';
+console.log('html', host.innerHTML);
+function early() { console.log('never') }
+window.addEventListener('load', early);
+window.removeEventListener('load', early);
+window.addEventListener('load', function () { console.log('window load', document.readyState) });
+alert('hello ' + document.title);
+</script>
+</body></html>"""
+
+# Click handlers: the first line of the page is the thing to click
+CLICK_HTML = """<html><body>
+<div id="big" onclick="this.textContent = 'CLICKED ' + (++window.clicks)">PRESS HERE</div>
+<p><a id="go" href="hello.html">a link that a handler cancels</a></p>
+<script>
+window.clicks = 0;
+document.getElementById('big').addEventListener('click', function (e) {
+    console.log('listener', e.type, e.target.id, e.currentTarget.id);
+});
+document.body.addEventListener('click', function (e) { console.log('bubbled to body', e.target.id) });
+document.getElementById('go').onclick = function (e) { e.preventDefault(); console.log('link cancelled') };
+</script>
+</body></html>"""
+
 
 class HostWebServer:
     """http.server on 127.0.0.1 (reachable from the guest as 10.0.2.2:<port>)."""
@@ -98,6 +180,10 @@ class HostWebServer:
         (self.root / "links.html").write_text(LINKS_HTML)
         (self.root / "css.html").write_text(CSS_HTML)
         (self.root / "extra.css").write_text(EXTRA_CSS)
+        (self.root / "js.html").write_text(JS_HTML)
+        (self.root / "extra.js").write_text(EXTRA_JS)
+        (self.root / "click.html").write_text(CLICK_HTML)
+        (self.root / "dom.html").write_text(DOM_HTML)
         # GET /sub answers "301 Location: /sub/" (http.server adds the slash)
         (self.root / "sub").mkdir(exist_ok=True)
         (self.root / "sub" / "index.html").write_text("<html><body><p>Sub page</p></body></html>")

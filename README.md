@@ -44,8 +44,9 @@ windowed desktop with i3-style workspaces.
     - a terminal that runs the same shell as the text console
     - the CyberSurf web browser: built-in pages, `afs://` files, real HTTP
       and HTTPS with redirects; an HTML parser, a CSS engine (style sheets,
-      selectors, the cascade, `@media`) and a layout engine drawing with the
-      8x8 font; scrolling and relative links
+      selectors, the cascade, `@media`), a layout engine drawing with the
+      8x8 font, and page scripts with the DOM and click events; scrolling
+      and relative links
     - a paint canvas
     - a live system monitor
 
@@ -117,9 +118,9 @@ The terminal window runs the real shell, so every command works there too.
 URL into the browser. `tcplisten` serves a page that your host can open at
 <http://localhost:8888>.
 
-The browser doesn't run page scripts yet (the JavaScript engine is only
-in the shell so far; see below). A page goes through the same stages as
-in a big browser, all in `kernel/web/`:
+A page goes through the same stages as in a big browser, all in
+`kernel/web/`, and then its scripts run (`kernel/js/`, see JavaScript
+below):
 
 1. `dom.asm` parses the HTML into a DOM tree, with the HTML rules that
    matter for display (void elements, `<p>`/`<li>`/`<td>` closing each other,
@@ -156,6 +157,7 @@ PgUp/PgDn, Home/End or the mouse wheel. Pages up to 1 MB are kept.
 | Up / Down, mouse wheel | Scroll a few lines |
 | PgUp / PgDn, Home / End | Scroll a screen, to the top / bottom |
 | Click a link | Follow it (relative links resolve against the page) |
+| Click anything else | The page's `click` handlers run |
 
 HTTPS speaks TLS 1.3 with one cipher suite, `TLS_CHACHA20_POLY1305_SHA256`,
 and one key exchange, X25519. Servers that only offer AES-GCM (rare, since
@@ -197,7 +199,37 @@ antigravity64> js script.js
 ```
 
 Each run starts from a fresh engine; Esc or Ctrl+C stops a script that
-doesn't end. The engine (`kernel/js/`) works like the big ones, minus the
+doesn't end.
+
+In the browser, every HTML page gets its own engine with `window` and
+`document`. Its `<script>`s run in order (inline or `src=`, which is
+fetched), then `DOMContentLoaded` and `load` fire. `console.log` output
+and errors go to the serial log as `[klog] js: ...`; an error ends only
+the script it happened in. Clicks run the page's handlers (`onclick=""`,
+`onclick` properties and `addEventListener`), which bubble up the tree;
+`preventDefault()` stops a link from being followed. After scripts
+change the DOM, the page is styled and laid out again. The DOM API
+(`kernel/js/jsdom.asm`):
+
+- `document`: `getElementById`, `querySelector(All)` (the CSS engine's
+  selectors), `getElementsByTagName` / `ClassName`, `createElement`,
+  `createTextNode`, `write` / `writeln`, `body`, `head`,
+  `documentElement`, `title`, `readyState`, `URL`
+- elements: `textContent`, `innerHTML`, `outerHTML`, `id`, `className`,
+  `classList`, `style` (with `cssText`), `get/set/remove/hasAttribute`,
+  reflected attributes (`href`, `src`, `value`, `checked`, `hidden`, ...),
+  `appendChild`, `insertBefore`, `replaceChild`, `removeChild`, `remove`,
+  `append`, `cloneNode`, `contains`, `matches`, `closest`, `click()`, and
+  the tree (`parentNode`, `children`, `childNodes`, `firstChild`,
+  `nextElementSibling`, ...)
+- events: `addEventListener` / `removeEventListener`, `event.target`,
+  `currentTarget`, `preventDefault()`, `stopPropagation()`
+- `window`: `alert` (status bar and log), `location` (`href`, `pathname`,
+  ...; setting `href` loads the page), `navigator.userAgent`,
+  `innerWidth` / `innerHeight`
+
+Lists from `querySelectorAll` and friends are plain arrays, not live
+collections. The engine (`kernel/js/`) works like the big ones, minus the
 optimising compilers:
 
 1. `lexer.asm` turns the text into tokens; names and strings become atoms
@@ -228,9 +260,11 @@ including `**`, `??` and the logical assignments, `if`/`for`/`for-in`/
 
 Not yet (the parser says so): arrow functions, classes, `try`/`catch`,
 template literals, destructuring, spread, getters/setters, optional
-chaining, regular expressions, generators and `async`. Strings are UTF-8
-bytes, so `length` counts bytes. Memory isn't reclaimed during a run
-(the heap is 64 MB).
+chaining, regular expressions, generators and `async`; in the browser,
+timers (`setTimeout`), `fetch` and typing into form fields. Real sites'
+scripts mostly stop at the first of these, and the page shows without
+them. Strings are UTF-8 bytes, so `length` counts bytes. Memory isn't
+reclaimed while a page is open (the heap is 64 MB).
 
 ## Project layout
 

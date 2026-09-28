@@ -956,6 +956,10 @@ js_get:
     je .function
     cmp ecx, JK_NATIVE
     je .native
+    cmp dword [rdi + JOBJ_CLASS], JC_HOST
+    jb .object_lookup
+    call jsd_get                    ; DOM properties (CF=0: RAX = the value)
+    jnc .out
 .object_lookup:
     mov rax, rdi
 .lookup:
@@ -1090,6 +1094,11 @@ js_put:
     mov [rax + JFN_PROTO_OBJ], rcx
     jmp .out
 .plain:
+    cmp dword [rax + JOBJ_CLASS], JC_HOST
+    jb .ordinary
+    call jsd_put                    ; DOM properties (CF=0: handled)
+    jnc .out
+.ordinary:
     call jsobj_put
 .out:
     pop rdi

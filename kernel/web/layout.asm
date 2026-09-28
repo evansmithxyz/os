@@ -418,6 +418,8 @@ lay_block:
     mov eax, [r13 + S_BG]
     mov [rbx + I_COLOR], eax
     mov [rbx + I_NODE], r12d
+    mov eax, [lay_count]            ; the rectangle is not content of a line
+    mov [lay_line_first], eax
 .no_bg:
     ; indent: margin-left + padding-left
     movsx eax, word [r13 + S_ML]
@@ -1715,6 +1717,88 @@ lay_pic_checkbox:       db "[ ]", 0
 lay_pic_radio:          db "( )", 0
 lay_pic_field:          db "__________]", 0
 section .text
+
+; ------------------------------------------------------------------------------
+; layout_node_at: ECX, EDX = screen point in the viewport -> EAX = the DOM node
+; drawn there: a text run's node, else the innermost background box. CF=1 if
+; there is only page background.
+; ------------------------------------------------------------------------------
+layout_node_at:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    sub ecx, [browser_vp_x]
+    sub ecx, 8                      ; document x
+    sub edx, [browser_vp_y]
+    sub edx, 6
+    add edx, [browser_scroll]       ; document y
+    ; text, last drawn first
+    mov eax, [lay_count]
+.text:
+    test eax, eax
+    jz .rects
+    dec eax
+    call lay_item
+    cmp byte [rbx + I_KIND], IK_TEXT
+    jne .text
+    mov esi, [rbx + I_Y]
+    cmp edx, esi
+    jl .text
+    add esi, LAY_LINE_H
+    cmp edx, esi
+    jge .text
+    mov esi, [rbx + I_X]
+    cmp ecx, esi
+    jl .text
+    movzx edi, word [rbx + I_LEN]
+    shl edi, 3
+    add esi, edi
+    cmp ecx, esi
+    jge .text
+    mov eax, [rbx + I_NODE]
+    jmp .found
+.rects:
+    mov eax, [lay_count]
+.rect:
+    test eax, eax
+    jz .none
+    dec eax
+    call lay_item
+    cmp byte [rbx + I_KIND], IK_RECT
+    jne .rect
+    cmp dword [rbx + I_NODE], 0
+    je .rect
+    mov esi, [rbx + I_Y]
+    cmp edx, esi
+    jl .rect
+    add esi, [rbx + I_LINK]         ; height
+    cmp edx, esi
+    jge .rect
+    mov esi, [rbx + I_X]
+    cmp ecx, esi
+    jl .rect
+    add esi, [rbx + I_TEXT]         ; width
+    cmp ecx, esi
+    jge .rect
+    mov eax, [rbx + I_NODE]
+.found:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    clc
+    ret
+.none:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    stc
+    ret
 
 ; ==============================================================================
 ; Shared with browser.asm: scrolling, link boxes, the test log

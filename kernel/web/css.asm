@@ -158,6 +158,10 @@ css_inline_count:       resd 1
 css_sel:                resb CSS_RULE_SIZE      ; selector being parsed
 css_sel_spec:           resd 1
 css_bad:                resb 1      ; the selector uses something unsupported
+css_sel_only:           resb 1          ; css_add_selector only compiles (css_compile_selector)
+css_sel_ok:             resb 1
+alignb 8
+css_sel_out:            resq 1
 css_decl_first:         resd 1
 css_decl_n:             resd 1
 css_values:             resd 4      ; lengths of a margin/padding shorthand
@@ -1646,7 +1650,11 @@ css_add_selector:
 .finish:
     test r8d, r8d
     jz .bad
-    ; new rule
+    cmp byte [css_sel_only], 0
+    je .new_rule
+    mov rdi, [css_sel_out]          ; css_compile_selector: just the record
+    jmp .fill
+.new_rule:
     mov eax, [css_rule_count]
     cmp eax, CSS_MAX_RULES
     jae .bad
@@ -1655,6 +1663,7 @@ css_add_selector:
     imul rax, rax, CSS_RULE_SIZE
     lea rdi, [abs CSS_RULES]
     add rdi, rax                    ; RDI = rule
+.fill:
     mov eax, [css_sel_spec]
     add eax, [css_origin]
     mov [rdi + R_SPEC], eax
@@ -1688,6 +1697,11 @@ css_add_selector:
     inc ecx
     cmp ecx, r8d
     jb .copy
+    cmp byte [css_sel_only], 0
+    je .file
+    mov byte [css_sel_ok], 1
+    jmp .done
+.file:
     ; into its bucket: id, else first class, else tag, else universal
     mov eax, [rdi + R_COMP + C_ID]
     test eax, eax
@@ -1924,10 +1938,12 @@ css_compute:
     mov byte [rbx + S_DISPLAY], DISP_BLOCK
     mov dword [rbx + S_COLOR], 0x000000
     mov dword [rbx + S_BG], CSS_TRANSPARENT
-    mov r12d, 1
+    ; a walk through the tree, parents before children (scripts can move
+    ; nodes, so index order is not enough; detached nodes are skipped)
+    mov r12d, [rbx + N_FIRST]
 .node:
-    cmp r12d, [dom_count]
-    jae .done
+    test r12d, r12d
+    jz .done
     mov eax, r12d
     call dom_node
     mov r13, rbx                    ; R13 = this node
@@ -2013,7 +2029,22 @@ css_compute:
     jc .next
     mov byte [r13 + S_DISPLAY], DISP_NONE
 .next:
-    inc r12d
+    ; the next node in document order
+    mov eax, [r13 + N_FIRST]
+    test eax, eax
+    jnz .go
+.up:
+    mov eax, [r13 + N_NEXT]
+    test eax, eax
+    jnz .go
+    mov eax, [r13 + N_PARENT]
+    test eax, eax
+    jz .done
+    call dom_node
+    mov r13, rbx
+    jmp .up
+.go:
+    mov r12d, eax
     jmp .node
 .done:
     pop r13
@@ -2221,17 +2252,43 @@ css_sort_matches:
     ret
 
 ; ------------------------------------------------------------------------------
+; css_compile_selector: RSI/RCX = one selector, RDI = a CSS_RULE_SIZE record
+; -> the compiled selector in it (querySelector); CF=1 if it uses something
+; not supported
+; ------------------------------------------------------------------------------
+css_compile_selector:
+    mov [css_sel_out], rdi
+    mov byte [css_sel_only], 1
+    mov byte [css_sel_ok], 0
+    call css_add_selector
+    mov byte [css_sel_only], 0
+    cmp byte [css_sel_ok], 1
+    jne .bad
+    clc
+    ret
+.bad:
+    stc
+    ret
+
+; ------------------------------------------------------------------------------
 ; css_rule_matches: EAX = rule, RBX = element -> CF=0 if the selector matches
+; css_selector_matches: RSI = rule record, RBX = element -> the same
 ; ------------------------------------------------------------------------------
 css_rule_matches:
+    push rsi
+    imul rsi, rax, CSS_RULE_SIZE
+    add rsi, CSS_RULES              ; RSI = rule
+    call css_selector_matches
+    pop rsi
+    ret
+
+css_selector_matches:
     push rax
     push rcx
     push rdx
     push rsi
     push rdi
     push r8
-    imul rsi, rax, CSS_RULE_SIZE
-    add rsi, CSS_RULES              ; RSI = rule
     movzx r8d, byte [rsi + R_NCOMP]
     lea rdi, [rsi + R_COMP]         ; RDI = compound 0 (rightmost)
     mov rdx, rbx                    ; RDX = element being matched

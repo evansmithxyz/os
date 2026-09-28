@@ -42,6 +42,7 @@ browser_page_builtin:   db 1        ; 1 = the browser's own page: dark style she
 browser_sheets:         db 0        ; style sheets fetched for this page
 dom_ready:              db 0        ; dom_init has run
 browser_redirects:      db 0        ; redirects followed for the current navigation
+browser_js_navs:        db 0        ; navigations a script started, in a row
 align 4
 browser_log_len:        dd 0
 browser_log_y:          dd 0        ; y of the last logged glyph
@@ -729,6 +730,7 @@ browser_navigate:
     call browser_set_page
 .done:
     call browser_prepare_page       ; DOM, style sheets, styles
+    call jsd_page_load              ; its scripts
     mov byte [gui_dirty], 1
     mov byte [browser_log_text], 1  ; the next render reports the visible text
     mov dword [browser_log_len], 0
@@ -739,6 +741,7 @@ browser_navigate:
     lea rsi, [klog_browser_status]  ; "[klog] browser status: <status bar>"
     lea rdi, [browser_status_text]
     call klog2
+    call browser_js_navigation      ; a script set location.href
     pop r8
     pop rdi
     pop rsi
@@ -746,6 +749,20 @@ browser_navigate:
     pop rcx
     pop rbx
     pop rax
+    ret
+
+; browser_js_navigation: a script asked for another page (location.href):
+; load it (at most a few in a row, so pages cannot bounce forever)
+browser_js_navigation:
+    cmp byte [jsd_nav_pending], 0
+    je .ret
+    mov byte [jsd_nav_pending], 0
+    cmp byte [browser_js_navs], 4
+    jae .ret
+    inc byte [browser_js_navs]
+    call browser_navigate
+    dec byte [browser_js_navs]
+.ret:
     ret
 
 ; ------------------------------------------------------------------------------
@@ -873,24 +890,44 @@ browser_prepare_page:
 browser_fetch_stylesheet:
     push rax
     push rcx
-    push rdx
     push rsi
-    push rdi
-    push r8
     cmp byte [browser_sheets], BROWSER_MAX_SHEETS
     jae .done
     inc byte [browser_sheets]
-    call browser_resolve_link
+    call browser_fetch_quiet
     jc .done
+    call css_keep_text              ; the next fetch reuses http_resp_buf
+    call css_parse
+    mov eax, ecx
+    lea rsi, [klog_browser_sheet]
+    call klog_dec
+.done:
+    pop rsi
+    pop rcx
+    pop rax
+    ret
+
+; ------------------------------------------------------------------------------
+; browser_fetch_quiet: RSI = href, ECX = its length (resolved against the page)
+; -> RSI = the body of a 200 response (in http_resp_buf, valid until the next
+; fetch), RCX = its length; CF=1 if it could not be fetched
+; ------------------------------------------------------------------------------
+browser_fetch_quiet:
+    push rax
+    push rdx
+    push rdi
+    push r8
+    call browser_resolve_link
+    jc .fail
     mov rsi, [browser_resolved]
     call url_parse
-    jc .done
+    jc .fail
     cmp byte [net_present], 1
-    jne .done
+    jne .fail
     lea rsi, [url_host]
     lea rdi, [url_ip]
     call net_resolve_host
-    jc .done
+    jc .fail
     mov byte [http_quiet], 1
     lea rsi, [url_ip]
     lea rdi, [url_host]
@@ -906,16 +943,16 @@ browser_fetch_stylesheet:
 .fetched:
     mov byte [http_quiet], 0
     test eax, eax
-    jnz .done
-    ; only a 200 response is a style sheet
+    jnz .fail
+    ; only a 200 response counts
     lea rsi, [abs http_resp_buf]
     cmp byte [rsi + 9], '2'
-    jne .done
+    jne .fail
     ; the body, after the blank line
 .find_body:
     mov al, [rsi]
     test al, al
-    jz .done
+    jz .fail
     cmp dword [rsi], 0x0A0D0A0D
     je .body
     inc rsi
@@ -923,21 +960,19 @@ browser_fetch_stylesheet:
 .body:
     add rsi, 4
     call strlen
-    mov ecx, eax
-    call css_keep_text              ; the next fetch reuses http_resp_buf
-    call css_parse
-    mov eax, ecx
-    push rsi
-    lea rsi, [klog_browser_sheet]
-    call klog_dec
-    pop rsi
-.done:
+    mov rcx, rax
     pop r8
     pop rdi
-    pop rsi
     pop rdx
-    pop rcx
     pop rax
+    clc
+    ret
+.fail:
+    pop r8
+    pop rdi
+    pop rdx
+    pop rax
+    stc
     ret
 
 ; ------------------------------------------------------------------------------
@@ -2134,7 +2169,9 @@ browser_handle_click:
     jmp .browser_click_done
 
 .chk_hyperlinks:
-    ; 5. Check Click on Page Hyperlinks in Viewport
+    ; 5. The page: first its scripts' click handlers, then links
+    call browser_page_click
+    jc .body_handled                ; a handler cancelled it (or navigated)
     mov ebx, [browser_link_count]
     test ebx, ebx
     jz .body_handled
@@ -2185,6 +2222,58 @@ browser_handle_click:
     pop rdx
     pop rcx
     pop rbx
+    ret
+
+; ------------------------------------------------------------------------------
+; browser_page_click: ECX, EDX = the pointer -> the page's click event on the
+; element under it (if it is in the viewport). CF=1 if the default action
+; is cancelled or a script navigated.
+; ------------------------------------------------------------------------------
+browser_page_click:
+    push rax
+    push rbx
+    mov eax, [browser_vp_x]
+    cmp ecx, eax
+    jl .outside
+    add eax, [browser_vp_w]
+    cmp ecx, eax
+    jge .outside
+    mov eax, [browser_vp_y]
+    cmp edx, eax
+    jl .outside
+    add eax, [browser_vp_h]
+    cmp edx, eax
+    jge .outside
+    call layout_node_at
+    jnc .target
+    ; page background: <body>
+    push rdx
+    xor eax, eax
+    mov edx, TAGID_BODY
+    call jsd_find_tag
+    pop rdx
+    jc .outside
+.target:
+    push rcx
+    push rdx
+    sub ecx, [browser_vp_x]
+    sub edx, [browser_vp_y]
+    call jsd_page_click
+    pop rdx
+    pop rcx
+    jc .cancel
+    cmp byte [jsd_nav_pending], 0
+    je .outside
+    call browser_js_navigation
+.cancel:
+    pop rbx
+    pop rax
+    stc
+    ret
+.outside:
+    pop rbx
+    pop rax
+    clc
     ret
 
 ; ------------------------------------------------------------------------------

@@ -287,25 +287,7 @@ js_init_builtins:
     call jsb_define
     ; methods
     lea r8, [jsb_natives]
-.native:
-    mov rdi, [r8]
-    test rdi, rdi
-    jz .natives_done
-    movzx ecx, byte [r8 + 17]
-    lea rsi, [r8 + 18]
-    call jsstr_atom
-    mov rdx, rax
-    mov rax, [r8 + 8]
-    movzx ecx, byte [r8 + 16]
-    call jsfn_native
-    mov rcx, rax
-    BOX rcx, rsi, JS_OBJ_BITS
-    mov rax, [rdi]
-    call jsobj_define_hidden
-    movzx ecx, byte [r8 + 17]
-    lea r8, [r8 + rcx + 18]
-    jmp .native
-.natives_done:
+    call jsb_define_natives
     ; constants
     lea r8, [jsb_constants]
 .constant:
@@ -336,6 +318,41 @@ js_init_builtins:
     pop rdx
     pop rcx
     pop rbx
+    pop rax
+    ret
+
+; jsb_define_natives: R8 = a JSNATIVE table -> its functions defined (hidden)
+jsb_define_natives:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+.native:
+    mov rdi, [r8]
+    test rdi, rdi
+    jz .done
+    movzx ecx, byte [r8 + 17]
+    lea rsi, [r8 + 18]
+    call jsstr_atom
+    mov rdx, rax
+    mov rax, [r8 + 8]
+    movzx ecx, byte [r8 + 16]
+    call jsfn_native
+    mov rcx, rax
+    BOX rcx, rsi, JS_OBJ_BITS
+    mov rax, [rdi]
+    call jsobj_define_hidden
+    movzx ecx, byte [r8 + 17]
+    lea r8, [r8 + rcx + 18]
+    jmp .native
+.done:
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
     pop rax
     ret
 

@@ -82,7 +82,8 @@ Routines are prefixed with their module: `con_`, `key_`, `serial_`, `vga_`,
 `js_` (engine API and runtime helpers), `jsnum_`/`jsbig_` (numbers),
 `jsstr_` (strings, atoms), `jsobj_`/`jsarr_`/`jsfn_` (objects), `jslex_`,
 `jsp_` (parser), `jsc_` (compiler), `vm_`/`vmop_` (interpreter), `jsb_`
-(built-ins), `jsi_`/`jsout_` (printing values),
+(built-ins), `jsi_`/`jsout_` (printing values), `jsd_` (the DOM in
+JavaScript),
 `gfx_`, `wm_`, `gui_`,
 `desktop_`, `term_`, `canvas_`, `sysmon_`, `browser_`, `shell_`, `cmd_`,
 `fmt_`, and plain names (`strlen`, `memcpy`) for `lib/string.asm`. Local

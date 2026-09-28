@@ -22,6 +22,8 @@ js_print_hook:          dq js_print_console
 
 section .bss
 alignb 8
+js_depth:               resd 1          ; js_eval / js_call_safe nesting
+js_realm:               resd 1          ; counts js_reset calls
 jsout_len:              resd 1
 jsi_top:                resd 1
 jsi_stack:              resq 8          ; objects being printed (cycles)
@@ -47,6 +49,7 @@ section .text
 ; js_reset: a fresh engine (heap, atoms, global object, built-ins)
 ; ------------------------------------------------------------------------------
 js_reset:
+    inc dword [js_realm]            ; whoever used the old heap must not any more
     call js_heap_reset
     call js_init_builtins
     ret
@@ -54,9 +57,39 @@ js_reset:
 ; ------------------------------------------------------------------------------
 ; js_eval: RSI = source, RCX = length -> RAX = completion value (the value of
 ; the last expression statement), CF=1 if the script threw (js_exception)
+; js_call_safe: RAX = function, RDX = this, RDI = arguments, ECX = count
+; -> RAX = its result, CF=1 if it threw
+; Both may be used while JavaScript is running (a native running more code):
+; an error then ends only the inner run.
 ; ------------------------------------------------------------------------------
 js_eval:
     push rbx
+    lea rbx, [js_eval_body]
+    jmp js_protected
+
+js_call_safe:
+    push rbx
+    lea rbx, [js_call]
+    jmp js_protected
+
+; js_eval_body: RSI/RCX = source -> RAX = completion value
+js_eval_body:
+    mov rax, JS_UNDEF
+    mov [vm_completion], rax
+    mov dword [vm_line], 0
+    call jsp_parse_script
+    call jsc_compile_script
+    xor edx, edx
+    call jsfn_new
+    BOX rax, rdx, JS_OBJ_BITS
+    mov rdx, [js_global]
+    BOX rdx, rcx, JS_OBJ_BITS
+    xor ecx, ecx
+    jmp js_call
+
+; js_protected: [RSP] = the caller's RBX, RBX = routine to run with the other
+; registers as its inputs. Errors land in js_eval_fail with RSP = js_catch_rsp.
+js_protected:
     push rcx
     push rdx
     push rsi
@@ -70,32 +103,45 @@ js_eval:
     push r13
     push r14
     push r15
+    ; the interpreter state of an outer run, restored afterwards
+    push qword [vm_sp]
+    push qword [vm_fp]
+    push qword [vm_completion]
+    mov r8d, [vm_line]
+    push r8
+    mov r8d, [vm_nesting]
+    push r8
+    push qword [js_catch_rsp]
     mov [js_catch_rsp], rsp
+    cmp dword [js_depth], 0
+    jne .nested
     mov qword [vm_sp], JS_STACK_ADDR
     mov qword [vm_fp], JS_FRAMES_ADDR
-    mov dword [vm_line], 0
     mov dword [vm_nesting], 0
     mov dword [vm_budget], JSVM_BUDGET
+    push rax
     mov rax, [timer_ticks]
     mov [vm_idle_tick], rax
-    mov rax, JS_UNDEF
-    mov [vm_completion], rax
+    pop rax
     finit                           ; x87 for % and Math (64-bit precision)
-    call jsp_parse_script
-    call jsc_compile_script
-    xor edx, edx
-    call jsfn_new
-    BOX rax, rdx, JS_OBJ_BITS
-    mov rdx, [js_global]
-    BOX rdx, rcx, JS_OBJ_BITS
-    xor ecx, ecx
-    call js_call
+.nested:
+    inc dword [js_depth]
+    call rbx
     clc
-    jmp js_eval_out
+    jmp js_protected_out
 js_eval_fail:                       ; js_throw_value lands here, RSP = js_catch_rsp
     mov rax, [js_exception]
     stc
-js_eval_out:
+js_protected_out:
+    dec dword [js_depth]            ; (keeps CF)
+    pop qword [js_catch_rsp]
+    pop r8
+    mov [vm_nesting], r8d
+    pop r8
+    mov [vm_line], r8d
+    pop qword [vm_completion]
+    pop qword [vm_fp]
+    pop qword [vm_sp]
     pop r15
     pop r14
     pop r13
@@ -337,6 +383,13 @@ jsi_value:
     je .function
     cmp esi, JK_ITER
     je .iterator
+    cmp esi, JK_OBJECT
+    jne .not_host
+    cmp dword [rbx + JOBJ_CLASS], JC_HOST
+    jb .not_host
+    call jsd_inspect
+    jmp .out
+.not_host:
     ; cycles
     mov esi, [jsi_top]
     lea rdi, [jsi_stack]
