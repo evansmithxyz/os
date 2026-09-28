@@ -324,12 +324,27 @@ class OSTestCase(unittest.TestCase):
     """
 
     shared_vm = False
+    disk_files: dict[str, bytes] = {}   # extra AFS files on the test's disk
     _class_vm: Machine | None = None
 
     @classmethod
+    def _image(cls) -> Path | None:
+        if not cls.disk_files:
+            return None
+        import mkimage  # noqa: E402 (tools/ is on sys.path)
+        image = bytearray(agbuild.IMAGE.read_bytes())
+        for name, data in cls.disk_files.items():
+            mkimage.add_file(image, name, data)
+        OUTPUT.mkdir(parents=True, exist_ok=True)
+        path = OUTPUT / f"{cls.__name__}.base.img"
+        path.write_bytes(image)
+        return path
+
+    @classmethod
     def setUpClass(cls) -> None:
+        cls._base_image = cls._image()
         if cls.shared_vm:
-            cls._class_vm = Machine(cls.__name__).start()
+            cls._class_vm = Machine(cls.__name__, image=cls._base_image).start()
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -341,7 +356,7 @@ class OSTestCase(unittest.TestCase):
         if self.shared_vm:
             self.vm = self._class_vm
         else:
-            self.vm = Machine(self.id().split(".", 1)[-1]).start()
+            self.vm = Machine(self.id().split(".", 1)[-1], image=self._base_image).start()
             self.addCleanup(self.vm.stop)
 
     def start_gui(self) -> Machine:

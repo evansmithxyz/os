@@ -70,7 +70,7 @@ COMMAND "arp",       cmd_arp,       0,            "arp                 ARP cache
 COMMAND "ping",      cmd_ping,      0,            "ping <host>         ICMP echo (IP address or domain name)"
 COMMAND "dns",       cmd_dns,       0,            "dns <domain>        Resolve a name with DNS"
 ALIAS   "nslookup",  cmd_dns,       0
-COMMAND "curl",      cmd_curl,      0,            "curl <url> [port]   HTTP(S) GET, e.g. curl https://example.com/"
+COMMAND "curl",      cmd_curl,      0,            "curl [-k] <url>     HTTP(S) GET, e.g. curl https://example.com/"
 ALIAS   "http",      cmd_curl,      0
 COMMAND "tcplisten", cmd_tcplisten, 0,            "tcplisten [port]    Serve a web page (host: http://localhost:8888)"
 
@@ -85,6 +85,7 @@ COMMAND "mem",       cmd_mem,       0,            "mem                 Memory ma
 COMMAND "regs",      cmd_regs,      0,            "regs                Register snapshot"
 COMMAND "uptime",    cmd_uptime,    0,            "uptime              Time since boot"
 ALIAS   "ticks",     cmd_uptime,    0
+COMMAND "date",      cmd_date,      0,            "date                Date and time (UTC, from the CMOS clock)"
 COMMAND "reboot",    cmd_reboot,    0,            "reboot              Restart the machine"
 COMMAND "halt",      cmd_halt,      0,            "halt                Stop the CPU"
 COMMAND "cryptotest", cmd_cryptotest, 0,           "cryptotest          Run the TLS crypto self-test (hex output)"

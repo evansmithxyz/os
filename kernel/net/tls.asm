@@ -1,11 +1,11 @@
 ; ==============================================================================
-; Antigravity OS - TLS 1.3 client (RFC 8446), phase 1
+; Antigravity OS - TLS 1.3 client (RFC 8446)
 ; ------------------------------------------------------------------------------
 ; One cipher suite, TLS_CHACHA20_POLY1305_SHA256, with an X25519 key share.
-; The handshake is authenticated only by the Finished messages: the server's
-; certificate chain and CertificateVerify signature are hashed into the
-; transcript but NOT checked, so a man in the middle could impersonate the
-; server. Everything that shows a TLS page says so.
+; The server proves who it is with its certificate chain (checked by x509.asm
+; against the trusted roots, the clock and the host name) and a
+; CertificateVerify signature over the transcript. With tls_insecure set
+; (curl -k) those checks are skipped and callers say so.
 ;
 ; Data flow: TCP puts every received segment into tls_in_buf (tcp_rx_to_tls),
 ; tls_read_record takes whole records out of it, handshake messages are
@@ -43,6 +43,11 @@ TLS_DIR_SIZE            equ 56
 section .data
 align 8
 tls_error_msg:          dq 0        ; why the last tls_https_get failed
+tls_host:               dq 0        ; host name being verified
+tls_insecure:           db 0        ; 1 = skip certificate checks (curl -k); set by the caller
+tls_verified:           db 0        ; 1 = the last connection's certificate was verified
+tls_got_cert:           db 0
+tls_got_cv:             db 0
 
 section .bss
 alignb 16
@@ -54,6 +59,8 @@ tls_got_version:        resb 1
 tls_got_key:            resb 1
 alignb 16
 tls_hs_buf:             resb TLS_HS_MAX
+tls_cert_buf:           resb TLS_HS_MAX ; the Certificate message (x509_chain points into it)
+tls_cv_content:         resb 64 + 34 + 32
 tls_out_buf:            resb TLS_OUT_MAX + 32
 tls_th_ctx:             resb SHA256_CTX_SIZE    ; running transcript hash
 tls_th_tmp:             resb SHA256_CTX_SIZE
@@ -124,10 +131,17 @@ tls_err_unexpected:     db "unexpected handshake message", 0
 tls_err_certreq:        db "server requires a client certificate", 0
 tls_err_big:            db "handshake message too large", 0
 tls_err_record:         db "malformed record", 0
+tls_err_cv_alg:         db "unsupported CertificateVerify algorithm", 0
+tls_err_cv_bad:         db "server's CertificateVerify signature is invalid", 0
+tls_err_no_auth:        db "server did not prove its identity", 0
+tls_err_cert_msg:       db "malformed Certificate message", 0
+tls_cv_context:         db "TLS 1.3, server CertificateVerify", 0   ; 33 bytes + the 0
+klog_tls_insecure:      db "tls: certificate NOT verified (insecure mode)", 0
 
 klog_tls_error:         db "tls: error: ", 0
 klog_tls_alert:         db "tls: alert ", 0
-klog_tls_done:          db "tls: handshake done (TLS 1.3, CHACHA20_POLY1305_SHA256), certificate NOT verified", 0
+klog_tls_done:          db "tls: handshake done (TLS 1.3, CHACHA20_POLY1305_SHA256)", 0
+klog_tls_verified:      db "tls: certificate verified for ", 0
 klog_tls_bytes:         db "tls: response bytes ", 0
 
 section .text
@@ -368,6 +382,19 @@ tls_wait:
     mov dword [tls_in_pos], 0
     rep movsb
     pop rcx
+    ; the window we advertised had (nearly) closed: tell the sender there is
+    ; room again rather than wait for its window probe
+    cmp dword [tcp_last_window], TLS_RECORD_MAX
+    jae .poll
+    cmp byte [tcp_active_state], TCP_STATE_ESTABLISHED
+    jne .poll
+    push rax
+    push rcx
+    mov al, TCP_FLAG_ACK
+    xor ecx, ecx
+    call tcp_send_segment
+    pop rcx
+    pop rax
 .poll:
     call net_wait_step
     cmp [tls_in_len], r8d
@@ -1032,16 +1059,30 @@ tls_read_server_flight:
     je .cert_request
     cmp al, TLS_HS_ENC_EXTENSIONS
     je .hash_it
-    cmp al, TLS_HS_CERTIFICATE      ; phase 1: not verified
-    je .hash_it
-    cmp al, TLS_HS_CERT_VERIFY      ; phase 1: not verified
+    cmp al, TLS_HS_CERTIFICATE
+    jne .not_certificate
+    call tls_process_certificate    ; chain, dates and host name
+    jc .out
+    jmp .hash_it
+.not_certificate:
+    cmp al, TLS_HS_CERT_VERIFY
     jne .unexpected
+    call tls_process_cert_verify    ; before it joins the transcript
+    jc .out
 .hash_it:
     call tls_th_update
     call tls_hs_consume
     jmp .message
 
 .finished:
+    ; the server must have proved its identity first (unless told not to check)
+    cmp byte [tls_insecure], 0
+    jne .auth_ok
+    cmp byte [tls_got_cert], 1
+    jne .no_auth
+    cmp byte [tls_got_cv], 1
+    jne .no_auth
+.auth_ok:
     ; verify_data = HMAC(finished_key, Hash(ClientHello..CertificateVerify))
     cmp ecx, 4 + 32
     jne .bad_finished
@@ -1096,6 +1137,10 @@ tls_read_server_flight:
     lea rsi, [tls_err_finished]
     call tls_fail
     jmp .out
+.no_auth:
+    lea rsi, [tls_err_no_auth]
+    call tls_fail
+    jmp .out
 .fail:
     stc
 .out:
@@ -1104,6 +1149,221 @@ tls_read_server_flight:
     pop rsi
     pop rdx
     pop rcx
+    pop rax
+    ret
+
+; ------------------------------------------------------------------------------
+; tls_process_certificate: RSI = Certificate message, ECX = its length.
+; Keeps a copy, parses up to X509_MAX_CHAIN certificates into x509_chain and,
+; unless tls_insecure, verifies them for tls_host. CF=1 on failure.
+; ------------------------------------------------------------------------------
+tls_process_certificate:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    cmp byte [tls_insecure], 0
+    jne .ok
+    ; copy: x509_chain will point into it after tls_hs_buf moves on
+    lea rdi, [tls_cert_buf]
+    push rdi
+    rep movsb
+    pop rsi
+    mov r9, rdi                     ; R9 = end
+    add rsi, 4                      ; handshake header
+    ; certificate_request_context<0..255>
+    lea rax, [rsi + 4]
+    cmp rax, r9
+    ja .malformed
+    movzx eax, byte [rsi]
+    lea rsi, [rsi + rax + 1]
+    ; certificate_list<0..2^24-1>
+    lea rax, [rsi + 3]
+    cmp rax, r9
+    ja .malformed
+    call .u24
+    add rsi, 3
+    lea r10, [rsi + rax]            ; R10 = end of the list
+    cmp r10, r9
+    ja .malformed
+    xor r8d, r8d                    ; R8 = certificates kept
+    lea rdi, [x509_chain]
+.entry:
+    lea rax, [rsi + 3]
+    cmp rax, r10
+    ja .list_done
+    cmp r8d, X509_MAX_CHAIN
+    jae .list_done
+    call .u24                       ; cert_data<1..2^24-1>
+    add rsi, 3
+    lea rdx, [rsi + rax]
+    cmp rdx, r10
+    ja .malformed
+    mov ecx, eax
+    call x509_parse
+    jnc .kept
+    test r8d, r8d                   ; an unreadable extra certificate is skipped,
+    jz .malformed                   ; an unreadable server certificate is fatal
+    jmp .extensions
+.kept:
+    inc r8d
+    add rdi, CERT_SIZE
+.extensions:
+    mov rsi, rdx
+    lea rax, [rsi + 2]              ; extensions<0..2^16-1>
+    cmp rax, r10
+    ja .malformed
+    movzx eax, word [rsi]
+    xchg al, ah
+    lea rsi, [rsi + rax + 2]
+    jmp .entry
+.list_done:
+    mov [x509_chain_count], r8d
+    mov rsi, [tls_host]
+    call x509_verify_chain
+    jc .x509_failed
+    mov byte [tls_got_cert], 1
+.ok:
+    clc
+    jmp .out
+.x509_failed:
+    mov rsi, [x509_error]
+    call tls_fail
+    jmp .out
+.malformed:
+    lea rsi, [tls_err_cert_msg]
+    call tls_fail
+.out:
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+; .u24: RSI = 24-bit big-endian length -> EAX
+.u24:
+    movzx eax, byte [rsi]
+    shl eax, 8
+    mov al, [rsi + 1]
+    shl eax, 8
+    mov al, [rsi + 2]
+    ret
+
+; ------------------------------------------------------------------------------
+; tls_process_cert_verify: RSI = CertificateVerify message, ECX = its length.
+; Checks the signature over 64 spaces | context string | 0 | transcript hash
+; with the server certificate's key. CF=1 on failure.
+; ------------------------------------------------------------------------------
+tls_process_cert_verify:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    cmp byte [tls_insecure], 0
+    jne .ok
+    cmp byte [tls_got_cert], 1
+    jne .no_auth
+    ; body: SignatureScheme algorithm, signature<0..2^16-1>
+    cmp ecx, 4 + 4
+    jb .bad
+    movzx eax, word [rsi + 4]
+    xchg al, ah                     ; AX = SignatureScheme
+    movzx r8d, byte [rsi + 6]
+    shl r8d, 8
+    mov r8b, [rsi + 7]              ; R8 = signature length
+    lea edx, [r8d + 8]
+    cmp edx, ecx
+    ja .bad
+    lea rdx, [rsi + 8]              ; RDX = signature
+    ; scheme -> hash (| RSA scheme << 8) and the key type it needs
+    lea rbx, [x509_chain + CERT_PK]
+    mov cl, [rbx + PK_TYPE]
+    mov ch, PK_TYPE_P256
+    cmp ax, 0x0403                  ; ecdsa_secp256r1_sha256
+    mov eax, HASH_SHA256
+    je .check_key
+    movzx eax, word [rsi + 4]
+    xchg al, ah
+    mov ch, PK_TYPE_P384
+    cmp ax, 0x0503                  ; ecdsa_secp384r1_sha384
+    mov eax, HASH_SHA384
+    je .check_key
+    movzx eax, word [rsi + 4]
+    xchg al, ah
+    mov ch, PK_TYPE_RSA
+    cmp ax, 0x0804                  ; rsa_pss_rsae_sha256
+    mov eax, HASH_SHA256 | (RSA_SCHEME_PSS << 8)
+    je .check_key
+    movzx eax, word [rsi + 4]
+    xchg al, ah
+    cmp ax, 0x0805                  ; rsa_pss_rsae_sha384
+    mov eax, HASH_SHA384 | (RSA_SCHEME_PSS << 8)
+    je .check_key
+    movzx eax, word [rsi + 4]
+    xchg al, ah
+    cmp ax, 0x0806                  ; rsa_pss_rsae_sha512
+    mov eax, HASH_SHA512 | (RSA_SCHEME_PSS << 8)
+    jne .alg
+.check_key:
+    cmp cl, ch
+    jne .alg
+.content:
+    ; 64 spaces | "TLS 1.3, server CertificateVerify" | 0 | Hash(ClientHello..Certificate)
+    push rax
+    push rsi
+    lea rdi, [tls_cv_content]
+    mov al, ' '
+    mov ecx, 64
+    rep stosb
+    lea rsi, [tls_cv_context]
+    mov ecx, 34
+    rep movsb
+    call tls_th_snapshot
+    lea rsi, [tls_th]
+    mov ecx, 32
+    rep movsb
+    pop rsi
+    pop rax
+    lea rsi, [tls_cv_content]
+    mov ecx, 64 + 34 + 32
+    call sig_verify
+    jc .bad_sig
+    mov byte [tls_got_cv], 1
+.ok:
+    clc
+    jmp .out
+.alg:
+    lea rsi, [tls_err_cv_alg]
+    call tls_fail
+    jmp .out
+.bad_sig:
+    lea rsi, [tls_err_cv_bad]
+    call tls_fail
+    jmp .out
+.no_auth:
+    lea rsi, [tls_err_no_auth]
+    call tls_fail
+    jmp .out
+.bad:
+    lea rsi, [tls_err_cert_msg]
+    call tls_fail
+.out:
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
     pop rax
     ret
 
@@ -1216,7 +1476,9 @@ tls_read_response:
     jmp .done
 .data:
     call tls_resp_append
-    jmp .record
+    cmp dword [http_resp_len], HTTP_RESP_MAX
+    jb .record                      ; full: the rest would be thrown away anyway
+    jmp .done
 .post_handshake:
     call tls_hs_append
     jc .failed
@@ -1286,7 +1548,8 @@ tls_resp_append:
 ;         DX = port, R8 = path (0 = "/")
 ; Output: RAX = 0 on success (http_resp_buf / http_resp_len hold the response),
 ;         1 on failure (tls_error_msg says why)
-; The certificate is NOT verified (phase 1).
+; The certificate is verified unless tls_insecure is set; tls_verified says
+; whether it was.
 ; ==============================================================================
 tls_https_get:
     push rbx
@@ -1303,6 +1566,11 @@ tls_https_get:
     mov r13, r8                     ; R13 = path
 
     mov qword [tls_error_msg], 0
+    mov [tls_host], r15
+    mov byte [tls_verified], 0
+    mov byte [tls_got_cert], 0
+    mov byte [tls_got_cv], 0
+    mov dword [x509_chain_count], 0
     mov dword [http_resp_len], 0
     mov byte [http_resp_buf], 0
     mov dword [tls_in_len], 0
@@ -1335,6 +1603,17 @@ tls_https_get:
     call tls_finish_handshake
     lea rsi, [klog_tls_done]
     call klog
+    lea rsi, [klog_tls_insecure]
+    cmp byte [tls_insecure], 0
+    jne .say_trust
+    mov byte [tls_verified], 1
+    lea rsi, [klog_tls_verified]
+    mov rdi, r15
+    call klog2
+    jmp .trust_said
+.say_trust:
+    call klog
+.trust_said:
 
     mov rdi, r15
     mov r8, r13
@@ -1358,6 +1637,7 @@ tls_https_get:
     call klog2
     mov eax, 1
 .out:
+    call tcp_abort                  ; still open (big page, error): reset it
     mov byte [tcp_rx_to_tls], 0
     pop r15
     pop r13

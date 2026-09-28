@@ -51,6 +51,7 @@ http_quiet:             db 0        ; 1 = tcp_http_client prints nothing (browse
 tcp_rx_to_tls:          db 0        ; 1 = received data goes to tls_in_buf, not http_resp_buf
 align 4
 http_resp_len:          dd 0        ; bytes in http_resp_buf (NUL-terminated)
+tcp_last_window:        dd 0        ; receive window in the last segment we sent
 
 section .bss
 alignb 16
@@ -183,9 +184,20 @@ tcp_send_segment:
     ; TCP Flags
     mov byte [rax + 25], r8b
 
-    ; Window Size = 16384 (0x4000 in Big Endian)
-    mov byte [rax + 26], 0x40
-    mov byte [rax + 27], 0x00
+    ; Window: 16384, or the free space in tls_in_buf while TLS is reading, so
+    ; the sender never sends more than we can keep
+    mov ebx, 0x4000
+    cmp byte [tcp_rx_to_tls], 0
+    je .window
+    mov ebx, TLS_IN_MAX
+    sub ebx, [tls_in_len]
+    cmp ebx, 0xFFFF
+    jbe .window
+    mov ebx, 0xFFFF
+.window:
+    mov [tcp_last_window], ebx
+    mov byte [rax + 26], bh
+    mov byte [rax + 27], bl
 
     ; Checksum = 0 initially
     mov word [rax + 28], 0
@@ -958,6 +970,26 @@ tcp_server_start:
     pop rdx
     pop rcx
     pop rbx
+    pop rax
+    ret
+
+; ------------------------------------------------------------------------------
+; tcp_abort: reset the client connection if it is still open (RST), so data
+; the server is still sending is not taken for the next request
+; ------------------------------------------------------------------------------
+tcp_abort:
+    push rax
+    push rcx
+    cmp byte [tcp_active_state], TCP_STATE_CLOSED
+    je .done
+    cmp byte [tcp_is_server], 0
+    jne .done
+    mov al, TCP_FLAG_RST | TCP_FLAG_ACK
+    xor ecx, ecx
+    call tcp_send_segment
+    mov byte [tcp_active_state], TCP_STATE_CLOSED
+.done:
+    pop rcx
     pop rax
     ret
 

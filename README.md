@@ -27,11 +27,10 @@ windowed desktop with i3-style workspaces.
   persist on disk.
 - **Network:** RTL8139 driver plus Ethernet, ARP, IPv4, ICMP (`ping`), UDP,
   DNS, TCP, an HTTP/HTTPS client (`curl`) and an HTTP server (`tcplisten`).
-- **TLS 1.3 (phase 1):** `https://` in `curl` and the browser, using X25519
-  and ChaCha20-Poly1305 written in assembly. **Certificates are not verified
-  yet**, so the connection is encrypted but the server could be an impostor.
-  The browser marks every HTTPS page `UNVERIFIED TLS`, and `curl` prints a
-  warning.
+- **TLS 1.3:** `https://` in `curl` and the browser, all in assembly:
+  X25519, ChaCha20-Poly1305, SHA-2, and certificate verification with RSA
+  (PKCS#1 v1.5 and PSS, up to 4096 bits) and ECDSA (P-256, P-384) against the
+  Mozilla root store, the CMOS clock and the host name.
 - **Shell:** about 30 commands, Tab completion, history (Up/Down) and Ctrl+C.
 - **Desktop:**
   - 1024×768×32 graphics through the Bochs/QEMU display adapter.
@@ -113,9 +112,27 @@ URL into the browser. `tcplisten` serves a page that your host can open at
 
 HTTPS speaks TLS 1.3 with one cipher suite, `TLS_CHACHA20_POLY1305_SHA256`,
 and one key exchange, X25519. Servers that only offer AES-GCM (rare, since
-TLS 1.3 servers normally support ChaCha20) fail with a handshake alert. The
-server's certificate and signature are not checked yet, only the Finished
-messages. `cryptotest` runs the crypto primitives on the RFC test vectors.
+TLS 1.3 servers normally support ChaCha20) fail with a handshake alert.
+
+The server must prove who it is: its certificate chain has to lead to a
+trusted root, every certificate has to be within its validity period (`date`
+shows the clock it is checked against), intermediates have to be CAs, the
+server certificate has to name the host (subjectAltName, `*.` wildcards,
+IP addresses), and its CertificateVerify signature has to check out. If not,
+the browser shows *Secure Connection Failed* with the reason and `curl`
+prints it; `curl -k` skips the checks and says so. Not checked: revocation
+(OCSP/CRL), name constraints and path length limits.
+
+Trusted roots:
+
+- the Mozilla set, compiled into the kernel from `kernel/data/roots.der`
+  (regenerate with `python tools/mkroots.py`, which reads the host's
+  `/etc/ssl/certs/ca-certificates.crt`; `kernel/data/roots.txt` lists them)
+- your own: DER certificates back to back in the AFS file `localca.der`,
+  e.g. `python tools/mkimage.py add build/os.img myca.der --name localca.der`
+
+`cryptotest` runs the crypto on the RFC test vectors and fixed RSA and ECDSA
+signatures (`tools/gen_cryptotest.py`).
 
 ## Project layout
 
@@ -133,8 +150,11 @@ kernel/
   drivers/              serial, vga_text, keyboard, mouse, pci, ata, rtl8139, bga
   console/console.asm   output routing (VGA / GUI terminal / serial) and the key queue
   fs/afs.asm            AntigravityFS
-  net/                  eth (ARP), ipv4 (ICMP), udp (DNS), tcp (HTTP), url, tls (TLS 1.3 client)
-  crypto/               sha256 + HMAC, chacha20poly1305, x25519, random
+  net/                  eth (ARP), ipv4 (ICMP), udp (DNS), tcp (HTTP), url,
+                        tls (TLS 1.3 client), x509 (certificates and chains)
+  crypto/               sha256 + HMAC, sha512/384, chacha20poly1305, x25519,
+                        bignum (Montgomery), rsa, ecc (ECDSA P-256/P-384), random
+  data/roots.der        trusted root certificates (tools/mkroots.py)
   gfx/                  clipped 2D drawing, font, back buffer, mouse pointer
   gui/                  window manager + event loop, taskbar/footer, theme colours
   apps/                 terminal, browser, canvas, sysmon windows

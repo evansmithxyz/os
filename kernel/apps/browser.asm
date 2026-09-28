@@ -36,7 +36,7 @@ browser_url_focused:    db 0        ; 1 = URL bar has keyboard focus
 browser_in_link:        db 0
 browser_href_set:       db 0        ; current <a> tag had an href
 browser_log_text:       db 0        ; 1 = next render logs the page's first text
-browser_page_tls:       db 0        ; 1 = page came over TLS; certificate NOT verified
+browser_page_tls:       db 0        ; 1 = page came over TLS with a verified certificate
 browser_redirects:      db 0        ; redirects followed for the current navigation
 align 4
 browser_log_len:        dd 0
@@ -353,9 +353,9 @@ browser_navigate:
 
 ; ------------------------------------------------------------------------------
 ; browser_fetch_http: GET browser_url_buf (http:// or https://) into the page
-; buffer, following up to BROWSER_MAX_REDIRECTS redirects. An https:// page
-; sets browser_page_tls: its certificate was NOT verified, which the address
-; bar, the status bar and the badge all show.
+; buffer, following up to BROWSER_MAX_REDIRECTS redirects. An https:// page is
+; only shown if its certificate verifies; it sets browser_page_tls, which the
+; address bar and the badge show.
 ; ------------------------------------------------------------------------------
 browser_fetch_http:
     push rax
@@ -395,6 +395,7 @@ browser_fetch_http:
     jnz .fail
     jmp .fetched
 .https:
+    mov byte [tls_insecure], 0      ; the browser always checks certificates
     call tls_https_get
     mov byte [http_quiet], 0
     test rax, rax
@@ -461,12 +462,6 @@ browser_fetch_http:
     mov ecx, 64
     call strlcpy
     lea rdi, [browser_scratch]
-    mov byte [rdi], 0
-    cmp byte [browser_page_tls], 0
-    je .status_start
-    lea rsi, [STR_STATUS_UNVERIFIED]
-    call fmt_str
-.status_start:
     lea rsi, [http_resp_buf]
     xor ecx, ecx
 .status_line:
@@ -886,8 +881,8 @@ browser_draw_window:
     mov eax, THEME_GREEN
     cmp byte [browser_page_tls], 0
     je .url_icon
-    lea rsi, [STR_URL_ICON_TLS]     ; encrypted, but the server is not verified
-    mov eax, THEME_YELLOW
+    lea rsi, [STR_URL_ICON_TLS]     ; encrypted, certificate verified
+    mov eax, THEME_GREEN_LIGHT
 .url_icon:
     mov ebx, -1
     call gfx_print_string
@@ -1098,10 +1093,6 @@ browser_draw_window:
     sub edx, 16
     lea rsi, [browser_status_text]
     mov eax, THEME_GREEN
-    cmp byte [browser_page_tls], 0
-    je .status_color
-    mov eax, THEME_YELLOW
-.status_color:
     mov ebx, -1
     call gfx_print_string
 
@@ -1116,8 +1107,8 @@ browser_draw_window:
     mov eax, THEME_TEXT_MUTED
     cmp byte [browser_page_tls], 0
     je .badge
-    lea rsi, [STR_BADGE_UNVERIFIED]
-    mov eax, THEME_RED
+    lea rsi, [STR_BADGE_VERIFIED]
+    mov eax, THEME_GREEN_LIGHT
 .badge:
     mov ebx, -1
     call gfx_print_string
@@ -2195,16 +2186,17 @@ PAGE_TLS_FAIL_HTML:
     db "<html><head><title>Secure Connection Failed</title></head>", 0x0A
     db "<body>", 0x0A
     db "<h1>Secure Connection Failed</h1>", 0x0A
-    db "<p>The TLS 1.3 handshake did not complete. The reason is in the status bar.</p>", 0x0A
-    db "<p>CyberSurf speaks TLS 1.3 with ChaCha20-Poly1305 and X25519 only.</p>", 0x0A
+    db "<p>The TLS 1.3 connection was not made. The reason is in the status bar.</p>", 0x0A
+    db "<p>CyberSurf only shows HTTPS pages from servers whose certificate chains to a trusted root, "
+    db "is currently valid and names this host. Add your own CA to the disk file localca.der to trust it.</p>", 0x0A
+    db "<p>It speaks TLS 1.3 with ChaCha20-Poly1305 and X25519 only.</p>", 0x0A
     db "<hr>", 0x0A
     db "<p><a href='http://antigravity.os/'>Return to Home Portal</a></p>", 0x0A
     db "</body></html>", 0
 
 STR_TITLE_TLS_FAIL:     db "CyberSurf - Secure Connection Failed", 0
 STR_STATUS_TLS_FAIL:    db "Error: TLS ", 0
-STR_STATUS_UNVERIFIED:  db "CERT NOT VERIFIED | ", 0
-STR_BADGE_UNVERIFIED:   db "UNVERIFIED TLS", 0
+STR_BADGE_VERIFIED:     db "TLS 1.3 VERIFIED", 0
 STR_URL_ICON_TLS:       db "TLS", 0
 STR_HDR_LOCATION:       db "location:", 0
 klog_browser_redirect:  db "browser: redirect -> ", 0

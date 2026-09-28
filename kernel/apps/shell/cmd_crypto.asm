@@ -15,6 +15,7 @@ section .bss
 alignb 16
 ct_out:                 resb 64
 ct_buf:                 resb 256
+ct_pk:                  resb PK_SIZE
 
 section .rodata
 ct_msg_sha_abc:         db "sha256 abc: ", 0
@@ -31,6 +32,38 @@ ct_msg_x_rfc:           db "x25519 rfc: ", 0
 ct_msg_x_base:          db "x25519 base: ", 0
 ct_msg_x_shared:        db "x25519 shared: ", 0
 ct_msg_rand:            db "random: ", 0
+ct_msg_sha384:          db "sha384 abc: ", 0
+ct_msg_sha512:          db "sha512 200: ", 0
+ct_msg_ok:              db ": ok", 0x0A, 0
+ct_msg_failed:          db ": FAILED", 0x0A, 0
+ct_msg_rejected:        db " tampered: rejected", 0x0A, 0
+ct_msg_accepted:        db " tampered: ACCEPTED", 0x0A, 0
+ct_name_rsa_pkcs1:      db "rsa2048 pkcs1 sha256", 0
+ct_name_rsa_pss:        db "rsa2048 pss sha256", 0
+ct_name_rsa4096:        db "rsa4096 pkcs1 sha384", 0
+ct_name_p256:           db "ecdsa p256 sha256", 0
+ct_name_p384:           db "ecdsa p384 sha384", 0
+ct_name_p256_384:       db "ecdsa p256 sha384", 0
+
+%include "apps/shell/cryptotest_vectors.inc"
+
+; signature checks: name, key type, hash | scheme << 8, key A, A length,
+; key B (RSA exponent), B length, signature, signature length
+%macro CT_SIG 9
+    dq %1
+    dd %2, %3
+    dq %4, %5, %6, %7, %8, %9
+%endmacro
+CT_SIG_SIZE             equ 64
+align 8
+ct_sig_table:
+    CT_SIG ct_name_rsa_pkcs1, PK_TYPE_RSA, HASH_SHA256, ctv_rsa2048_n, ctv_rsa2048_n_len, ctv_rsa_e, ctv_rsa_e_len, ctv_rsa2048_pkcs1_sha256, ctv_rsa2048_pkcs1_sha256_len
+    CT_SIG ct_name_rsa_pss, PK_TYPE_RSA, HASH_SHA256 | (RSA_SCHEME_PSS << 8), ctv_rsa2048_n, ctv_rsa2048_n_len, ctv_rsa_e, ctv_rsa_e_len, ctv_rsa2048_pss_sha256, ctv_rsa2048_pss_sha256_len
+    CT_SIG ct_name_rsa4096, PK_TYPE_RSA, HASH_SHA384, ctv_rsa4096_n, ctv_rsa4096_n_len, ctv_rsa_e, ctv_rsa_e_len, ctv_rsa4096_pkcs1_sha384, ctv_rsa4096_pkcs1_sha384_len
+    CT_SIG ct_name_p256, PK_TYPE_P256, HASH_SHA256, ctv_p256_sha256_pub, ctv_p256_sha256_pub_len, 0, 0, ctv_p256_sha256_sig, ctv_p256_sha256_sig_len
+    CT_SIG ct_name_p384, PK_TYPE_P384, HASH_SHA384, ctv_p384_sha384_pub, ctv_p384_sha384_pub_len, 0, 0, ctv_p384_sha384_sig, ctv_p384_sha384_sig_len
+    CT_SIG ct_name_p256_384, PK_TYPE_P256, HASH_SHA384, ctv_p256_sha384_pub, ctv_p256_sha384_pub_len, 0, 0, ctv_p256_sha384_sig, ctv_p256_sha384_sig_len
+ct_sig_table_end:
 
 ct_abc:                 db "abc"
 ct_jefe:                db "Jefe"
@@ -229,4 +262,76 @@ cmd_cryptotest:
     call ct_hex_line
     call rand_bytes
     call ct_hex_line
+
+    ; SHA-384 of "abc", SHA-512 of bytes 0..199
+    lea rsi, [ct_abc]
+    mov ecx, 3
+    lea rdi, [ct_out]
+    call sha384
+    lea rsi, [ct_msg_sha384]
+    mov ecx, 48
+    call ct_hex_line
+    lea rdi, [ct_buf]
+    mov ecx, 200
+    xor eax, eax
+    call ct_counting_bytes
+    mov rsi, rdi
+    lea rdi, [ct_out]
+    call sha512
+    lea rsi, [ct_msg_sha512]
+    mov ecx, 64
+    call ct_hex_line
+
+    ; signatures over ctv_msg: each must verify, and fail with one bit flipped
+    lea r15, [ct_sig_table]
+.sig:
+    lea rax, [ct_sig_table_end]
+    cmp r15, rax
+    jae .sig_done
+    mov rsi, [r15]
+    call con_puts
+    lea rbx, [ct_pk]
+    mov eax, [r15 + 8]
+    mov [rbx + PK_TYPE], al
+    mov rax, [r15 + 16]
+    mov [rbx + PK_A], rax
+    mov rax, [r15 + 24]
+    mov [rbx + PK_A_LEN], eax
+    mov rax, [r15 + 32]
+    mov [rbx + PK_B], rax
+    mov rax, [r15 + 40]
+    mov [rbx + PK_B_LEN], eax
+    ; message into ct_buf so it can be tampered with
+    lea rsi, [ctv_msg]
+    lea rdi, [ct_buf]
+    mov ecx, ctv_msg_len
+    rep movsb
+    call .verify
+    lea rsi, [ct_msg_ok]
+    jnc .sig_result
+    lea rsi, [ct_msg_failed]
+.sig_result:
+    call con_puts
+    mov rsi, [r15]
+    call con_puts
+    xor byte [ct_buf + 3], 0x10
+    call .verify
+    lea rsi, [ct_msg_rejected]
+    jc .tamper_result
+    lea rsi, [ct_msg_accepted]
+.tamper_result:
+    call con_puts
+    add r15, CT_SIG_SIZE
+    jmp .sig
+.sig_done:
     ret
+
+; .verify: ct_buf / ct_pk against table entry R15 -> CF from the verifier
+.verify:
+    lea rbx, [ct_pk]
+    mov eax, [r15 + 12]             ; hash | scheme << 8
+    lea rsi, [ct_buf]
+    mov ecx, ctv_msg_len
+    mov rdx, [r15 + 48]
+    mov r8, [r15 + 56]
+    jmp sig_verify

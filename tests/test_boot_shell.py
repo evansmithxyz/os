@@ -1,5 +1,6 @@
 """Boot, shell basics, command table, history and completion (serial console)."""
 
+import datetime
 import time
 import unittest
 
@@ -36,6 +37,13 @@ class BootTest(OSTestCase):
         self.assertRegex(out, r"Vendor:\s+(GenuineIntel|AuthenticAMD)")
         self.assertIn("Long mode:  active", out)
 
+    def test_date_is_host_utc(self):
+        """QEMU's CMOS clock starts at the host's UTC time (certificates depend on it)."""
+        out = self.vm.run("date").strip()
+        shown = datetime.datetime.strptime(out, "%Y-%m-%d %H:%M:%S UTC").replace(tzinfo=datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        self.assertLess(abs((now - shown).total_seconds()), 120, out)
+
     def test_uptime_advances(self):
         first = int(self.vm.run("uptime").split("(")[1].split()[0])
         time.sleep(0.3)
@@ -55,7 +63,7 @@ class ShellTest(OSTestCase):
         out = self.vm.run("help")
         for heading in ("Files", "Network", "System", "Desktop"):
             self.assertIn(heading, out)
-        for command in ("ls", "cat <file>", "ping <host>", "curl <url>", "gui", "browser [url]"):
+        for command in ("ls", "cat <file>", "ping <host>", "curl [-k] <url>", "gui", "browser [url]"):
             self.assertIn(command, out)
         self.assertNotIn("crash", out, "hidden commands must not be listed")
 
