@@ -20,6 +20,10 @@ js_boolean_proto:       resq 1
 js_global:              resq 1          ; the global object
 js_error_protos:        resq JE_COUNT   ; Error.prototype, TypeError.prototype, ... (JE_*)
 
+section .bss
+alignb 16
+jsobj_cache:            resb 16 * 1024  ; object (dword), key (dword), entry (JSOBJ_CACHE_BITS)
+
 section .text
 
 ; ------------------------------------------------------------------------------
@@ -44,11 +48,19 @@ jsobj_new_plain:
 
 ; ------------------------------------------------------------------------------
 ; jsobj_find_own: RAX = object, EDX = atom -> RBX = entry, CF=0 if found
-; (CF=1 when the object has no such own property)
+; (CF=1 when the object has no such own property). Objects with more than
+; JSOBJ_CACHE_MIN properties (prototypes, big objects) go through a small
+; cache of (object, key) -> entry; a hit is checked against the object's
+; current entries, so it can never be stale.
 ; ------------------------------------------------------------------------------
+JSOBJ_CACHE_MIN         equ 8
+JSOBJ_CACHE_BITS        equ 10
+
 jsobj_find_own:
     push rcx
     mov ecx, [rax + JOBJ_COUNT]
+    cmp ecx, JSOBJ_CACHE_MIN
+    ja jsobj_find_cached
     mov rbx, [rax + JOBJ_PROPS]
 .loop:
     test ecx, ecx
@@ -63,6 +75,61 @@ jsobj_find_own:
     clc
     ret
 .missing:
+    pop rcx
+    stc
+    ret
+
+; jsobj_find_cached: (jsobj_find_own, [RSP] = RCX, ECX = count)
+jsobj_find_cached:
+    push rsi
+    push rdi
+    ; the cache slot for (object, key)
+    mov edi, eax
+    xor edi, edx
+    imul edi, edi, -1640531535      ; (0x9E3779B1)
+    shr edi, 32 - JSOBJ_CACHE_BITS
+    shl edi, 4
+    lea rsi, [jsobj_cache + rdi]
+    cmp [rsi], eax
+    jne .scan
+    cmp [rsi + 4], edx
+    jne .scan
+    ; still that key's entry in this object?
+    mov rbx, [rsi + 8]
+    mov rdi, rbx
+    sub rdi, [rax + JOBJ_PROPS]
+    jb .scan
+    test edi, 15
+    jnz .scan
+    shr rdi, 4
+    cmp edi, ecx
+    jae .scan
+    cmp [rbx + JPE_KEY], edx
+    jne .scan
+    jmp .hit
+.scan:
+    mov rbx, [rax + JOBJ_PROPS]
+.entry:
+    test ecx, ecx
+    jz .missing
+    cmp [rbx + JPE_KEY], edx
+    je .found
+    add rbx, JPE_SIZE
+    dec ecx
+    jmp .entry
+.found:
+    mov [rsi], eax
+    mov [rsi + 4], edx
+    mov [rsi + 8], rbx
+.hit:
+    pop rdi
+    pop rsi
+    pop rcx
+    clc
+    ret
+.missing:
+    pop rdi
+    pop rsi
     pop rcx
     stc
     ret

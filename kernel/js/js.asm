@@ -60,6 +60,7 @@ section .text
 ; ------------------------------------------------------------------------------
 js_reset:
     inc dword [js_realm]            ; whoever used the old heap must not any more
+    mov byte [jsc_dump], 0
     call js_heap_reset
     call js_init_builtins
     ret
@@ -189,18 +190,18 @@ js_compile_dump:
 .body:
     inc dword [jsgc_off]
     call jsp_parse_script
+    mov byte [jsc_dump], 1
     call jsc_compile_script
+    mov byte [jsc_dump], 0
     dec dword [jsgc_off]
-    mov rax, [jsc_script]
-    call .function
     ret
-; .function: RAX = function info (compiled) -> its code, then its inner ones
-.function:
+
+; js_dump_template: RBX = a compiled function -> "line: its code in hex"
+js_dump_template:
     push rax
     push rbx
     push rcx
     push rsi
-    mov rbx, [rax + JFI_TEMPLATE]
     call jsout_reset
     mov eax, [rbx + JCODE_LINE]
     call jsout_u64

@@ -363,6 +363,13 @@ JSVM_MAX_HANDLERS       equ 256
     OPC YIELDSTAR
     OPC GENTHROW
     OPC REGEXP
+    OPC JNLT
+    OPC JNLE
+    OPC JNGT
+    OPC JNGE
+    OPC INCLOC
+    OPC DECLOC
+    OPC SETLOCP
 %endmacro
 
 %assign js_opc_n 0

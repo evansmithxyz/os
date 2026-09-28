@@ -76,6 +76,10 @@ GUI_WALLPAPER_ADDR      equ 0x01400000  ; pre-rendered desktop gradient
 GUI_CANVAS_ADDR         equ 0x01800000  ; Cyber Canvas drawing surface (persists)
 GUI_MIN_RAM             equ 0x02000000  ; GUI refuses to start below 32 MB RAM
 
+; --- Profiler (js -p) ---------------------------------------------------------
+PROF_ADDR               equ 0x01C00000  ; the timer's samples of RIP (dwords)
+PROF_SIZE               equ 0x00100000
+
 ; --- JavaScript engine (kernel/js/) ------------------------------------------
 JS_STACK_ADDR           equ 0x02000000  ; value stack (8-byte values)
 JS_STACK_SIZE           equ 0x00100000
@@ -86,7 +90,9 @@ JS_SRC_SIZE             equ 0x00100000
 JS_CODEBUF_ADDR         equ 0x02300000  ; bytecode scratch while compiling
 JS_CODEBUF_SIZE         equ 0x00100000
 JS_AST_ADDR             equ 0x02400000  ; syntax tree, scopes (freed after compiling)
-JS_AST_SIZE             equ 0x00B00000
+JS_AST_SIZE             equ 0x00A00000
+JS_NAMES_ADDR           equ 0x02E00000  ; parser: name sets for the closure analysis
+JS_NAMES_SIZE           equ 0x00100000
 JS_RX_ADDR              equ 0x02F00000  ; regular expression matching: captures, backtracking
 JS_RX_SIZE              equ 0x00100000
 JS_HEAP_ADDR            equ 0x03000000  ; strings, objects, bytecode

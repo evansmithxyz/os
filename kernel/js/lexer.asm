@@ -178,6 +178,8 @@ peek_line:              resd 1
 peek_kw:                resd 1
 peek_val:               resq 1
 peek_nl:                resb 1
+alignb 2
+jslex_punct_first:      resw 128        ; first char -> 1 + offset of its first entry in jslex_puncts
 
 section .text
 
@@ -266,6 +268,34 @@ jslex_regex:
 ; jslex_init: RSI = source, RCX = length; reads the first token
 ; ------------------------------------------------------------------------------
 jslex_init:
+    cmp word [jslex_punct_first + '(' * 2], 0
+    jne .ready
+    ; (once: where the punctuators of each first character start)
+    push rax
+    push rbx
+    push rdx
+    lea rbx, [jslex_puncts]
+.entry:
+    movzx edx, byte [rbx]
+    test edx, edx
+    jz .indexed
+    movzx eax, byte [rbx + 1]
+    cmp word [jslex_punct_first + rax * 2], 0
+    jne .next_entry
+    push rbx
+    lea rdx, [jslex_puncts - 1]
+    sub rbx, rdx
+    mov [jslex_punct_first + rax * 2], bx
+    pop rbx
+    movzx edx, byte [rbx]
+.next_entry:
+    lea rbx, [rbx + rdx + 2]
+    jmp .entry
+.indexed:
+    pop rdx
+    pop rbx
+    pop rax
+.ready:
     push rax
     mov [jslex_src], rsi
     mov [jslex_pos], rsi
@@ -597,13 +627,21 @@ jslex_next:
 .punct:
     cmp al, '`'
     je .template
-    lea rbx, [jslex_puncts]
+    cmp al, 128
+    jae .bad_char
+    movzx ebx, al
+    movzx ebx, word [jslex_punct_first + rbx * 2]
+    test ebx, ebx
+    jz .bad_char
+    lea rbx, [jslex_puncts + rbx - 1]
     mov rcx, rdi
     sub rcx, rsi                    ; bytes left
 .try:
     movzx edx, byte [rbx]
     test edx, edx
     jz .bad_char
+    cmp al, [rbx + 1]
+    jne .try_next
     cmp rdx, rcx
     ja .try_next
     push rcx

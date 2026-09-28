@@ -12,6 +12,10 @@ section .bss
 cpu_brand_buf:          resb 64
 
 section .rodata
+str_prof_on:            db "on", 0
+str_prof_off:           db "off", 0
+msg_prof_usage:         db "Usage: prof on | prof off", 10, 0
+msg_prof_samples:       db "prof samples ", 0
 msg_date_utc:           db " UTC", 0x0A, 0
 msg_about:
     db "Antigravity OS ", OS_VERSION_STR, " - a 64-bit operating system in pure x86_64 assembly", 0x0A
@@ -275,6 +279,37 @@ cmd_uptime:
     call con_dec
     lea rsi, [msg_uptime_hz]
     jmp con_puts
+
+; prof on | off: every timer tick records the interrupted RIP at PROF_ADDR
+; (tools/profile.py turns the samples into a profile); off says how many
+cmd_prof:
+    push rdi
+    lea rdi, [str_prof_on]
+    call strcmp
+    je .on
+    lea rdi, [str_prof_off]
+    call strcmp
+    je .off
+    pop rdi
+    lea rsi, [msg_prof_usage]
+    jmp con_puts
+.on:
+    pop rdi
+    mov dword [prof_count], 0
+    mov byte [prof_on], 1
+    ret
+.off:
+    pop rdi
+    mov byte [prof_on], 0
+    lea rsi, [msg_prof_samples]
+    call con_puts
+    mov eax, [prof_count]
+    call con_dec
+    mov al, 10
+    call con_putc
+    mov eax, [prof_count]
+    lea rsi, [msg_prof_samples]
+    jmp klog_dec
 
 ; date: "YYYY-MM-DD HH:MM:SS UTC" from the CMOS clock
 cmd_date:

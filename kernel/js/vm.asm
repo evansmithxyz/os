@@ -2203,54 +2203,28 @@ vm_enter_js:
     jmp .missing
 .params_done:
     lea r12, [r13 + r10*8]
+    mov r14, [r15 + JFN_ENV]
     test byte [r9 + JCODE_FLAGS], JCF_HEAPENV
     jz .stack_locals
-    ; variables live in a heap environment
+    ; the captured variables live in a heap env (the function's first
+    ; instructions copy captured parameters there)
     mov ecx, [r9 + JCODE_NENV]
     lea ecx, [rcx*8 + JENV_VALS]
     call js_alloc
     mov byte [rax + JH_KIND], JK_ENV
     mov ecx, [r9 + JCODE_NENV]
     mov [rax + JENV_COUNT], ecx
-    mov rdx, [r15 + JFN_ENV]
-    mov [rax + JENV_PARENT], rdx
+    mov [rax + JENV_PARENT], r14
     mov r14, rax
     xor edx, edx
     mov rdi, JS_UNDEF
 .env_fill:
     cmp edx, ecx
-    jae .env_params
+    jae .stack_locals
     mov [r14 + JENV_VALS + rdx*8], rdi
     inc edx
     jmp .env_fill
-.env_params:
-    xor edx, edx
-.env_param:
-    cmp edx, r10d
-    jae .env_special
-    mov rax, [r13 + rdx*8]
-    mov [r14 + JENV_VALS + rdx*8], rax
-    inc edx
-    jmp .env_param
-.env_special:
-    test byte [r9 + JCODE_FLAGS], JCF_ARGUMENTS
-    jz .env_rest
-    mov edx, [r9 + JCODE_ARGSLOT]
-    mov [r14 + JENV_VALS + rdx*8], r11
-.env_rest:
-    test byte [r9 + JCODE_FLAGS], JCF_REST
-    jz .env_self
-    mov edx, [r9 + JCODE_RESTSLOT]
-    mov [r14 + JENV_VALS + rdx*8], r8
-.env_self:
-    test byte [r9 + JCODE_FLAGS], JCF_SELF
-    jz .code
-    mov edx, [r9 + JCODE_SELFSLOT]
-    mov rax, [rbx]
-    mov [r14 + JENV_VALS + rdx*8], rax
-    jmp .code
 .stack_locals:
-    mov r14, [r15 + JFN_ENV]
     mov ecx, [r9 + JCODE_NLOCALS]
     sub ecx, r10d
     mov rax, JS_UNDEF
@@ -3021,6 +2995,103 @@ vmop_NE:
     NEXT
 
 ; VM_COMPARE cc: numbers fast, else js_less
+; VM_CJUMP jcc, kind: [a b] -> jump (rel32) unless a ? b; jcc jumps after
+; ucomisd a, b when it is false; kind as in VM_COMPARE for the other values
+%macro VM_CJUMP 2
+    mov rax, [r12 - 16]
+    mov rdx, [r12 - 8]
+    sub r12, 16
+    mov rcx, rax
+    or rcx, rdx
+    shr rcx, 48
+    cmp ecx, JS_TAG_SPECIAL
+    jae %%slow
+    movq xmm0, rax
+    movq xmm1, rdx
+    ucomisd xmm0, xmm1
+    jp vm_jump                      ; NaN: false
+    %1 vm_jump
+    jmp vm_no_jump
+%%slow:
+    mov [vm_sp], r12
+%if %2 == 0
+    call js_less
+    cmp eax, 1
+    sete al
+%elif %2 == 1
+    xchg rax, rdx
+    call js_less
+    cmp eax, 1
+    sete al
+%elif %2 == 2
+    xchg rax, rdx
+    call js_less
+    test eax, eax
+    sete al
+%else
+    call js_less
+    test eax, eax
+    sete al
+%endif
+    test al, al
+    jz vm_jump
+    jmp vm_no_jump
+%endmacro
+
+; JNLT / JNLE / JNGT / JNGE rel32: [a b] -> jump unless a < b (<=, >, >=)
+vmop_JNLT:
+    VM_CJUMP jae, 0
+vmop_JNGT:
+    VM_CJUMP jbe, 1
+vmop_JNLE:
+    VM_CJUMP ja, 2
+vmop_JNGE:
+    VM_CJUMP jb, 3
+
+; INCLOC / DECLOC slot16: a local plus / minus one (x++ as a statement)
+vmop_INCLOC:
+    movzx eax, word [rsi]
+    add rsi, 2
+    lea rbx, [r13 + rax*8]
+    mov rax, [rbx]
+    mov rdx, rax
+    shr rdx, 48
+    cmp edx, JS_TAG_SPECIAL
+    jb .number
+    push rbx
+    VMCALL js_to_number
+    pop rbx
+.number:
+    movq xmm0, rax
+    addsd xmm0, [jsvm_one]
+    movq [rbx], xmm0
+    NEXT
+vmop_DECLOC:
+    movzx eax, word [rsi]
+    add rsi, 2
+    lea rbx, [r13 + rax*8]
+    mov rax, [rbx]
+    mov rdx, rax
+    shr rdx, 48
+    cmp edx, JS_TAG_SPECIAL
+    jb .number
+    push rbx
+    VMCALL js_to_number
+    pop rbx
+.number:
+    movq xmm0, rax
+    subsd xmm0, [jsvm_one]
+    movq [rbx], xmm0
+    NEXT
+
+; SETLOCP slot16: [v] -> [] (a local = v, as a statement)
+vmop_SETLOCP:
+    movzx eax, word [rsi]
+    add rsi, 2
+    POPV rdx
+    mov [r13 + rax*8], rdx
+    NEXT
+
 %macro VM_COMPARE 2                 ; %1 = setcc for numbers (a ? b), %2 = slow kind
     mov rax, [r12 - 16]
     mov rdx, [r12 - 8]
@@ -3100,9 +3171,14 @@ vmop_NEG:
     NEXT
 vmop_PLUS:
 vmop_TONUM:
+    mov rax, [r12 - 8]
+    shr rax, 48
+    cmp eax, JS_TAG_SPECIAL
+    jb .number                      ; already one
     POPV rax
     VMCALL js_to_number
     PUSHV rax
+.number:
     NEXT
 vmop_NOT:
     POPV rax
@@ -3124,7 +3200,12 @@ vmop_TYPEOF:
     NEXT
 vmop_INC:
     POPV rax
+    mov rdx, rax
+    shr rdx, 48
+    cmp edx, JS_TAG_SPECIAL
+    jb .number
     VMCALL js_to_number
+.number:
     movq xmm0, rax
     addsd xmm0, [jsvm_one]
     movq rax, xmm0
@@ -3154,6 +3235,12 @@ vmop_JMP:
 
 vmop_JF:
     POPV rax
+    mov rdx, JS_FALSE               ; (booleans without a call)
+    cmp rax, rdx
+    je vm_jump
+    mov rdx, JS_TRUE
+    cmp rax, rdx
+    je vm_no_jump
     call js_truthy
     jc vm_no_jump
 vm_jump:

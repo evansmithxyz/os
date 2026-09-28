@@ -97,7 +97,7 @@ and `... cat build/os.img welcome.txt` read its files from the host.
 ls  cat  touch  write  rm  df                     files
 ifconfig  arp  ping  dns  curl  tcplisten         network
 sysinfo  about  cpu  mem  regs  uptime  clear     system
-js <code | file.js>                               JavaScript
+js [-p | -d] <code | file.js>  prof on|off        JavaScript, profiling
 gui  browser [url]  ws  exit                      desktop
 ```
 
@@ -207,6 +207,12 @@ left, so `js setTimeout(() => console.log('later'), 500)` prints `later`
 half a second on. Esc or Ctrl+C stops a script that doesn't end, or the
 waiting.
 
+`js -p ...` runs the same way under the profiler, and `js -d <code>`
+prints each compiled function's bytecode in hex instead of running it.
+`python tools/profile.py bench/core.js` boots a copy of the image, runs
+the benchmarks in `bench/` and prints where the time went (see
+Debugging).
+
 In the browser, every HTML page gets its own engine with `window` and
 `document`. Its `<script>`s run in order (inline or `src=`, which is
 fetched), then `DOMContentLoaded` and `load` fire. `console.log` output
@@ -242,11 +248,15 @@ optimising compilers:
 1. `lexer.asm` turns the text into tokens; names and strings become atoms
    (one shared copy per text, so property names compare as pointers).
 2. `parser.asm` builds a syntax tree and records every declaration in its
-   scope.
-3. `compiler.asm` turns the tree into bytecode. Variables of functions that
-   contain no other functions live in stack slots; the others live in heap
-   environments that closures capture (`let` in a `for` loop gets a fresh
-   one each time round).
+   scope. It notes the names each function uses; when a function ends, the
+   names it does not declare pass to its parent, which marks its own
+   variables of those names as captured (hash tables keep this linear, so
+   big bundles such as React compile in a few tens of milliseconds).
+3. `compiler.asm` turns the tree into bytecode. Variables no inner function
+   uses live in stack slots; captured ones live in heap environments that
+   closures keep (`let` in a `for` loop gets a fresh one each time round).
+   Common shapes get their own opcodes: `i < n` in a condition compiles to
+   one compare-and-jump, `i++` on a local to `INCLOC`.
 4. `vm.asm` runs the bytecode on a value stack. Calls between JavaScript
    functions don't use the kernel stack, so deep recursion ends with
    `RangeError: Maximum call stack size exceeded` instead of a crash.
@@ -364,7 +374,9 @@ kernel/
   apps/                 terminal, browser, canvas, sysmon windows
   apps/shell/           line editor + command table + command handlers
 rootfs/                 files copied onto a freshly formatted disk
-tools/                  build.py, mkimage.py (disk images), ppm.py (screenshots)
+tools/                  build.py, mkimage.py (disk images), ppm.py (screenshots),
+                        profile.py (profiles the kernel)
+bench/                  JavaScript benchmarks (core.js)
 tests/                  harness.py + test_*.py (QEMU-driven, stdlib unittest)
 docs/                   CONVENTIONS.md, screenshots
 ```
@@ -412,7 +424,8 @@ docs/                   CONVENTIONS.md, screenshots
 | `0x400000` / `0x500000` | last HTTP(S) response / the browser's page (1 MB each) |
 | `0x600000` / `0xA00000` / `0xC00000` | DOM nodes / CSS rules / layout display list |
 | `0x1000000` | GUI back buffer, wallpaper, canvas (3 MB each) |
-| `0x2000000` | JavaScript: value stack, call frames, source, compiler scratch, syntax tree, regular expression matching |
+| `0x1C00000` | profiler samples (1 MB) |
+| `0x2000000` | JavaScript: value stack, call frames, source, compiler scratch, syntax tree, name tables, regular expression matching |
 | `0x3000000` | JavaScript heap (62 MB) |
 | `0x6E00000` / `0x6F00000` | the garbage collector's start bitmap / mark stack |
 | `0xFD000000` | framebuffer (from the display adapter's PCI BAR0) |
@@ -471,6 +484,18 @@ Node.js prints), and the panic handler. The network tests use a web server on th
 - **`python tools/build.py debug` + gdb:** kernel symbols are in
   `build/kernel.map`.
 - **Deliberate crashes:** `crash ud|gp|pf|de` exercises the exception path.
+- **Profiling:** while sampling is on, the timer records the interrupted
+  RIP every millisecond at `0x1C00000`. `js -p` samples one script; `prof
+  on` / `prof off` sample anything in between. `tools/profile.py` does it
+  all from the host and counts the samples per routine:
+
+  ```bash
+  python tools/profile.py bench/core.js
+  ```
+
+  ```bash
+  python tools/profile.py --cmd "browser https://example.com/" --until "browser text:"
+  ```
 
 ## Contributing
 

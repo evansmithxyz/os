@@ -3,10 +3,18 @@
 Expected values are what Node.js prints for the same code.
 """
 
+import re
 import time
 import unittest
 
-from tests.harness import PROMPT, OSTestCase
+from tests.harness import PROMPT, ROOT, OSTestCase
+
+
+def opcodes() -> dict:
+    """OP_* numbers: their order in JS_OPCODE_LIST (kernel/js/js.inc)."""
+    text = (ROOT / "kernel" / "js" / "js.inc").read_text(encoding="utf-8")
+    body = text.split("%macro JS_OPCODE_LIST 0", 1)[1].split("%endmacro", 1)[0]
+    return {name: i for i, name in enumerate(re.findall(r"^\s*OPC (\w+)", body, re.M))}
 
 DEMO_JS = b"""// a multi-line script from the disk
 function Counter(start) {
@@ -448,6 +456,48 @@ class JavaScriptTest(OSTestCase):
                       "[ 1705276800000, 1705314600000, 1705357800000, 1705276800000 ]")
         self.assertJs("var n = Date.now(); [typeof n, n > 1.7e12, new Date().getFullYear() >= 2024, typeof Date()]",
                       "[ 'number', true, true, 'string' ]")
+
+    # --- step 6: speed -----------------------------------------------------------------
+    def test_closure_analysis(self):
+        # only variables inner functions use live in heap envs; the rest in stack slots
+        self.assertJs("function f() { var a1 = 1, a2 = 2, a3 = 3, a4 = 4, a5 = 5, a6 = 6, a7 = 7, a8 = 8, "
+                      "a9 = 9, a10 = 10, a11 = 11; var g = () => a3 + a10; a10 = 20; return g() + a11 } f()", "34")
+        self.assertJs("function f() { var x = 1; function g() { var x = 2; return () => x } "
+                      "return g()() * 10 + x } f()", "21")
+        self.assertJs("function f(a, ...r) { return () => a + r.length + arguments.length } f(1, 2, 3)()", "6")
+        self.assertJs("function a() { var v = 5; return function b() { return function c() { return v * 2 } } } "
+                      "a()()()", "10")
+        self.assertJs("function f() { var r = []; for (let i = 0; i < 3; i++) { let j = i * 2; r.push(() => j) } "
+                      "return r.map(g => g()) } f()", "[ 0, 2, 4 ]")
+        self.assertJs("function f(n) { var out = 0; for (var i = 0; i < n; i++) out += i; "
+                      "return [out, (() => n)()] } f(4)", "[ 6, 4 ]")
+        self.assertJs("function f() { var c = 0; class K { inc() { return ++c } } new K().inc(); "
+                      "return new K().inc() } f()", "2")
+        # many variables, a scope index: declared, found and captured by name
+        decl = "let " + ",".join(f"v{i}={i}" for i in range(24))
+        self.assertJs(f"function f() {{ {decl}; return () => v7 + v23 + v20 }} f()()", "50")
+        self.assertJs(f"{decl}; v23 + (() => v1)()", "24")
+
+    def test_bytecode_fast_paths(self):
+        ops = opcodes()
+        out = self.vm.run("js -d function f(n) { var s = 0; for (var i = 0; i < n; i++) s += i; return s }")
+        codes = [line.split(":", 1)[1].split() for line in out.splitlines() if re.match(r"^\d+:( [0-9a-fA-F]{2})+$", line)]
+        self.assertEqual(len(codes), 2, out)          # the script and f
+        f = [int(b, 16) for b in codes[0]]
+        for op in ("JNLT", "INCLOC", "SETLOCP"):      # i < n; i++; s += i
+            self.assertIn(ops[op], f, f"{op} in {codes[0]}")
+        self.assertNotIn(ops["GETENV"], f, "f's variables are stack slots")
+
+    def test_profiler(self):
+        out = self.vm.run("js -p for (var i = 0; i < 300000; i++) {}", timeout=30)
+        m = re.search(r"\[klog\] js prof samples (\d+)", out)
+        self.assertTrue(m and int(m.group(1)) > 0, out)
+        self.vm.run("prof on")
+        self.js("for (var i = 0; i < 100000; i++) {}")
+        out = self.vm.run("prof off")
+        m = re.search(r"^prof samples (\d+)", out, re.M)
+        self.assertTrue(m and int(m.group(1)) > 0, out)
+        self.assertIn("Usage: prof on | prof off", self.vm.run("prof"))
 
     def test_ctrl_c_stops_a_runaway_script(self):
         self.vm.send("js for (;;) {}\r")

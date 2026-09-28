@@ -167,7 +167,7 @@ jsre_compile:
     call js_alloc
     or byte [rax - 8 + GCH_FLAGS], GCF_LEAF
     mov rdi, rax
-    lea rsi, [jsre_buf]
+    lea rsi, [abs jsre_buf]
     mov rcx, [jsre_len]
     rep movsb
     mov ecx, [jsre_total]
@@ -1010,7 +1010,7 @@ jsre_repeat:
     push r11
     ; keep a copy of the atom
     lea rsi, [jsre_buf + rbx]
-    lea rdi, [jsre_atom]
+    lea rdi, [abs jsre_atom]
     push rcx
     rep movsb
     pop rcx
@@ -1095,7 +1095,7 @@ jsre_repeat:
     jae jsre_too_big
     mov [jsre_len], rax
     lea rdi, [jsre_buf + rdi]
-    lea rsi, [jsre_atom]
+    lea rsi, [abs jsre_atom]
     rep movsb
     pop rdi
     pop rsi

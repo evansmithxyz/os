@@ -3,6 +3,9 @@
 ; ------------------------------------------------------------------------------
 ;   js <code>        run a line of JavaScript and print its value, e.g. js 1 + 2
 ;   js <file.js>     run a script from the disk
+;   js -p <...>      the same, profiled: every millisecond the timer records
+;                    where the CPU is (PROF_ADDR; tools/profile.py reads it)
+;   js -d <code>     compile only and print each function's bytecode in hex
 ; Every run starts with a fresh engine (kernel/js/). console.log prints to the
 ; console; an uncaught error prints "Uncaught <error> (line N)". Like Node.js,
 ; the command then runs promise jobs and waits for timers until none are left
@@ -15,6 +18,7 @@ section .rodata
 msg_js_usage:           db "Usage: js <code> | js <file.js>   e.g. js 1 + 2", 10, 0
 msg_js_ram:             db "js needs at least 112 MB of RAM", 10, 0
 msg_js_too_big:         db "Script is too large (1 MB at most)", 10, 0
+klog_js_prof:           db "js prof samples ", 0
 
 section .text
 
@@ -26,6 +30,8 @@ cmd_js:
     jb .no_ram
     cmp word [rsi], '-d'
     je .dump
+    cmp word [rsi], '-p'
+    je .profile
     ; a single word ending in .js that names a file: run the file
     call strlen
     mov rcx, rax
@@ -71,6 +77,15 @@ cmd_js:
     pop rax
     mov [con_attr], al
     jmp jsev_loop
+.profile:
+    add rsi, 3
+    mov dword [prof_count], 0
+    mov byte [prof_on], 1
+    call cmd_js
+    mov byte [prof_on], 0
+    mov eax, [prof_count]
+    lea rsi, [klog_js_prof]
+    jmp klog_dec
 .dump:
     ; js -d <code>: the compiled script's bytecode in hex (debugging)
     add rsi, 3

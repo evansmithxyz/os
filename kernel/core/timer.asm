@@ -16,6 +16,8 @@ PIT_DIVISOR             equ (PIT_BASE_HZ + TIMER_HZ / 2) / TIMER_HZ
 
 section .data
 timer_ticks:            dq 0
+prof_count:             dd 0        ; samples in PROF_ADDR
+prof_on:                db 0        ; 1: each tick samples the interrupted RIP
 
 section .text
 ; ------------------------------------------------------------------------------
@@ -38,6 +40,18 @@ timer_init:
 isr_timer:
     push rax
     inc qword [timer_ticks]
+    cmp byte [prof_on], 0
+    je .eoi
+    ; the profiler: where the CPU was
+    mov eax, [prof_count]
+    cmp eax, PROF_SIZE / 4
+    jae .eoi
+    push rbx
+    mov rbx, [rsp + 16]             ; the interrupted RIP
+    mov [PROF_ADDR + rax*4], ebx
+    inc dword [prof_count]
+    pop rbx
+.eoi:
     mov al, PIC_EOI
     out PIC1_COMMAND, al
     pop rax

@@ -300,10 +300,23 @@ jsstr_new:
     push rsi
     push rdi
     lea rdi, [rax + JSTR_DATA]
-    rep movsb
+    call jsmem_copy
     pop rdi
     pop rsi
     pop rcx
+    ret
+
+; jsmem_copy: RSI = from, RDI = to, RCX = bytes -> copied a qword at a time
+; (RSI and RDI past them, RCX = 0: like rep movsb)
+jsmem_copy:
+    push rax
+    mov rax, rcx
+    shr rcx, 3
+    rep movsq
+    mov ecx, eax
+    and ecx, 7
+    rep movsb
+    pop rax
     ret
 
 ; jsstr_concat: RAX = string a, RDX = string b -> RAX = new string a + b
@@ -324,10 +337,10 @@ jsstr_concat:
     lea rdi, [rax + JSTR_DATA]
     lea rsi, [r8 + JSTR_DATA]
     mov ecx, [r8 + JSTR_LEN]
-    rep movsb
+    call jsmem_copy
     lea rsi, [rdx + JSTR_DATA]
     mov ecx, [rdx + JSTR_LEN]
-    rep movsb
+    call jsmem_copy
     jmp .out
 .take_b:
     mov rax, rdx

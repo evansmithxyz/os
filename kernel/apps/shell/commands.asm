@@ -84,6 +84,7 @@ COMMAND "cpu",       cmd_cpu,       0,            "cpu                 CPUID ven
 COMMAND "mem",       cmd_mem,       0,            "mem                 Memory map (E820) and kernel layout"
 COMMAND "regs",      cmd_regs,      0,            "regs                Register snapshot"
 COMMAND "uptime",    cmd_uptime,    0,            "uptime              Time since boot"
+COMMAND "prof",      cmd_prof,      0,            "prof on|off         Profiler: sample where the CPU is (tools/profile.py)"
 ALIAS   "ticks",     cmd_uptime,    0
 COMMAND "date",      cmd_date,      0,            "date                Date and time (UTC, from the CMOS clock)"
 COMMAND "reboot",    cmd_reboot,    0,            "reboot              Restart the machine"

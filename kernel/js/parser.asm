@@ -117,16 +117,22 @@ JSC_VARS                equ 16          ; first JVR record
 JSC_NVARS               equ 24          ; dword
 JSC_KIND                equ 28          ; byte, SK_*
 JSC_ENV                 equ 29          ; byte, 1 = makes a heap env at run time (compiler)
+JSC_INDEXED             equ 30          ; byte: its variables in the compiler's index (1), too many (2)
 JSC_NEXT                equ 32          ; next scope of the same function
-JSC_SIZE                equ 40
+JSC_NENV                equ 40          ; dword: its captured variables (the env's size; compiler)
+JSC_LAST                equ 48          ; last JVR record
+JSC_SIZE                equ 56
 SK_FUNC                 equ 1
 SK_BLOCK                equ 2
 
 JVR_NEXT                equ 0
 JVR_NAME                equ 8           ; atom
 JVR_KIND                equ 16          ; byte, VK_*
-JVR_SLOT                equ 20          ; dword, stack slot or env index (compiler)
-JVR_SIZE                equ 24
+JVR_FLAGS               equ 17          ; byte, JVRF_*
+JVR_SLOT                equ 20          ; dword, stack slot, or env index if captured (compiler)
+JVR_STACK               equ 24          ; dword, its stack slot (parameters, arguments: where it arrives)
+JVR_SIZE                equ 32
+JVRF_CAPTURED           equ 1           ; an inner function uses it: it lives in a heap env
 VK_VAR                  equ 1
 VK_LET                  equ 2
 VK_CONST                equ 3
@@ -146,13 +152,18 @@ JFI_NLOCALS             equ 44          ; dword (compiler)
 JFI_SCOPES              equ 48          ; first scope (linked through JSC_NEXT)
 JFI_LAST_SCOPE          equ 56
 JFI_TEMPLATE            equ 64          ; the compiled JK_CODE (compiler)
-JFI_GLOBALS             equ 72          ; script: JVR list of top-level declarations
-JFI_NGLOBALS            equ 80          ; dword (JFI_GLOBALS works as a scope's JSC_VARS)
+JFI_GLOBALS             equ 72          ; script: a scope (in no chain) of its top-level declarations
 JFI_PARAMS              equ 88          ; first NT_PARAM
 JFI_REST                equ 96          ; the variable of a ...rest parameter, or 0
 JFI_FIELDS              equ 104         ; class constructor: first instance field (NT_CLASSMEM)
 JFI_ASYNCTRY            equ 112         ; qword: the implicit TRY of an async function
-JFI_SIZE                equ 120
+JFI_USES                equ 120         ; names this function uses (JU_* list)
+JFI_FREE                equ 128         ; names its inner functions use and do not declare
+JFI_GEN                 equ 136         ; dword: its generation in jsp_note_use's table
+JFI_SIZE                equ 144
+JU_NEXT                 equ 0
+JU_NAME                 equ 8
+JU_SIZE                 equ 16
 FIF_INNER               equ 1           ; contains function definitions
 FIF_ARGS                equ 2           ; uses `arguments`
 FIF_SELF                equ 4           ; named function expression
@@ -195,6 +206,10 @@ jsp_depth:              resd 1
 jsp_no_in:              resq 1          ; 1 = `in` is not an operator (for-init; saved as a qword)
 jsp_next_async:         resq 1          ; 1 = the next function made is async
 jsp_next_gen:           resq 1          ; 1 = the next function made is a generator
+jsp_names_gen:          resd 1          ; the name tables' current generation
+jsp_names_count:        resd 1          ; entries in jsp_close_func's set
+jsp_index_gen:          resd 1          ; this script's generation in the scope index
+jsp_index_count:        resd 1          ; variables in it
 jsp_ahead_tpl:          resd 32         ; jsp_arrow_ahead: depths of open ${
 jsp_ahead_saved:        resb 64
 
@@ -228,9 +243,17 @@ jsp_parse_script:
     mov qword [jsp_scope], 0
     mov dword [jsp_depth], 0
     mov dword [jsp_no_in], 0
+    call jsp_new_gen
+    mov [jsp_index_gen], eax
+    mov dword [jsp_index_count], 0
     call jsp_new_func
     mov rbx, rax
     or dword [rbx + JFI_FLAGS], FIF_SCRIPT
+    push rcx
+    mov ecx, JSC_SIZE
+    call jsp_alloc
+    mov [rbx + JFI_GLOBALS], rax
+    pop rcx
     mov dword [rbx + JFI_LINE], 1
     call jslex_init
 .body:
@@ -238,6 +261,10 @@ jsp_parse_script:
     cmp dword [tok_type], TK_EOF
     jne jsp_unexpected
     mov [rbx + JFI_BODY], rax
+    push rax
+    mov rax, rbx
+    call jsp_close_func
+    pop rax
     mov rax, rbx
     pop rbx
     ret
@@ -301,6 +328,8 @@ jsp_new_func:
 .top:
     mov ecx, [tok_line]
     mov [rbx + JFI_LINE], ecx
+    call jsp_new_gen
+    mov [rbx + JFI_GEN], eax
     cmp dword [jsp_next_async], 0
     je .sync
     mov dword [jsp_next_async], 0
@@ -360,6 +389,8 @@ jsp_pop_scope:
 
 ; jsp_scope_find: RBX = scope, RDX = atom -> RAX = variable record, CF=0 if found
 jsp_scope_find:
+    cmp byte [rbx + JSC_INDEXED], 1
+    je .indexed
     mov rax, [rbx + JSC_VARS]
 .loop:
     test rax, rax
@@ -373,6 +404,18 @@ jsp_scope_find:
     ret
 .missing:
     stc
+    ret
+.indexed:
+    push rsi
+    push rdi
+    mov rdi, rbx
+    call jsp_index_find
+    mov rax, rsi
+    pop rdi
+    pop rsi
+    test rax, rax
+    jz .missing
+    clc
     ret
 
 ; jsp_scope_add: RBX = scope, RDX = atom, CL = VK_* -> RAX = its variable
@@ -390,17 +433,141 @@ jsp_scope_add:
     mov [rax + JVR_KIND], cl
     ; append (declaration order = slot order, parameters first)
     push rsi
+    mov rsi, [rbx + JSC_LAST]
+    test rsi, rsi
+    jnz .append
     lea rsi, [rbx + JSC_VARS - JVR_NEXT]
-.tail:
-    cmp qword [rsi + JVR_NEXT], 0
-    je .append
-    mov rsi, [rsi + JVR_NEXT]
-    jmp .tail
 .append:
     mov [rsi + JVR_NEXT], rax
+    mov [rbx + JSC_LAST], rax
     pop rsi
     inc dword [rbx + JSC_NVARS]
+    ; (many variables: indexed)
+    cmp byte [rbx + JSC_INDEXED], 1
+    je .index_one
+    ja .done
+    cmp dword [rbx + JSC_NVARS], JSP_INDEX_MIN
+    jbe .done
+    call jsp_index_scope
 .done:
+    ret
+.index_one:
+    push rsi
+    push rdi
+    mov rdi, rbx
+    mov rsi, rax
+    call jsp_index_put
+    pop rdi
+    pop rsi
+    ret
+
+; ------------------------------------------------------------------------------
+; The scope index: the variables of scopes with more than JSP_INDEX_MIN of
+; them, hashed by (scope, name) at JS_NAMES_ADDR + JNS_INDEX in 32-byte
+; entries {atom, scope, variable, generation dd}. Each script takes a new
+; generation, which empties it; the compiler looks names up in it too.
+; ------------------------------------------------------------------------------
+JSP_INDEX_MIN           equ 8
+JSP_INDEX_SLOTS         equ 16384
+JSP_INDEX_LIMIT         equ 12288
+
+; jsp_index_slot: RDI = scope, RDX = atom -> RAX = its first slot number
+jsp_index_slot:
+    push rcx
+    mov rcx, 0x9E3779B97F4A7C15
+    mov rax, rdi
+    imul rax, rcx
+    xor rax, rdx
+    imul rax, rcx
+    shr rax, 64 - 14
+    pop rcx
+    ret
+
+; jsp_index_scope: RBX = scope -> its variables in the index (JSC_INDEXED 1),
+; or too many (2)
+jsp_index_scope:
+    push rsi
+    push rdi
+    mov rdi, rbx
+    mov byte [rbx + JSC_INDEXED], 1
+    mov rsi, [rbx + JSC_VARS]
+.var:
+    test rsi, rsi
+    jz .out
+    call jsp_index_put
+    mov rsi, [rsi + JVR_NEXT]
+    jmp .var
+.out:
+    pop rdi
+    pop rsi
+    ret
+
+; jsp_index_put: RDI = scope, RSI = one of its variables -> in the index (if
+; it is full, the scope's JSC_INDEXED becomes 2: looked up the slow way)
+jsp_index_put:
+    push rax
+    push rcx
+    push rdx
+    push r9
+    cmp dword [jsp_index_count], JSP_INDEX_LIMIT
+    jae .full
+    inc dword [jsp_index_count]
+    mov ecx, [jsp_index_gen]
+    mov rdx, [rsi + JVR_NAME]
+    call jsp_index_slot
+.probe:
+    mov r9, rax
+    shl r9, 5
+    add r9, JS_NAMES_ADDR + JNS_INDEX
+    cmp [r9 + 24], ecx
+    jne .put
+    inc eax
+    and eax, JSP_INDEX_SLOTS - 1
+    jmp .probe
+.put:
+    mov [r9], rdx
+    mov [r9 + 8], rdi
+    mov [r9 + 16], rsi
+    mov [r9 + 24], ecx
+    jmp .out
+.full:
+    mov byte [rdi + JSC_INDEXED], 2
+.out:
+    pop r9
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; jsp_index_find: RDI = an indexed scope, RDX = atom -> RSI = its variable, or 0
+jsp_index_find:
+    push rax
+    push rcx
+    mov ecx, [jsp_index_gen]
+    call jsp_index_slot
+.probe:
+    mov rsi, rax
+    shl rsi, 5
+    add rsi, JS_NAMES_ADDR + JNS_INDEX
+    cmp [rsi + 24], ecx
+    jne .missing
+    cmp [rsi], rdx
+    jne .next
+    cmp [rsi + 8], rdi
+    je .found
+.next:
+    inc eax
+    and eax, JSP_INDEX_SLOTS - 1
+    jmp .probe
+.missing:
+    xor esi, esi
+    pop rcx
+    pop rax
+    ret
+.found:
+    mov rsi, [rsi + 16]
+    pop rcx
+    pop rax
     ret
 
 ; ------------------------------------------------------------------------------
@@ -433,7 +600,7 @@ jsp_declare:
     ret
 .global:
     ; remember it: the script defines it (as undefined) before running
-    lea rbx, [rax + JFI_GLOBALS - JSC_VARS]
+    mov rbx, [rax + JFI_GLOBALS]
     call jsp_scope_add
     pop rbx
     pop rax
@@ -1244,6 +1411,8 @@ jsp_function_rest:
     or dword [rbx + JFI_FLAGS], FIF_SELF
 .no_self:
     call jslex_next                 ; '}' (after the scope work: it may read a regex-free token)
+    mov rax, rbx
+    call jsp_close_func
     pop qword [jsp_no_in]
     mov [jsp_func], r8
     mov [jsp_scope], r9
@@ -1695,6 +1864,8 @@ jsp_arrow:
     jne jsp_unexpected
     call jslex_next
 .done:
+    mov rax, rbx
+    call jsp_close_func
     pop qword [jsp_no_in]
     mov [jsp_func], r8
     mov [jsp_scope], r9
@@ -2680,6 +2851,7 @@ jsp_primary:
     call jsp_node
     mov rdx, [atom_async]
     mov [rax + JN_A], rdx
+    call jsp_note_use
     jmp .done
 .async_name:
     ; async x => ... (x => made async)
@@ -2691,6 +2863,7 @@ jsp_primary:
     mov rbx, rax
     mov rdx, [tok_val]
     mov [rbx + JN_A], rdx
+    call jsp_note_use
     call jslex_next
     AT_PUNCT P_ARROW
     je .single_arrow
@@ -2833,6 +3006,263 @@ jsp_modifier_ahead:
     ret
 .no:
     clc
+    ret
+
+; ------------------------------------------------------------------------------
+; Closures: which variables inner functions use (they need a heap env; the
+; rest stay in stack slots). Every name a function uses is noted; when it
+; ends, the names it does not declare go to its parent's free list, and the
+; parent marks its variables of the names on its own free list captured.
+; By name, so a shadowed name may be captured without need (never the other
+; way round).
+; ------------------------------------------------------------------------------
+
+; The names are counted in hash tables at JS_NAMES_ADDR, entries of 16 bytes
+; {atom, generation dd, bits dd}; an entry of an older generation is free, so
+; a table is emptied by taking a new generation.
+JNS_SET                 equ 0           ; jsp_close_func's set: 32768 entries
+JNS_SET_SLOTS           equ 16384
+JNS_SET_LIMIT           equ 12288       ; more names than this: the slow way
+JNS_USES                equ 0x40000     ; jsp_note_use's recent names: 4096 entries
+JNS_INDEX               equ 0x80000     ; the compiler's scope index (compiler.asm)
+JNS_DECL                equ 1           ; the function declares the name
+JNS_FREE                equ 2           ; an inner function uses it
+JNS_PASSED              equ 4           ; passed on to the parent already
+
+; jsp_new_gen: -> EAX = a new generation (the tables are cleared the first time)
+jsp_new_gen:
+    mov eax, [jsp_names_gen]
+    inc eax
+    cmp eax, 1
+    ja .ok
+    push rcx
+    push rdi
+    mov edi, JS_NAMES_ADDR
+    mov ecx, JS_NAMES_SIZE / 8
+    xor eax, eax
+    rep stosq
+    pop rdi
+    pop rcx
+    mov eax, 1
+.ok:
+    mov [jsp_names_gen], eax
+    ret
+
+; jsp_note_use: RDX = a name the current function uses
+jsp_note_use:
+    push rax
+    push rbx
+    push rcx
+    mov rbx, [jsp_func]
+    test rbx, rbx
+    jz .out
+    ; (noted lately by this function: once is enough; a collision in the
+    ; table only repeats a name)
+    mov rax, rdx
+    mov rcx, 0x9E3779B97F4A7C15
+    imul rax, rcx
+    shr rax, 64 - 12
+    shl eax, 4
+    add rax, JS_NAMES_ADDR + JNS_USES
+    mov ecx, [rbx + JFI_GEN]
+    cmp [rax + 8], ecx
+    jne .note
+    cmp [rax], rdx
+    je .out
+.note:
+    mov [rax], rdx
+    mov [rax + 8], ecx
+    mov ecx, JU_SIZE
+    call jsp_alloc
+    mov [rax + JU_NAME], rdx
+    mov rcx, [rbx + JFI_USES]
+    mov [rax + JU_NEXT], rcx
+    mov [rbx + JFI_USES], rax
+.out:
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; jsp_name_entry: RDX = atom -> RAX = its entry in jsp_close_func's set (new
+; ones with no bits), CF=1 if the set is full
+jsp_name_entry:
+    push rcx
+    push rsi
+    mov rax, rdx
+    mov rcx, 0x9E3779B97F4A7C15
+    imul rax, rcx
+    shr rax, 64 - 14
+    mov ecx, [jsp_names_gen]
+.probe:
+    mov rsi, rax
+    shl rsi, 4
+    add rsi, JS_NAMES_ADDR + JNS_SET
+    cmp [rsi + 8], ecx
+    jne .new
+    cmp [rsi], rdx
+    je .found
+    inc eax
+    and eax, JNS_SET_SLOTS - 1
+    jmp .probe
+.new:
+    cmp dword [jsp_names_count], JNS_SET_LIMIT
+    jae .full
+    inc dword [jsp_names_count]
+    mov [rsi], rdx
+    mov [rsi + 8], ecx
+    mov dword [rsi + 12], 0
+.found:
+    mov rax, rsi
+    pop rsi
+    pop rcx
+    clc
+    ret
+.full:
+    pop rsi
+    pop rcx
+    stc
+    ret
+
+; jsp_close_func: RAX = a function that has been parsed -> its variables that
+; inner functions use marked JVRF_CAPTURED; the names it does not declare
+; passed on to its parent (each once)
+jsp_close_func:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    mov rbx, rax
+    call jsp_new_gen
+    mov dword [jsp_names_count], 0
+    ; the names it declares
+    mov rsi, [rbx + JFI_SCOPE]
+    mov rsi, [rsi + JSC_VARS]
+.decl:
+    test rsi, rsi
+    jz .free
+    mov rdx, [rsi + JVR_NAME]
+    call jsp_name_entry
+    jc .full
+    or byte [rax + 12], JNS_DECL
+    mov rsi, [rsi + JVR_NEXT]
+    jmp .decl
+.free:
+    ; names its inner functions use: captured here, or passed on
+    mov rsi, [rbx + JFI_FREE]
+.free_name:
+    test rsi, rsi
+    jz .mark
+    mov rdx, [rsi + JU_NAME]
+    call jsp_name_entry
+    jc .full
+    or byte [rax + 12], JNS_FREE
+    call .pass_up
+    mov rsi, [rsi + JU_NEXT]
+    jmp .free_name
+.mark:
+    ; its variables (in any block) of those names are captured
+    mov rcx, [rbx + JFI_SCOPES]
+.mark_scope:
+    test rcx, rcx
+    jz .uses
+    mov rsi, [rcx + JSC_VARS]
+.mark_var:
+    test rsi, rsi
+    jz .mark_next
+    mov rdx, [rsi + JVR_NAME]
+    call jsp_name_entry
+    jc .full
+    test byte [rax + 12], JNS_FREE
+    jz .mark_skip
+    or byte [rsi + JVR_FLAGS], JVRF_CAPTURED
+.mark_skip:
+    mov rsi, [rsi + JVR_NEXT]
+    jmp .mark_var
+.mark_next:
+    mov rcx, [rcx + JSC_NEXT]
+    jmp .mark_scope
+.uses:
+    ; its own uses of names it does not declare: the parent's (or further up)
+    mov rsi, [rbx + JFI_USES]
+.use:
+    test rsi, rsi
+    jz .done
+    mov rdx, [rsi + JU_NAME]
+    call jsp_name_entry
+    jc .full
+    call .pass_up
+    mov rsi, [rsi + JU_NEXT]
+    jmp .use
+.done:
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+.full:
+    ; too many names for the set: every variable captured and every name
+    ; passed on (more than needed, never less)
+    mov rcx, [rbx + JFI_SCOPES]
+.all_scope:
+    test rcx, rcx
+    jz .all_free
+    mov rsi, [rcx + JSC_VARS]
+.all_var:
+    test rsi, rsi
+    jz .all_next
+    or byte [rsi + JVR_FLAGS], JVRF_CAPTURED
+    mov rsi, [rsi + JVR_NEXT]
+    jmp .all_var
+.all_next:
+    mov rcx, [rcx + JSC_NEXT]
+    jmp .all_scope
+.all_free:
+    mov rsi, [rbx + JFI_FREE]
+.all_free_name:
+    test rsi, rsi
+    jz .all_uses
+    mov rdx, [rsi + JU_NAME]
+    call .push_up
+    mov rsi, [rsi + JU_NEXT]
+    jmp .all_free_name
+.all_uses:
+    mov rsi, [rbx + JFI_USES]
+.all_use:
+    test rsi, rsi
+    jz .done
+    mov rdx, [rsi + JU_NAME]
+    call .push_up
+    mov rsi, [rsi + JU_NEXT]
+    jmp .all_use
+; .pass_up: RAX = the entry of RDX = a name -> onto the parent's free list,
+; unless the function declares it or passed it on already
+.pass_up:
+    test byte [rax + 12], JNS_DECL | JNS_PASSED
+    jnz .kept
+    or byte [rax + 12], JNS_PASSED
+.push_up:
+    push rax
+    push rcx
+    mov rcx, [rbx + JFI_PARENT]
+    test rcx, rcx
+    jz .no_parent
+    push rcx
+    mov ecx, JU_SIZE
+    call jsp_alloc
+    pop rcx
+    mov [rax + JU_NAME], rdx
+    push rdx
+    mov rdx, [rcx + JFI_FREE]
+    mov [rax + JU_NEXT], rdx
+    mov [rcx + JFI_FREE], rax
+    pop rdx
+.no_parent:
+    pop rcx
+    pop rax
+.kept:
     ret
 
 ; jsp_use_arguments: the current function reads `arguments`: declare it
@@ -3211,6 +3641,8 @@ jsp_class:
     mov [jsp_func], r8
     mov [jsp_scope], r9
 .done:
+    mov rax, r10
+    call jsp_close_func             ; the constructor (and the fields)
     mov qword [rbx + JN_E], 0
     mov rax, rbx
     pop r11
@@ -3352,6 +3784,7 @@ jsp_object:
     cmp byte [r8 + JN_OP], 0
     jne jsp_unexpected
     mov rdx, [r8 + JN_A]
+    call jsp_note_use
     mov al, NT_IDENT
     call jsp_node
     mov [rax + JN_A], rdx
