@@ -488,6 +488,8 @@ jslex_next:
     mov [tok_line], edx
     call jslex_is_ident_start
     jc .name
+    cmp al, '#'
+    je .hash
     cmp al, '0'
     jb .not_digit
     cmp al, '9'
@@ -510,6 +512,16 @@ jslex_next:
     je .string
     jmp .punct
 
+.hash:
+    ; #name: a class's private name, one token (its atom keeps the #)
+    lea rdx, [rsi + 1]
+    cmp rdx, rdi
+    jae .punct
+    push rax
+    movzx eax, byte [rdx]
+    call jslex_is_ident_start
+    pop rax
+    jnc .punct
 .name:
     mov rbx, rsi
 .name_loop:
@@ -605,7 +617,8 @@ jslex_next:
     cmp rsi, rdi
     jae .done
     cmp byte [rsi], 'n'
-    je .bigint
+    jne .done
+    inc rsi                         ; 10n: BigInt, approximated by a number
     jmp .done
 
 .string:

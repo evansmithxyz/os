@@ -41,28 +41,33 @@ jsb_array_ctor:         resq 1
 jsb_string_ctor:        resq 1
 jsb_number_ctor:        resq 1
 jsb_boolean_ctor:       resq 1
+jsb_function_ctor:      resq 1
+jsb_array_generics:     resq 1          ; object: generic array methods by name (prelude)
 jsb_rng:                resq 1
 
 section .rodata
 jsb_natives:
 JSNATIVE js_global, "parseInt", jsb_parse_int, 2
+JSNATIVE js_global, "eval", jsb_eval, 1
+JSNATIVE js_global, "__arrayGenerics", jsb_set_array_generics, 1
 JSNATIVE js_global, "parseFloat", jsb_parse_float, 1
 JSNATIVE js_global, "isNaN", jsb_is_nan, 1
 JSNATIVE js_global, "isFinite", jsb_is_finite, 1
 JSNATIVE jsb_object_ctor, "keys", jsb_object_keys, 1
 JSNATIVE jsb_array_ctor, "isArray", jsb_array_is_array, 1
 JSNATIVE jsb_string_ctor, "fromCharCode", jsb_string_from_char_code, 1
+JSNATIVE jsb_string_ctor, "raw", jsb_string_raw, 1
 JSNATIVE js_object_proto, "toString", jsb_object_to_string, 0
 JSNATIVE js_object_proto, "valueOf", jsb_object_value_of, 0
-JSNATIVE js_object_proto, "hasOwnProperty", jsb_object_has_own, 1
+JSNATIVE js_object_proto, "hasOwnProperty", jsb_object_has_own_px, 1
 JSNATIVE js_function_proto, "toString", jsb_function_to_string, 0
 JSNATIVE js_error_protos, "toString", jsb_error_to_string, 0
-JSNATIVE js_array_proto, "push", jsb_array_push, 1
-JSNATIVE js_array_proto, "pop", jsb_array_pop, 0
-JSNATIVE js_array_proto, "join", jsb_array_join, 1
-JSNATIVE js_array_proto, "toString", jsb_array_to_string, 0
-JSNATIVE js_array_proto, "indexOf", jsb_array_index_of, 1
-JSNATIVE js_array_proto, "slice", jsb_array_slice, 2
+JSNATIVE js_array_proto, "push", jsb_array_push_any, 1
+JSNATIVE js_array_proto, "pop", jsb_array_pop_any, 0
+JSNATIVE js_array_proto, "join", jsb_array_join_any, 1
+JSNATIVE js_array_proto, "toString", jsb_array_to_string_any, 0
+JSNATIVE js_array_proto, "indexOf", jsb_array_index_of_any, 1
+JSNATIVE js_array_proto, "slice", jsb_array_slice_any, 2
 JSNATIVE js_string_proto, "toString", jsb_string_value_of, 0
 JSNATIVE js_string_proto, "valueOf", jsb_string_value_of, 0
 JSNATIVE js_string_proto, "charAt", jsb_string_char_at, 1
@@ -129,12 +134,14 @@ JSCONST jsb_number_ctor, "MIN_VALUE", 5e-324
 %endmacro
 jsb_error_ctors:
     dq jsb_error_ctor_0, jsb_error_ctor_1, jsb_error_ctor_2, jsb_error_ctor_3, jsb_error_ctor_4
+    dq jsb_error_ctor_5, jsb_error_ctor_6
 jsb_ctors:
 JSCTOR jsb_object_ctor, jsb_object, 1, js_object_proto, "Object"
 JSCTOR jsb_array_ctor, jsb_array, 1, js_array_proto, "Array"
-JSCTOR jsb_string_ctor, jsb_string, 1, js_string_proto, "String"
-JSCTOR jsb_number_ctor, jsb_number, 1, js_number_proto, "Number"
-JSCTOR jsb_boolean_ctor, jsb_boolean, 1, js_boolean_proto, "Boolean"
+JSCTOR jsb_string_ctor, jsb_string_new, 1, js_string_proto, "String"
+JSCTOR jsb_number_ctor, jsb_number_new, 1, js_number_proto, "Number"
+JSCTOR jsb_boolean_ctor, jsb_boolean_new, 1, js_boolean_proto, "Boolean"
+JSCTOR jsb_function_ctor, jsb_function, 1, js_function_proto, "Function"
     dq 0
 
 jsb_name_global_this:   db "globalThis", 0
@@ -156,9 +163,36 @@ jsb_class_null:         db "[object Null]", 0
 jsb_class_string:       db "[object String]", 0
 jsb_class_number:       db "[object Number]", 0
 jsb_class_boolean:      db "[object Boolean]", 0
+jsb_class_error:        db "[object Error]", 0
+jsb_class_regexp:       db "[object RegExp]", 0
+jsb_class_date:         db "[object Date]", 0
+jsb_class_open:         db "[object ", 0
+jsb_fn_source_open:     db "(function anonymous(", 0
+jsb_fn_source_body:     db 10, ") {", 10, 0
+jsb_fn_source_close:    db 10, "})", 0
+jsb_comma:              db ",", 0
+jsmsg_illegal_array:    db "Array method called on a value that is not array-like", 0
+jsb_tag_map:            db "Map", 0
+jsb_tag_set:            db "Set", 0
+jsb_tag_weakmap:        db "WeakMap", 0
+jsb_tag_weakset:        db "WeakSet", 0
+jsb_tag_promise:        db "Promise", 0
+jsb_tag_symbol:         db "Symbol", 0
+jsb_tag_generator:      db "Generator", 0
+align 8
+jsb_tags:
+    dq jscol_map_proto, jsb_tag_map
+    dq jscol_set_proto, jsb_tag_set
+    dq jscol_weakmap_proto, jsb_tag_weakmap
+    dq jscol_weakset_proto, jsb_tag_weakset
+    dq js_promise_proto, jsb_tag_promise
+    dq js_symbol_proto, jsb_tag_symbol
+    dq js_generator_proto, jsb_tag_generator
+    dq 0
+jsb_class_close:        db "]", 0
 jsb_fn_prefix:          db "function ", 0
 jsb_fn_native:          db "() { [native code] }", 0
-jsb_comma:              db ",", 0
+
 jsmsg_not_number:       db "Number.prototype.% requires that 'this' be a Number", 0
 jsmsg_radix:            db "toString() radix must be between 2 and 36", 0
 jsmsg_fixed:            db "toFixed() digits argument must be between 0 and 100", 0
@@ -262,6 +296,9 @@ js_init_builtins:
     call jscol_init
     call jsre_init
     call jsdate_init
+    call jstx_init
+    call jsta_init
+    call jsprx_init
     call jsl_init
     call jsa_init
     call jsn_init
@@ -284,11 +321,30 @@ js_init_builtins:
     lea r8, [r8 + rcx + 17]
     jmp .constant
 .constants_done:
+    ; [Symbol.toStringTag] of the built-in prototypes
+    lea r8, [jsb_tags]
+.tag:
+    mov rdi, [r8]
+    test rdi, rdi
+    jz .tags_done
+    mov rsi, [r8 + 8]
+    call jsb_cstr
+    mov rcx, rax
+    mov rax, [rdi]
+    mov edx, [sym_to_string_tag]
+    call jsobj_define_hidden
+    add r8, 16
+    jmp .tag
+.tags_done:
     ; Math.random seed
     lea rdi, [jsb_rng]
     mov ecx, 8
     call rand_bytes
     or qword [jsb_rng], 1
+    ; the library's JavaScript part
+    lea rsi, [js_prelude_src]
+    mov ecx, js_prelude_len
+    call js_run_prelude
     pop r8
     pop rdi
     pop rsi
@@ -384,6 +440,14 @@ jsb_error_ctor_2:
 jsb_error_ctor_3:
     push r9
     mov r9d, 3
+    jmp jsb_error_common
+jsb_error_ctor_5:
+    push r9
+    mov r9d, 5
+    jmp jsb_error_common
+jsb_error_ctor_6:
+    push r9
+    mov r9d, 6
     jmp jsb_error_common
 jsb_error_ctor_4:
     push r9
@@ -686,6 +750,7 @@ jsb_cstr:
 ; jsb_this_string: RDX = this -> RAX = ToString(this) (TypeError for
 ; undefined/null); RSI = method name for the message
 jsb_this_string:
+    call jsb_unwrap_this
     mov rax, rdx
     push rdx
     shr rdx, 48
@@ -911,7 +976,253 @@ jsb_boolean:
     call js_truthy
     jmp js_bool
 
-; Object(value)
+; Function(p1, ..., body) / new Function(...): a function made from source
+; text, in the global scope
+jsb_function:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push r8
+    push r9
+    mov r9d, ecx                    ; arguments
+    lea rsi, [jsb_fn_source_open]
+    call jsstr_from_cstr
+    mov rbx, rax                    ; the source so far
+    xor r8d, r8d
+.param:
+    lea eax, [r8d + 1]
+    cmp eax, r9d
+    jae .body
+    test r8d, r8d
+    jz .no_comma
+    lea rsi, [jsb_comma]
+    call .append_cstr
+.no_comma:
+    mov rax, [rdi + r8*8]
+    call js_to_string
+    call .append
+    inc r8d
+    jmp .param
+.body:
+    lea rsi, [jsb_fn_source_body]
+    call .append_cstr
+    test r9d, r9d
+    jz .no_body
+    lea eax, [r9d - 1]
+    mov rax, [rdi + rax*8]
+    call js_to_string
+    call .append
+.no_body:
+    lea rsi, [jsb_fn_source_close]
+    call .append_cstr
+    call jsb_eval_source
+    pop r9
+    pop r8
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+.append_cstr:
+    call jsstr_from_cstr
+.append:
+    mov rdx, rax
+    mov rax, rbx
+    call jsstr_concat
+    mov rbx, rax
+    ret
+
+; eval(code): runs a string as a script in the global scope (an indirect
+; eval: the caller's local variables are not visible) -> its completion value
+jsb_eval:
+    xor eax, eax
+    call jsb_arg
+    push rdx
+    mov rdx, rax
+    shr rdx, 48
+    cmp edx, JS_TAG_STRING
+    pop rdx
+    jne .value
+    push rbx
+    mov ebx, eax
+    call jsb_eval_source
+    pop rbx
+.value:
+    ret
+
+; jsb_eval_source: RBX = source string (heap pointer) -> RAX = its completion
+; value (an error it throws is thrown on)
+jsb_eval_source:
+    push rcx
+    push rsi
+    lea rsi, [rbx + JSTR_DATA]
+    mov ecx, [rbx + JSTR_LEN]
+    call js_eval
+    jc .threw
+    pop rsi
+    pop rcx
+    ret
+.threw:
+    mov rax, [js_exception]
+    jmp js_throw_value
+
+; String.raw(strings, ...values): strings.raw with the values in between
+jsb_string_raw:
+    push rbx
+    push rcx
+    push rdx
+    push r8
+    push r9
+    push r10
+    mov r10d, ecx                   ; arguments
+    xor eax, eax
+    call jsb_arg
+    mov rdx, [atom_raw]
+    call js_get
+    mov rbx, rax                    ; raw
+    mov rdx, [atom_length]
+    call js_get
+    call js_to_int32
+    mov r9d, eax                    ; pieces
+    mov r8, [atom_empty]            ; the result so far
+    xor ecx, ecx
+.piece:
+    cmp ecx, r9d
+    jge .done
+    ; (a value before every piece but the first)
+    test ecx, ecx
+    jz .text
+    cmp ecx, r10d
+    jae .text
+    mov rax, [rdi + rcx*8]
+    call js_to_string
+    mov rdx, rax
+    mov rax, r8
+    call jsstr_concat
+    mov r8, rax
+.text:
+    cvtsi2sd xmm0, ecx
+    movq rdx, xmm0
+    mov rax, rbx
+    call js_get_elem
+    call js_to_string
+    mov rdx, rax
+    mov rax, r8
+    call jsstr_concat
+    mov r8, rax
+    inc ecx
+    jmp .piece
+.done:
+    mov rax, r8
+    call jsb_box_string
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; ------------------------------------------------------------------------------
+; Array methods on objects that are not arrays (array-likes, strings, jQuery
+; objects...): each native is reached through a check, and the rest go to the
+; generic versions the prelude registers (__arrayGenerics), by the method's name
+; ------------------------------------------------------------------------------
+%macro ARRAY_METHOD 1
+%1_any:
+    call jsb_is_array_this
+    jc jsb_array_generic
+    jmp %1
+%endmacro
+ARRAY_METHOD jsb_array_index_of
+ARRAY_METHOD jsb_array_join
+ARRAY_METHOD jsb_array_pop
+ARRAY_METHOD jsb_array_push
+ARRAY_METHOD jsb_array_slice
+ARRAY_METHOD jsb_array_to_string
+ARRAY_METHOD jsl_array_at
+ARRAY_METHOD jsl_array_concat
+ARRAY_METHOD jsl_array_every
+ARRAY_METHOD jsl_array_fill
+ARRAY_METHOD jsl_array_filter
+ARRAY_METHOD jsl_array_find
+ARRAY_METHOD jsl_array_find_index
+ARRAY_METHOD jsl_array_find_last
+ARRAY_METHOD jsl_array_find_last_index
+ARRAY_METHOD jsl_array_flat
+ARRAY_METHOD jsl_array_flat_map
+ARRAY_METHOD jsl_array_for_each
+ARRAY_METHOD jsl_array_includes
+ARRAY_METHOD jsl_array_last_index_of
+ARRAY_METHOD jsl_array_map
+ARRAY_METHOD jsl_array_reduce
+ARRAY_METHOD jsl_array_reduce_right
+ARRAY_METHOD jsl_array_reverse
+ARRAY_METHOD jsl_array_shift
+ARRAY_METHOD jsl_array_some
+ARRAY_METHOD jsl_array_sort
+ARRAY_METHOD jsl_array_splice
+ARRAY_METHOD jsl_array_unshift
+
+; jsb_is_array_this: RDX = this -> CF=1 if it is not an array (all kept)
+jsb_is_array_this:
+    push rax
+    mov rax, rdx
+    shr rax, 48
+    cmp eax, JS_TAG_OBJECT
+    jne .no
+    mov eax, edx
+    cmp byte [rax + JH_KIND], JK_ARRAY
+    jne .no
+    pop rax
+    clc
+    ret
+.no:
+    pop rax
+    stc
+    ret
+
+; jsb_array_generic: a native array method (R10) called on something else ->
+; the generic version of the same name
+jsb_array_generic:
+    push rbx
+    push rdx
+    mov rax, [jsb_array_generics]
+    test rax, rax
+    jz .none
+    mov rdx, [r10 + JFN_NAME]
+    call jsobj_find_own
+    jc .none
+    mov rax, [rbx + JPE_VAL]
+    pop rdx
+    call js_call
+    pop rbx
+    ret
+.none:
+    pop rdx
+    pop rbx
+    lea rsi, [jsmsg_illegal_array]
+    xor edi, edi
+    jmp js_throw_type
+
+; __arrayGenerics(object): the prelude's generic array methods, by name
+jsb_set_array_generics:
+    xor eax, eax
+    call jsb_arg
+    push rcx
+    mov rcx, rax
+    shr rcx, 48
+    cmp ecx, JS_TAG_OBJECT
+    pop rcx
+    jne .done
+    mov eax, eax
+    mov [jsb_array_generics], rax
+.done:
+    mov rax, JS_UNDEF
+    ret
+
+; Object(value): objects as they are, primitives in their wrapper objects
 jsb_object:
     xor eax, eax
     call jsb_arg
@@ -920,10 +1231,105 @@ jsb_object:
     shr rdx, 48
     cmp edx, JS_TAG_OBJECT
     je .out
+    cmp edx, JS_TAG_STRING
+    je .string
+    cmp edx, JS_TAG_SPECIAL
+    jb .number
+    jne .plain
+    cmp eax, 2
+    jb .plain                       ; undefined, null
+    cmp eax, 3
+    ja .plain
+    mov rdx, [js_boolean_proto]     ; true / false
+    call jsb_wrap
+    jmp .out
+.string:
+    mov rdx, [js_string_proto]
+    call jsb_wrap
+    jmp .out
+.number:
+    mov rdx, [js_number_proto]
+    call jsb_wrap
+    jmp .out
+.plain:
     call jsobj_new_plain
     BOX rax, rdx, JS_OBJ_BITS
 .out:
     pop rdx
+    ret
+
+; String(value) / Number(value) / Boolean(value), and under new their
+; wrapper objects
+jsb_string_new:
+    call jsb_string
+    push rdx
+    mov rdx, [js_string_proto]
+    jmp jsb_wrap_if_new
+jsb_number_new:
+    call jsb_number
+    push rdx
+    mov rdx, [js_number_proto]
+    jmp jsb_wrap_if_new
+jsb_boolean_new:
+    call jsb_boolean
+    push rdx
+    mov rdx, [js_boolean_proto]
+jsb_wrap_if_new:
+    cmp r8d, 1
+    jne .plain
+    call jsb_wrap
+.plain:
+    pop rdx
+    ret
+
+; jsb_wrap: RAX = a primitive, RDX = prototype -> RAX = a wrapper object of it
+; (a String's has its length)
+jsb_wrap:
+    push rbx
+    push rcx
+    push rdx
+    mov rbx, rax
+    mov ecx, JWRAP_SIZE
+    call js_alloc
+    mov byte [rax + JH_KIND], JK_OBJECT
+    mov dword [rax + JOBJ_CLASS], JC_WRAPPER
+    mov [rax + JOBJ_PROTO], rdx
+    mov [rax + JWRAP_VALUE], rbx
+    mov rcx, rbx
+    shr rcx, 48
+    cmp ecx, JS_TAG_STRING
+    jne .done
+    push rax
+    mov ecx, ebx
+    mov eax, [rcx + JSTR_LEN]
+    call jsb_from_int
+    mov rcx, rax
+    pop rax
+    mov rdx, [atom_length]
+    call jsobj_define_hidden
+.done:
+    BOX rax, rcx, JS_OBJ_BITS
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; jsb_unwrap_this: RDX = a value -> RDX = the primitive in it if it is a
+; wrapper object (new String(...)), else the value
+jsb_unwrap_this:
+    push rax
+    mov rax, rdx
+    shr rax, 48
+    cmp eax, JS_TAG_OBJECT
+    jne .done
+    mov eax, edx
+    cmp byte [rax + JH_KIND], JK_OBJECT
+    jne .done
+    cmp dword [rax + JOBJ_CLASS], JC_WRAPPER
+    jne .done
+    mov rdx, [rax + JWRAP_VALUE]
+.done:
+    pop rax
     ret
 
 ; Array(...items) / Array(length)
@@ -1015,8 +1421,27 @@ jsb_array_is_array:
     push rbx
     push rdx
     mov rdx, rax
+.value:
     call jsb_this_array
-    cmc
+    jnc .yes
+    ; a proxy of an array is one too
+    mov rbx, rdx
+    shr rbx, 48
+    cmp ebx, JS_TAG_OBJECT
+    jne .no
+    mov ebx, edx
+    cmp byte [rbx + JH_KIND], JK_OBJECT
+    jne .no
+    cmp dword [rbx + JOBJ_CLASS], JC_PROXY
+    jne .no
+    mov rdx, [rbx + JPX_TARGET]
+    jmp .value
+.no:
+    clc
+    jmp .out
+.yes:
+    stc
+.out:
     call js_bool
     pop rdx
     pop rbx
@@ -1060,17 +1485,55 @@ jsb_object_to_string:
     lea rsi, [jsb_class_arguments]
     jmp .out
 .not_array:
+    ; a string [Symbol.toStringTag] names it: [object Map], ...
+    push rax
+    mov rdx, [sym_to_string_tag]
+    call js_get
+    mov rdx, rax
+    shr rdx, 48
+    cmp edx, JS_TAG_STRING
+    je .tagged
+    pop rax
     lea rsi, [jsb_class_function]
     cmp byte [rbx + JH_KIND], JK_FUNC
     je .out
     cmp byte [rbx + JH_KIND], JK_NATIVE
     je .out
+    mov edx, [rbx + JOBJ_CLASS]
     lea rsi, [jsb_class_math]
-    cmp dword [rbx + JOBJ_CLASS], JC_MATH
+    cmp edx, JC_MATH
+    je .out
+    lea rsi, [jsb_class_error]
+    cmp edx, JC_ERROR
+    je .out
+    lea rsi, [jsb_class_regexp]
+    cmp edx, JC_REGEXP
+    je .out
+    lea rsi, [jsb_class_date]
+    cmp edx, JC_DATE
     je .out
     lea rsi, [jsb_class_object]
 .out:
     call jsb_cstr
+    pop rsi
+    pop rdx
+    pop rbx
+    ret
+.tagged:
+    ; "[object " + tag + "]"
+    add rsp, 8
+    mov ebx, eax
+    lea rsi, [jsb_class_open]
+    call jsstr_from_cstr
+    mov rdx, rbx
+    call jsstr_concat
+    mov rbx, rax
+    lea rsi, [jsb_class_close]
+    call jsstr_from_cstr
+    mov rdx, rax
+    mov rax, rbx
+    call jsstr_concat
+    call jsb_box_string
     pop rsi
     pop rdx
     pop rbx
@@ -1081,7 +1544,13 @@ jsb_object_value_of:
     mov rax, rdx
     ret
 
-; Object.prototype.hasOwnProperty(key)
+; Object.prototype.hasOwnProperty(key) (of a proxy: of its target)
+jsb_object_has_own_px:
+    push rax
+    mov rax, rdx
+    call js_unproxy
+    mov rdx, rax
+    pop rax
 jsb_object_has_own:
     push rbx
     push rcx
@@ -1748,6 +2217,7 @@ jsb_string_from_char_code:
 
 ; jsb_this_number: RDX = this, RSI = method name -> RAX = the number
 jsb_this_number:
+    call jsb_unwrap_this
     mov rax, rdx
     push rdx
     shr rdx, 48
@@ -2117,12 +2587,18 @@ jsbig_divmod_small:
 
 ; Boolean.prototype.toString / valueOf
 jsb_boolean_to_string:
+    push rdx
+    call jsb_unwrap_this
     mov rax, rdx
+    pop rdx
     call js_to_string
     jmp jsb_box_string
 
 jsb_boolean_value_of:
+    push rdx
+    call jsb_unwrap_this
     mov rax, rdx
+    pop rdx
     ret
 
 ; ==============================================================================

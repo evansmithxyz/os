@@ -77,6 +77,13 @@ jsc_setloc_end:         resq 1          ; where the last SETLOC ended
 alignb 4
 jsc_env_depth:          resd 1          ; block envs entered in this function
 jsc_completion:         resd 1          ; 1 = expression statements set the completion value
+jsc_tag_sites:          resd 1          ; tagged templates compiled (their TAGSTR numbers)
+jsc_with_depth:         resd 1          ; with statements around the code being compiled
+jsc_class_decl:         resb 1          ; the next jsc_class is a declaration
+alignb 8
+jsc_with_atoms:         resq JSC_MAX_WITH ; their hidden variables, outermost first
+jsc_with_scopes:        resq JSC_MAX_WITH ; and their scopes
+jsc_with_patches:       resq 1          ; jsc_with_begin's jumps
 jsc_line:               resd 1          ; line of the last OP_LINE
                         resd 1          ; (jsc_function saves jsc_line as a qword)
 
@@ -90,6 +97,7 @@ section .text
 ; ------------------------------------------------------------------------------
 jsc_compile_script:
     mov [jsc_script], rax
+    mov dword [jsc_with_depth], 0
     mov qword [jsc_code_ptr], JS_CODEBUF_ADDR
     mov qword [jsc_fi], 0
     mov qword [jsc_scope], 0
@@ -669,8 +677,143 @@ jsc_resolve:
     pop rdi
     ret
 
+JSC_MAX_WITH            equ 32
+
+; ------------------------------------------------------------------------------
+; with: a name inside with statements is first looked for in their objects,
+; innermost first: [the object] WITHGET name, found (WITHSET for stores), and
+; after them the ordinary code
+; ------------------------------------------------------------------------------
+
+; jsc_with_begin: RDX = atom, AL = OP_WITHGET / OP_WITHSET -> the lookups
+; emitted; their jumps in jsc_with_patches
+jsc_with_begin:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    movzx esi, al
+    mov rdi, rdx
+    mov qword [jsc_with_patches], 0
+    mov ecx, [jsc_with_depth]
+    mov rax, [jsc_scope]            ; where the name is looked for from
+.each:
+    test ecx, ecx
+    jz .done
+    dec ecx
+    ; declared in a scope inside this with? then that is the one (no lookups)
+.inner:
+    cmp rax, [jsc_with_scopes + rcx*8]
+    je .this_with
+    test rax, rax
+    jz .done
+    push rbx
+    push rax
+    mov rbx, rax
+    mov rdx, rdi
+    call jsp_scope_find
+    pop rax
+    pop rbx
+    jnc .done
+    mov rax, [rax + JSC_PARENT]
+    jmp .inner
+.this_with:
+    mov rax, [rax + JSC_PARENT]     ; (outer withs: from its parent on)
+    push rax
+    ; the object: the hidden variable, found the ordinary way
+    mov rdx, [jsc_with_atoms + rcx*8]
+    push rcx
+    push qword [jsc_with_depth]
+    mov dword [jsc_with_depth], 0
+    call jsc_load_plain
+    pop qword [jsc_with_depth]
+    pop rcx
+    mov eax, esi
+    call jsc_op
+    mov eax, edi
+    call jsc_u32
+    mov rax, [jsc_code_ptr]
+    push rax
+    xor eax, eax
+    call jsc_u32
+    pop rax
+    push rbx
+    lea rbx, [jsc_with_patches]
+    call jsc_add_patch
+    pop rbx
+    pop rax
+    jmp .each
+.done:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; jsc_with_end: the jumps of jsc_with_begin -> here
+jsc_with_end:
+    push rax
+    push rdx
+    mov rax, [jsc_with_patches]
+    mov rdx, [jsc_code_ptr]
+    call jsc_resolve_patches
+    pop rdx
+    pop rax
+    ret
+
+; jsc_with: RBX = NT_WITH
+jsc_with:
+    push rax
+    push rcx
+    push rdx
+    push rdi
+    mov rax, [rbx + JN_E]
+    call jsc_enter_scope
+    push rax                        ; the scope to go back to
+    mov rax, [rbx + JN_A]
+    call jsc_expr
+    mov rdx, [rbx + JN_C]
+    mov edi, 1
+    call jsc_store
+    mov al, OP_POP
+    call jsc_op
+    mov ecx, [jsc_with_depth]
+    cmp ecx, JSC_MAX_WITH
+    jae .too_deep
+    mov [jsc_with_atoms + rcx*8], rdx
+    mov rax, [rbx + JN_E]
+    mov [jsc_with_scopes + rcx*8], rax
+    inc dword [jsc_with_depth]
+    mov rax, [rbx + JN_B]
+    call jsc_stmt
+    dec dword [jsc_with_depth]
+    pop rax
+    call jsc_leave_scope
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+.too_deep:
+    lea rsi, [jsmsg_too_deep]
+    jmp jslex_error
+
 ; jsc_load: RDX = atom -> emits code pushing the variable's value
 jsc_load:
+    cmp dword [jsc_with_depth], 0
+    je jsc_load_plain
+    push rax
+    mov al, OP_WITHGET
+    call jsc_with_begin
+    call jsc_load_plain
+    call jsc_with_end
+    pop rax
+    ret
+
+; jsc_load_plain: jsc_load, ignoring with statements
+jsc_load_plain:
     push rax
     push rbx
     push rcx
@@ -706,6 +849,20 @@ jsc_load:
 ; jsc_store: RDX = atom, EDI = 1 when this initialises the declaration
 ; -> emits code storing the top of the stack (which stays there)
 jsc_store:
+    test edi, edi
+    jnz jsc_store_plain
+    cmp dword [jsc_with_depth], 0
+    je jsc_store_plain
+    push rax
+    mov al, OP_WITHSET
+    call jsc_with_begin
+    call jsc_store_plain
+    call jsc_with_end
+    pop rax
+    ret
+
+; jsc_store_plain: jsc_store, ignoring with statements
+jsc_store_plain:
     push rax
     push rbx
     push rcx
@@ -889,6 +1046,8 @@ jsc_stmt:
     je .funcdecl
     cmp ecx, NT_EMPTY
     je .out
+    cmp ecx, NT_WITH
+    je .with
     cmp ecx, NT_BLOCK
     je .block
     cmp ecx, NT_LABELED
@@ -936,6 +1095,9 @@ jsc_stmt:
     jmp .out
 .var:
     call jsc_declarations
+    jmp .out
+.with:
+    call jsc_with
     jmp .out
 .block:
     mov rax, [rbx + JN_E]
@@ -1010,6 +1172,7 @@ jsc_stmt:
     call jsc_try
     jmp .out
 .class:
+    mov byte [jsc_class_decl], 1
     call jsc_class
     mov rdx, [rbx + JN_A]
     mov edi, 1
@@ -1519,6 +1682,12 @@ jsc_forin:
     lea rbx, [rdi + JLC_BREAKS]
     call jsc_add_patch
     pop rbx
+    ; for await: the value awaited
+    test word [rbx + JN_FLAGS], JNF_AWAIT
+    jz .not_await
+    mov al, OP_AWAIT
+    call jsc_op
+.not_await:
     ; per-iteration scope for let/const
     mov rax, [rbx + JN_E]
     call jsc_enter_scope
@@ -1931,6 +2100,8 @@ jsc_expr_discard:
     mov rbx, rax
     cmp byte [rbx + JN_TYPE], NT_UPDATE
     jne .general
+    cmp dword [jsc_with_depth], 0
+    jne .general
     mov rax, [rbx + JN_A]
     cmp byte [rax + JN_TYPE], NT_IDENT
     jne .general
@@ -2046,6 +2217,10 @@ jsc_expr:
     je .await
     cmp ecx, NT_YIELD
     je .yield
+    cmp ecx, NT_TAGSTR
+    je .tagstr
+    cmp ecx, NT_NEWTARGET
+    je .new_target
     cmp ecx, NT_REGEX
     je .regex
     ; NT_HOLE outside an array: undefined
@@ -2173,6 +2348,29 @@ jsc_expr:
     mov al, OP_AWAIT
     call jsc_op
     jmp .out
+.new_target:
+    mov al, OP_NEWTARGET
+    call jsc_op
+    jmp .out
+.tagstr:
+    ; TAGSTR site32, n16, then n x (cooked atom32, raw atom32)
+    mov al, OP_TAGSTR
+    call jsc_op
+    mov eax, [jsc_tag_sites]
+    inc dword [jsc_tag_sites]
+    call jsc_u32
+    mov eax, [rbx + JN_C]
+    call jsc_u16
+    mov rsi, [rbx + JN_A]
+.tagstr_piece:
+    test rsi, rsi
+    jz .out
+    mov eax, [rsi + JN_A]
+    call jsc_u32
+    mov eax, [rsi + JN_B]
+    call jsc_u32
+    mov rsi, [rsi + JN_NEXT]
+    jmp .tagstr_piece
 .regex:
     mov rdx, [rbx + JN_A]
     mov al, OP_REGEXP
@@ -2395,6 +2593,8 @@ jsc_unary:
     jmp .out
 .typeof:
     cmp byte [rsi + JN_TYPE], NT_IDENT
+    jne .typeof_value
+    cmp dword [jsc_with_depth], 0
     jne .typeof_value
     push rbx
     push rcx
@@ -2778,6 +2978,9 @@ jsc_class:
     push rcx
     push rdx
     push rsi
+    push rdi
+    movzx edi, byte [jsc_class_decl]
+    mov byte [jsc_class_decl], 0
     xor ecx, ecx
     mov rax, [rbx + JN_B]
     test rax, rax
@@ -2794,6 +2997,15 @@ jsc_class:
     call jsc_op
     mov eax, edx
     call jsc_u32
+    ; a declaration's name is the class from here on (static blocks and
+    ; static fields use it)
+    test edi, edi
+    jz .members
+    mov rdx, [rbx + JN_A]
+    test rdx, rdx
+    jz .members
+    call jsc_store                  ; (EDI = 1: initialising)
+.members:
     mov rsi, [rbx + JN_C]
 .member:
     test rsi, rsi
@@ -2806,6 +3018,8 @@ jsc_class:
     mov al, OP_GETPROP
     call jsc_op_u32_cache
 .target:
+    test byte [rsi + JN_OP], CM_BLOCK
+    jnz .static_block
     test byte [rsi + JN_OP], CM_FIELD
     jz .method
     ; a static field
@@ -2857,7 +3071,31 @@ jsc_class:
 .next:
     mov rsi, [rsi + JN_NEXT]
     jmp .member
+.static_block:
+    ; [class class] -> the block as a static method, then called on the class
+    mov rax, [rsi + JN_B]
+    call jsc_expr
+    mov rdx, [rsi + JN_A]
+    mov al, OP_METHOD
+    call jsc_op_u32
+    xor eax, eax
+    call jsc_op
+    mov al, OP_DUP
+    call jsc_op
+    mov rdx, [rsi + JN_A]
+    mov al, OP_GETMETHOD
+    call jsc_op_u32
+    mov al, OP_CALL
+    call jsc_op
+    xor eax, eax
+    call jsc_op                     ; (no arguments)
+    xor eax, eax
+    call jsc_u32                    ; (no name)
+    mov al, OP_POP
+    call jsc_op
+    jmp .next
 .done:
+    pop rdi
     pop rsi
     pop rdx
     pop rcx

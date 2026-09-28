@@ -5,7 +5,8 @@
 ;   js <file.js>     run a script from the disk
 ;   js -p <...>      the same, profiled: every millisecond the timer records
 ;                    where the CPU is (PROF_ADDR; tools/profile.py reads it)
-;   js -d <code>     compile only and print each function's bytecode in hex
+;   js -d <...>      compile only and print each function's bytecode in hex
+;   js -c <...>      compile only: "ok" or the syntax error
 ; Every run starts with a fresh engine (kernel/js/). console.log prints to the
 ; console; an uncaught error prints "Uncaught <error> (line N)". Like Node.js,
 ; the command then runs promise jobs and waits for timers until none are left
@@ -16,6 +17,7 @@
 
 section .rodata
 msg_js_usage:           db "Usage: js <code> | js <file.js>   e.g. js 1 + 2", 10, 0
+msg_js_compiled:        db "ok", 10, 0
 msg_js_ram:             db "js needs at least 112 MB of RAM", 10, 0
 msg_js_too_big:         db "Script is too large (1 MB at most)", 10, 0
 klog_js_prof:           db "js prof samples ", 0
@@ -30,39 +32,12 @@ cmd_js:
     jb .no_ram
     cmp word [rsi], '-d'
     je .dump
+    cmp word [rsi], '-c'
+    je .check
     cmp word [rsi], '-p'
     je .profile
-    ; a single word ending in .js that names a file: run the file
-    call strlen
-    mov rcx, rax
-    cmp rcx, 4
-    jb .inline
-    cmp dword [rsi + rcx - 3], 0x736A2E + 0     ; ".js" (+ the NUL)
-    jne .inline
-    mov rdi, rsi
-    mov al, ' '
-    push rcx
-    repne scasb
-    pop rcx
-    je .inline                      ; contains a space: code
-    mov rbx, rsi
-    call fs_find_file
-    test rax, rax
-    jz .inline_rbx
-    mov ecx, [rax + INODE_SIZE]
-    cmp ecx, JS_SRC_SIZE
-    ja .too_big
-    mov rdi, JS_SRC_ADDR
-    mov ecx, JS_SRC_SIZE
-    call fs_read_file
-    mov rcx, rax
-    mov rsi, JS_SRC_ADDR
-    jmp .run
-.inline_rbx:
-    mov rsi, rbx
-    call strlen
-    mov rcx, rax
-.inline:
+    call cmd_js_source
+    jc .too_big
 .run:
     call js_reset
     call js_eval
@@ -87,17 +62,28 @@ cmd_js:
     lea rsi, [klog_js_prof]
     jmp klog_dec
 .dump:
-    ; js -d <code>: the compiled script's bytecode in hex (debugging)
+    ; js -d <code | file.js>: the compiled script's bytecode in hex (debugging)
+    mov byte [js_dump_wanted], 1
+    jmp .compile
+.check:
+    ; js -c <code | file.js>: compiled only; "ok" or the syntax error
+    mov byte [js_dump_wanted], 0
+.compile:
     add rsi, 3
-    call strlen
-    mov rcx, rax
+    call cmd_js_source
+    jc .too_big
     call js_reset
     call js_compile_dump
-    ret
+    jc .error_only
+    lea rsi, [msg_js_compiled]
+    jmp con_puts
+.error_only:
+    jmp js_print_error
 .usage:
     mov bl, COLOR_YELLOW
     lea rsi, [msg_js_usage]
     jmp con_puts_color
+
 .no_ram:
     mov bl, COLOR_LIGHT_RED
     lea rsi, [msg_js_ram]
@@ -106,3 +92,53 @@ cmd_js:
     mov bl, COLOR_LIGHT_RED
     lea rsi, [msg_js_too_big]
     jmp con_puts_color
+
+; cmd_js_source: RSI = the argument -> RSI/RCX = the script: the file's text if
+; it is one word ending in .js that names a file, else the argument itself;
+; CF=1 if the file is too big
+cmd_js_source:
+    push rax
+    push rbx
+    push rdi
+    call strlen
+    mov rcx, rax
+    cmp rcx, 4
+    jb .inline
+    cmp dword [rsi + rcx - 3], 0x736A2E + 0     ; ".js" (+ the NUL)
+    jne .inline
+    mov rdi, rsi
+    mov al, ' '
+    push rcx
+    repne scasb
+    pop rcx
+    je .inline                      ; contains a space: code
+    mov rbx, rsi
+    call fs_find_file
+    test rax, rax
+    jz .inline_rbx
+    mov ecx, [rax + INODE_SIZE]
+    cmp ecx, JS_SRC_SIZE
+    ja .too_big
+    mov rdi, JS_SRC_ADDR
+    mov ecx, JS_SRC_SIZE
+    call fs_read_file
+    mov rcx, rax
+    mov rsi, JS_SRC_ADDR
+    jmp .out
+.inline_rbx:
+    mov rsi, rbx
+    call strlen
+    mov rcx, rax
+.inline:
+.out:
+    pop rdi
+    pop rbx
+    pop rax
+    clc
+    ret
+.too_big:
+    pop rdi
+    pop rbx
+    pop rax
+    stc
+    ret

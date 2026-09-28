@@ -34,29 +34,29 @@ jsl_atom_tojson:        resq 1
 
 section .rodata
 jsl_natives:
-JSLNATIVE js_array_proto, "forEach", jsl_array_for_each, 1
-JSLNATIVE js_array_proto, "map", jsl_array_map, 1
-JSLNATIVE js_array_proto, "filter", jsl_array_filter, 1
-JSLNATIVE js_array_proto, "some", jsl_array_some, 1
-JSLNATIVE js_array_proto, "every", jsl_array_every, 1
-JSLNATIVE js_array_proto, "find", jsl_array_find, 1
-JSLNATIVE js_array_proto, "findIndex", jsl_array_find_index, 1
-JSLNATIVE js_array_proto, "findLast", jsl_array_find_last, 1
-JSLNATIVE js_array_proto, "findLastIndex", jsl_array_find_last_index, 1
-JSLNATIVE js_array_proto, "reduce", jsl_array_reduce, 1
-JSLNATIVE js_array_proto, "reduceRight", jsl_array_reduce_right, 1
-JSLNATIVE js_array_proto, "includes", jsl_array_includes, 1
-JSLNATIVE js_array_proto, "lastIndexOf", jsl_array_last_index_of, 1
-JSLNATIVE js_array_proto, "concat", jsl_array_concat, 1
-JSLNATIVE js_array_proto, "reverse", jsl_array_reverse, 0
-JSLNATIVE js_array_proto, "sort", jsl_array_sort, 1
-JSLNATIVE js_array_proto, "splice", jsl_array_splice, 2
-JSLNATIVE js_array_proto, "shift", jsl_array_shift, 0
-JSLNATIVE js_array_proto, "unshift", jsl_array_unshift, 1
-JSLNATIVE js_array_proto, "fill", jsl_array_fill, 1
-JSLNATIVE js_array_proto, "flat", jsl_array_flat, 0
-JSLNATIVE js_array_proto, "flatMap", jsl_array_flat_map, 1
-JSLNATIVE js_array_proto, "at", jsl_array_at, 1
+JSLNATIVE js_array_proto, "forEach", jsl_array_for_each_any, 1
+JSLNATIVE js_array_proto, "map", jsl_array_map_any, 1
+JSLNATIVE js_array_proto, "filter", jsl_array_filter_any, 1
+JSLNATIVE js_array_proto, "some", jsl_array_some_any, 1
+JSLNATIVE js_array_proto, "every", jsl_array_every_any, 1
+JSLNATIVE js_array_proto, "find", jsl_array_find_any, 1
+JSLNATIVE js_array_proto, "findIndex", jsl_array_find_index_any, 1
+JSLNATIVE js_array_proto, "findLast", jsl_array_find_last_any, 1
+JSLNATIVE js_array_proto, "findLastIndex", jsl_array_find_last_index_any, 1
+JSLNATIVE js_array_proto, "reduce", jsl_array_reduce_any, 1
+JSLNATIVE js_array_proto, "reduceRight", jsl_array_reduce_right_any, 1
+JSLNATIVE js_array_proto, "includes", jsl_array_includes_any, 1
+JSLNATIVE js_array_proto, "lastIndexOf", jsl_array_last_index_of_any, 1
+JSLNATIVE js_array_proto, "concat", jsl_array_concat_any, 1
+JSLNATIVE js_array_proto, "reverse", jsl_array_reverse_any, 0
+JSLNATIVE js_array_proto, "sort", jsl_array_sort_any, 1
+JSLNATIVE js_array_proto, "splice", jsl_array_splice_any, 2
+JSLNATIVE js_array_proto, "shift", jsl_array_shift_any, 0
+JSLNATIVE js_array_proto, "unshift", jsl_array_unshift_any, 1
+JSLNATIVE js_array_proto, "fill", jsl_array_fill_any, 1
+JSLNATIVE js_array_proto, "flat", jsl_array_flat_any, 0
+JSLNATIVE js_array_proto, "flatMap", jsl_array_flat_map_any, 1
+JSLNATIVE js_array_proto, "at", jsl_array_at_any, 1
 JSLNATIVE jsb_array_ctor, "from", jsl_array_from, 1
 JSLNATIVE jsb_array_ctor, "of", jsl_array_of, 0
 JSLNATIVE js_function_proto, "call", jsl_function_call, 1
@@ -79,23 +79,23 @@ JSLNATIVE js_string_proto, "concat", jsl_string_concat, 1
 JSLNATIVE js_string_proto, "localeCompare", jsl_string_locale_compare, 1
 JSLNATIVE js_string_proto, "codePointAt", jsb_string_char_code_at, 1
 JSLNATIVE js_string_proto, "normalize", jsb_string_value_of, 0
-JSLNATIVE jsb_object_ctor, "values", jsl_object_values, 1
-JSLNATIVE jsb_object_ctor, "entries", jsl_object_entries, 1
+JSLNATIVE jsb_object_ctor, "values", jsl_object_values_px, 1
+JSLNATIVE jsb_object_ctor, "entries", jsl_object_entries_px, 1
 JSLNATIVE jsb_object_ctor, "assign", jsl_object_assign, 2
 JSLNATIVE jsb_object_ctor, "create", jsl_object_create, 2
-JSLNATIVE jsb_object_ctor, "getPrototypeOf", jsl_object_get_proto, 1
+JSLNATIVE jsb_object_ctor, "getPrototypeOf", jsl_object_get_proto_px, 1
 JSLNATIVE jsb_object_ctor, "setPrototypeOf", jsl_object_set_proto, 2
 JSLNATIVE jsb_object_ctor, "freeze", jsl_object_freeze, 1
 JSLNATIVE jsb_object_ctor, "seal", jsl_object_identity, 1
 JSLNATIVE jsb_object_ctor, "preventExtensions", jsl_object_identity, 1
 JSLNATIVE jsb_object_ctor, "defineProperty", jsl_object_define_property, 3
 JSLNATIVE jsb_object_ctor, "defineProperties", jsl_object_define_properties, 2
-JSLNATIVE jsb_object_ctor, "getOwnPropertyNames", jsl_object_own_names, 1
-JSLNATIVE jsb_object_ctor, "getOwnPropertyDescriptor", jsl_object_own_descriptor, 2
+JSLNATIVE jsb_object_ctor, "getOwnPropertyNames", jsl_object_own_names_px, 1
+JSLNATIVE jsb_object_ctor, "getOwnPropertyDescriptor", jsl_object_own_descriptor_px, 2
 JSLNATIVE jsb_object_ctor, "fromEntries", jsl_object_from_entries, 1
 JSLNATIVE jsb_object_ctor, "is", jsl_object_is, 2
 JSLNATIVE js_object_proto, "isPrototypeOf", jsl_object_is_prototype_of, 1
-JSLNATIVE js_object_proto, "propertyIsEnumerable", jsl_object_property_enumerable, 1
+JSLNATIVE js_object_proto, "propertyIsEnumerable", jsl_object_property_enumerable_px, 1
 JSLNATIVE js_object_proto, "toLocaleString", jsb_object_to_string, 0
 JSLNATIVE jsb_number_ctor, "isInteger", jsl_number_is_integer, 1
 JSLNATIVE jsb_number_ctor, "isSafeInteger", jsl_number_is_safe_integer, 1
@@ -887,9 +887,8 @@ jsl_array_concat:
     mov rsi, rdi
     call jsl_new_array
     mov rdx, rbx
-    BOX rdx, rax, JS_OBJ_BITS
     mov rax, r8
-    call js_spread_into
+    call .append
 .arg:
     test ecx, ecx
     jz .done
@@ -903,7 +902,8 @@ jsl_array_concat:
     cmp byte [rcx + JH_KIND], JK_ARRAY
     jne .single
     mov rax, r8
-    call js_spread_into
+    mov edx, edx
+    call .append
     jmp .next
 .single:
     mov rcx, rdx
@@ -922,6 +922,27 @@ jsl_array_concat:
     pop rdx
     pop rcx
     pop rbx
+    ret
+; .append: RAX = result array, RDX = an array (raw) -> its elements appended,
+; holes as holes
+.append:
+    push rcx
+    push rdx
+    push rdi
+    mov rdi, rdx
+    xor edx, edx
+.element:
+    cmp edx, [rdi + JARR_LEN]
+    jae .appended
+    mov rcx, [rdi + JARR_ELEMS]
+    mov rcx, [rcx + rdx*8]
+    call jsarr_push
+    inc edx
+    jmp .element
+.appended:
+    pop rdi
+    pop rdx
+    pop rcx
     ret
 
 ; reverse(): in place
@@ -1727,7 +1748,14 @@ jsl_function_apply:
     jne .call
     mov ebx, ebx
     cmp byte [rbx + JH_KIND], JK_ARRAY
-    jne .call
+    je .array
+    ; an array-like object ({length, 0: ...}): its elements in an array
+    mov rax, rbx
+    BOX rax, rcx, JS_OBJ_BITS
+    call jsl_array_like_to_array
+    mov rbx, rax
+    xor ecx, ecx
+.array:
     ; holes become undefined: copy them onto the kernel stack
     mov ecx, [rbx + JARR_LEN]
     cmp ecx, 0x10000
@@ -2707,10 +2735,108 @@ jsl_arg_object:
     xor edi, edi
     jmp js_throw_type
 
-; jsl_key_atom: RAX = key value -> RAX = its atom
+; ------------------------------------------------------------------------------
+; Object methods on a proxy look at its target (the traps for them are not
+; supported: getOwnPropertyDescriptor, getPrototypeOf, ...)
+; ------------------------------------------------------------------------------
+%macro UNPROXY_ARG0 1
+%1_px:
+    test ecx, ecx
+    jz %1
+    push rax
+    mov rax, [rdi]
+    call js_unproxy
+    mov [rdi], rax
+    pop rax
+    jmp %1
+%endmacro
+%macro UNPROXY_THIS 1
+%1_px:
+    push rax
+    mov rax, rdx
+    call js_unproxy
+    mov rdx, rax
+    pop rax
+    jmp %1
+%endmacro
+UNPROXY_ARG0 jsl_object_values
+UNPROXY_ARG0 jsl_object_entries
+UNPROXY_ARG0 jsl_object_get_proto
+UNPROXY_ARG0 jsl_object_own_descriptor
+UNPROXY_ARG0 jsl_object_own_names
+UNPROXY_THIS jsl_object_property_enumerable
+
+; js_unproxy: RAX = value -> RAX = the target, if it is a proxy (all the way in)
+js_unproxy:
+    push rcx
+.again:
+    mov rcx, rax
+    shr rcx, 48
+    cmp ecx, JS_TAG_OBJECT
+    jne .done
+    mov ecx, eax
+    cmp byte [rcx + JH_KIND], JK_OBJECT
+    jne .done
+    cmp dword [rcx + JOBJ_CLASS], JC_PROXY
+    jne .done
+    mov rax, [rcx + JPX_TARGET]
+    jmp .again
+.done:
+    pop rcx
+    ret
+
+; jsl_array_like_to_array: RAX = an object value -> RAX = a new array of its
+; elements 0 .. length-1 (raw)
+jsl_array_like_to_array:
+    push rbx
+    push rcx
+    push rdx
+    push r8
+    mov r8, rax
+    mov rdx, [atom_length]
+    call js_get
+    call js_to_int32
+    mov ecx, eax
+    test ecx, ecx
+    jns .count
+    xor ecx, ecx
+.count:
+    cmp ecx, 0x10000
+    jbe .make
+    mov ecx, 0x10000
+.make:
+    push rcx
+    call jsarr_new
+    mov rbx, rax
+    pop rcx
+    xor edx, edx
+.elem:
+    cmp edx, ecx
+    jae .done
+    push rdx
+    push rcx
+    cvtsi2sd xmm0, edx
+    movq rdx, xmm0
+    mov rax, r8
+    call js_get_elem
+    mov rcx, rax
+    mov rax, rbx
+    call jsarr_push
+    pop rcx
+    pop rdx
+    inc edx
+    jmp .elem
+.done:
+    mov rax, rbx
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; jsl_key_atom: RAX = key value -> RAX = its property key (an atom, or a symbol)
 jsl_key_atom:
-    call js_to_string
-    jmp jsstr_intern
+    jmp js_to_key
 
 ; Object.values(object) / Object.entries(object)
 jsl_object_values:
@@ -3108,6 +3234,22 @@ jsl_define_one:
     mov rax, rdx
     call jsl_key_atom
     mov r11, rax                    ; the key
+    ; a function's prototype is kept in the function (made on first use):
+    ; a value replaces it, attributes alone leave it
+    mov ebx, r10d
+    cmp byte [rbx + JH_KIND], JK_FUNC
+    jne .not_prototype
+    cmp r11, [atom_prototype]
+    jne .not_prototype
+    mov rax, rsi
+    mov rdx, [jsl_atom_value]
+    call js_get
+    mov rcx, JS_UNDEF
+    cmp rax, rcx
+    je .done
+    mov [rbx + JFN_PROTO_OBJ], rax
+    jmp .done
+.not_prototype:
     ; an array element
     mov ebx, r10d
     cmp byte [rbx + JH_KIND], JK_ARRAY
@@ -3263,9 +3405,12 @@ jsl_object_own_names:
     jnc .next
     push rcx
     mov ecx, eax
+    cmp byte [rcx + JH_KIND], JK_SYMBOL
+    je .symbol                      ; (symbol keys are not names)
     BOX rcx, rax, JS_STR_BITS
     mov rax, r8
     call jsarr_push
+.symbol:
     pop rcx
 .next:
     add rsi, JPE_SIZE
@@ -4055,6 +4200,7 @@ jsl_json_value:
     push rsi
     push rdi
     push r8
+    call js_unproxy                 ; (a proxy: as its target)
     mov rbx, rax
     ; value.toJSON(key)
     mov rcx, rbx

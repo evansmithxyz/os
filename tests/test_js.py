@@ -167,7 +167,7 @@ class JavaScriptTest(OSTestCase):
         self.assertJs("var x = )", "Uncaught SyntaxError: Unexpected token ')' (line 1)")
         self.assertJs("function deep(n) { return deep(n + 1) } deep(0)",
                       "Uncaught RangeError: Maximum call stack size exceeded (line 1)")
-        self.assertJs("String.raw`x`", "Uncaught SyntaxError: tagged templates is not supported yet (line 1)")
+        self.assertJs("import x from 'y'", "Uncaught SyntaxError: import/export is not supported yet (line 1)")
 
     # --- step 3: everyday JavaScript ---------------------------------------------
     def test_exceptions(self):
@@ -498,6 +498,92 @@ class JavaScriptTest(OSTestCase):
         m = re.search(r"^prof samples (\d+)", out, re.M)
         self.assertTrue(m and int(m.group(1)) > 0, out)
         self.assertIn("Usage: prof on | prof off", self.vm.run("prof"))
+
+    # --- step 7: real-site compatibility --------------------------------------------------
+    def test_function_eval_and_tagged_templates(self):
+        self.assertJs("[new Function('a', 'b', 'return a * b')(6, 7), Function('return typeof this')(), "
+                      "eval('var q = 2; q + 1'), typeof q]", "[ 42, 'object', 3, 'number' ]")
+        self.assertJs("function tag(s, ...v) { return s.raw.join('|') + ':' + v.join() } "
+                      "[tag`a${1}\\n${2}c`, String.raw`x\\ty`, (s => s)`z` === (s => s)`z`]",
+                      r"[ 'a|\\n|c:1,2', 'x\\ty', false ]")
+        self.assertJs("function f() { var seen = []; for (var i = 0; i < 2; i++) seen.push((s => s)`same`); "
+                      "return seen[0] === seen[1] } f()", "true")
+
+    def test_newer_syntax(self):
+        self.assertJs("class A { static x = 1; static { A.y = A.x + 1; this.z = this === A } } [A.y, A.z]", "[ 2, true ]")
+        self.assertJs("function F() { this.t = new.target === F } [new F().t, F()]", "[ true, undefined ]")
+        self.assertJs("(async () => { var s = 0; for await (const x of [Promise.resolve(1), 2]) s += x; "
+                      "console.log('sum', s) })(); import('x').catch(e => console.log(e.name))", "Promise { <pending> }\nTypeError\nsum 3")
+        # (BigInt is approximated by numbers: typeof 10n is 'number')
+        self.assertJs("[typeof import.meta, 10n + 5n, BigInt('7') * 2, BigInt.asUintN(8, 257)]", "[ 'object', 15, 14, 1 ]")
+        self.assertJs(r"[/\p{L}+/u.exec('abc1')[0], /^\p{Lu}/u.test('Abc'), /\P{L}/u.exec('ab3')[0], "
+                      r"/[\p{N}_]+/u.exec('x12_y')[0], /\p{Script=Latin}/u.test('z'), /[\P{L}]/u.exec('ab!')[0]]",
+                      "[ 'abc', true, '3', '12_', true, '!' ]")
+
+    def test_private_class_members_and_with(self):
+        self.assertJs("class Counter { #n = 0; static #made = 0; constructor() { Counter.#made++ } "
+                      "#step() { return ++this.#n } tick() { return this.#step() } static made() { return Counter.#made } "
+                      "has(o) { return #n in o } } var c = new Counter(); c.tick(); "
+                      "[c.tick(), Counter.made(), c.has(c), c.has({}), Object.keys(c).length, JSON.stringify(c)]",
+                      "[ 2, 1, true, false, 0, '{}' ]")
+        self.assertJs("var o = {a: 1, b: 2}; with (o) { a = a + b; var s = typeof b } [o.a, s, typeof a]",
+                      "[ 3, 'number', 'undefined' ]")
+        # names declared inside win over the object; closures keep it
+        self.assertJs("var o = {v: 1, x: 5}; with (o) { var r = [1, 2].map(v => v * 10); var get = () => x } "
+                      "o.x = 6; [r, get()]", "[ [ 10, 20 ], 6 ]")
+
+    def test_proxy_reflect_and_wrappers(self):
+        self.assertJs("var log = []; var p = new Proxy({x: 1}, { get(t, k) { log.push(String(k)); return Reflect.get(t, k) }, "
+                      "has(t, k) { return k === 'y' || k in t } }); ['x' in p, p.x, 'y' in p, 'z' in p, log.join(), "
+                      "Array.isArray(new Proxy([], {})), Reflect.ownKeys({a: 1, [Symbol.iterator]: 0}).length]",
+                      "[ true, 1, true, false, 'x', true, 2 ]")
+        self.assertJs("var a = new Proxy([1], {}); a.push(2); [a.length, Object.keys(a), JSON.stringify(a), "
+                      "Object.prototype.hasOwnProperty.call(new Proxy({k: 1}, {}), 'k')]",
+                      "[ 2, [ '0', '1' ], '[1,2]', true ]")
+        self.assertJs("[typeof new String('s'), new String('ab').length, new Number(5) + 1, Object('x') instanceof String, "
+                      "Object.prototype.toString.call(/x/), Object.prototype.toString.call(new Map()), "
+                      "Object.getOwnPropertyNames({[Symbol.iterator]: 1, a: 2})]",
+                      "[ 'object', 2, 6, true, '[object RegExp]', '[object Map]', [ 'a' ] ]")
+
+    def test_typed_arrays(self):
+        self.assertJs("var b = new ArrayBuffer(8); var v = new DataView(b); v.setUint16(0, 258); v.setFloat32(4, 1.5, true); "
+                      "var u = new Uint8Array(b); [u[0], u[1], v.getFloat32(4, true), new Int8Array([200])[0], "
+                      "new Uint8ClampedArray([300, -1])[0], Array.from(new Float64Array([1.5, 2]).map(x => x * 2)), "
+                      "new Uint16Array(u.buffer, 0, 2).length]",
+                      "[ 1, 2, 1.5, -56, 255, [ 3, 4 ], 2 ]")
+        self.assertJs("var t = new Uint8Array([3, 1, 2]); [t, t.sort().join('-'), t.subarray(1).length, [...t], "
+                      "new TextDecoder().decode(new TextEncoder().encode('h\\u00e9llo')) === 'h\\u00e9llo']",
+                      "[ Uint8Array(3) [ 1, 2, 3 ], '1-2-3', 2, [ 1, 2, 3 ], true ]")   # (sorted in place)
+
+    def test_web_library(self):
+        self.assertJs("var u = new URL('../x/y?a=1&b=two words#h', 'https://example.com/p/q/r'); u.searchParams.append('c', 3); "
+                      "[u.href, u.pathname, u.searchParams.get('b'), u.origin, new URLSearchParams({k: 'v', n: 1}).toString()]",
+                      "[ 'https://example.com/p/x/y?a=1&b=two+words&c=3#h', '/p/x/y', 'two words', 'https://example.com', 'k=v&n=1' ]")
+        self.assertJs("[btoa('hello'), atob('aGVsbG8='), encodeURIComponent('a b&c'), decodeURIComponent('%E2%9C%93') === '\\u2713', "
+                      "encodeURI('http://x/a b?c=d')]",
+                      "[ 'aGVsbG8=', 'hello', 'a%20b%26c', true, 'http://x/a%20b?c=d' ]")
+        self.assertJs("[new Intl.NumberFormat('en-US').format(1234567.891), (0.256).toLocaleString('en', {style: 'percent'}), "
+                      "new Intl.DateTimeFormat('en-US', {month: 'long', day: 'numeric', year: 'numeric'}).format(new Date(0)), "
+                      "(1234.5678).toPrecision(6), (5e-7).toExponential(2)]",
+                      "[ '1,234,567.891', '26%', 'January 1, 1970', '1234.57', '5.00e-7' ]")
+        self.assertJs("var o = structuredClone({d: new Date(0), m: new Map([[1, [2]]])}); [o.d.getTime(), o.m.get(1)[0], "
+                      "[1, 2, 3].toSorted((a, b) => b - a), Object.groupBy([1, 2, 3], x => x % 2 ? 'odd' : 'even').odd, "
+                      "/x(?=(abc)+$)/.test('xabcabc')]",
+                      "[ 0, 2, [ 3, 2, 1 ], [ 1, 3 ], true ]")
+        self.assertJs("try { decodeURIComponent('%') } catch (e) { e.name }", "'URIError'")
+
+    def test_array_methods_on_array_likes(self):
+        self.assertJs("var like = {0: 'a', 1: 'b', length: 2}; [Array.prototype.map.call(like, x => x + x), [].slice.call('xyz', 1), "
+                      "Array.prototype.push.call(like, 'c'), like.length, Math.max.apply(null, {length: 2, 0: 4, 1: 9})]",
+                      "[ [ 'aa', 'bb' ], [ 'y', 'z' ], 3, 3, 9 ]")
+        self.assertJs("[new Array(2).concat([1]).map(x => x * 2), 1 in [, 1, , 2].filter(() => true)]",
+                      "[ [ <2 empty items>, 2 ], true ]")
+
+    def test_stack_traces(self):
+        self.assertJs("function inner() { null.x } function outer() { inner() } try { outer() } catch (e) { e.stack.split('\\n').slice(0, 3) }",
+                      """[ "TypeError: Cannot read properties of null (reading 'x')", '    at inner (line 1)', '    at outer (line 1)' ]""")
+        self.assertJs("var o = { toString() { return String(this) } }; try { String(o) } catch (e) { e.name + ': ' + e.message }",
+                      "'RangeError: Maximum call stack size exceeded'")
 
     def test_ctrl_c_stops_a_runaway_script(self):
         self.vm.send("js for (;;) {}\r")

@@ -1622,6 +1622,7 @@ tls_https_get:
     mov al, TLS_CT_APPDATA
     call tls_send_record
     call tls_read_response
+    call http_decode_body           ; (a gzip body: decompressed)
     mov eax, [http_resp_len]
     lea rsi, [klog_tls_bytes]
     call klog_dec

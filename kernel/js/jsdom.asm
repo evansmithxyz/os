@@ -26,7 +26,7 @@ JSD_BLD                 equ JS_SRC_ADDR         ; string builder (JS_SRC is free
 JSD_BLD_MAX             equ JS_SRC_SIZE - 16
 JSD_MAX_SELS            equ 8                   ; selectors in one querySelector list
 JSD_MAX_SCRIPTS         equ 256
-JSD_MAX_EXTERNAL        equ 16                  ; <script src> fetched per page
+JSD_MAX_EXTERNAL        equ 64                  ; <script src> fetched per page
 
 ; JSDNATIVE object, "name", routine, arity (same layout as JSNATIVE)
 %macro JSDNATIVE 4
@@ -51,6 +51,13 @@ jsd_style_proto:        resq 1
 jsd_classlist_proto:    resq 1
 jsd_event_proto:        resq 1
 jsd_location_proto:     resq 1
+; the prototypes of wrapped nodes, from the page prelude (__domProtos); 0 = jsd_node_proto
+jsd_tag_protos:         resq 1          ; object: lower-case tag name -> prototype
+jsd_element_proto:      resq 1          ; other elements (HTMLElement.prototype)
+jsd_text_proto:         resq 1
+jsd_comment_proto:      resq 1
+jsd_fragment_proto:     resq 1
+jsd_document_proto:     resq 1
 jsd_saved_hook:         resq 1
 jsd_bld_len:            resd 1
 jsd_realm:              resd 1          ; js_realm when the page's scripts started
@@ -71,6 +78,7 @@ jsd_loading:            resb 1          ; the page's scripts are running
 jsd_enabled:            resb 1          ; the page has a JavaScript realm
 jsd_nav_pending:        resb 1          ; location.href was set: browser_url_buf
 jsd_sel_bad:            resb 1
+jsd_in_script:          resb 1          ; one of the page's <script>s is running
 alignb 8
 jsd_name_buf:           resb 128
 jsd_log_buf:            resb 240
@@ -86,12 +94,16 @@ JSDNATIVE jsd_node_proto, "getElementsByTagName", jsd_get_by_tag, 1
 JSDNATIVE jsd_node_proto, "getElementsByClassName", jsd_get_by_class, 1
 JSDNATIVE jsd_node_proto, "createElement", jsd_create_element, 1
 JSDNATIVE jsd_node_proto, "createTextNode", jsd_create_text_node, 1
+JSDNATIVE jsd_node_proto, "createComment", jsd_create_comment, 1
+JSDNATIVE jsd_node_proto, "createDocumentFragment", jsd_create_fragment, 0
 JSDNATIVE jsd_node_proto, "write", jsd_write, 1
 JSDNATIVE jsd_node_proto, "writeln", jsd_writeln, 1
 JSDNATIVE jsd_node_proto, "getAttribute", jsd_get_attribute, 1
 JSDNATIVE jsd_node_proto, "setAttribute", jsd_set_attribute, 2
 JSDNATIVE jsd_node_proto, "removeAttribute", jsd_remove_attribute, 1
 JSDNATIVE jsd_node_proto, "hasAttribute", jsd_has_attribute, 1
+JSDNATIVE jsd_node_proto, "getAttributeNames", jsd_get_attribute_names, 0
+JSDNATIVE jsd_node_proto, "dispatchEvent", jsd_dispatch_event, 1
 JSDNATIVE jsd_node_proto, "appendChild", jsd_append_child, 1
 JSDNATIVE jsd_node_proto, "removeChild", jsd_remove_child, 1
 JSDNATIVE jsd_node_proto, "insertBefore", jsd_insert_before, 2
@@ -127,6 +139,9 @@ JSDNATIVE js_global, "confirm", jsd_confirm, 1
 JSDNATIVE js_global, "prompt", jsd_prompt, 1
 JSDNATIVE js_global, "addEventListener", jsd_add_listener, 2
 JSDNATIVE js_global, "removeEventListener", jsd_remove_listener, 2
+JSDNATIVE js_global, "__domProtos", jsd_set_protos, 6
+JSDNATIVE js_global, "__currentScript", jsd_current_script, 0
+JSDNATIVE js_global, "dispatchEvent", jsd_dispatch_event, 1
     dq 0
 
 ; properties of DOM nodes: atom, getter, setter
@@ -143,8 +158,6 @@ JSDPROP atom_d_innerHTML, jsd_g_inner_html, jsd_s_inner_html
 JSDPROP atom_d_outerHTML, jsd_g_outer_html, 0
 JSDPROP atom_d_id, jsd_g_attr, jsd_s_attr
 JSDPROP atom_d_className, jsd_g_attr, jsd_s_attr
-JSDPROP atom_d_href, jsd_g_attr, jsd_s_attr
-JSDPROP atom_d_src, jsd_g_attr, jsd_s_attr
 JSDPROP atom_name, jsd_g_attr, jsd_s_attr
 JSDPROP atom_d_type, jsd_g_attr, jsd_s_attr
 JSDPROP atom_d_alt, jsd_g_attr, jsd_s_attr
@@ -182,6 +195,8 @@ JSDPROP atom_d_URL, jsd_g_url, 0
 JSDPROP atom_d_location, jsd_g_location, jsd_s_location
     dq 0
 
+jsd_prelude_src:        incbin "js/dom.js"
+jsd_prelude_len         equ $ - jsd_prelude_src
 jsd_str_class:          db "class", 0
 jsd_str_style:          db "style", 0
 jsd_str_value:          db "value", 0
@@ -191,6 +206,11 @@ jsd_str_javascript:     db "javascript", 0
 jsd_str_ecmascript:     db "ecmascript", 0
 jsd_str_div:            db "div"
 jsd_str_text_name:      db "#text", 0
+jsd_str_comment_name:   db "#comment", 0
+jsd_str_comment_open:   db "<!--", 0
+jsd_str_comment_close:  db "-->", 0
+jsd_str_fragment_name:  db "#document-fragment", 0
+jsd_str_fragment_name_len equ $ - jsd_str_fragment_name - 1
 jsd_str_document_name:  db "#document", 0
 jsd_str_loading:        db "loading", 0
 jsd_str_complete:       db "complete", 0
@@ -215,6 +235,7 @@ jsmsg_not_node:         db "Failed to execute '%' on 'Node': parameter is not of
 jsmsg_hierarchy:        db "Failed to execute '%': the new child contains the parent.", 0
 jsmsg_not_child:        db "Failed to execute '%': the node is not a child of this node.", 0
 jsmsg_illegal:          db "Illegal invocation", 0
+jsmsg_bad_selector:     db "'%' is not a valid selector", 0
 jsd_name_append:        db "appendChild", 0
 jsd_name_insert:        db "insertBefore", 0
 jsd_name_remove:        db "removeChild", 0
@@ -238,6 +259,13 @@ jsd_init:
     push rsi
     push rdi
     push r8
+    xor eax, eax                    ; (the prelude sets these again)
+    mov [jsd_tag_protos], rax
+    mov [jsd_element_proto], rax
+    mov [jsd_text_proto], rax
+    mov [jsd_comment_proto], rax
+    mov [jsd_fragment_proto], rax
+    mov [jsd_document_proto], rax
     mov rbx, [js_object_proto]
     mov rax, rbx
     call jsobj_new
@@ -325,6 +353,10 @@ jsd_init:
     mov rax, rdi
     mov rdx, [atom_d_innerHeight]
     call jsobj_define
+    ; the DOM classes and the rest of the web APIs (kernel/js/dom.js)
+    lea rsi, [jsd_prelude_src]
+    mov ecx, jsd_prelude_len
+    call js_run_prelude
     pop r8
     pop rdi
     pop rsi
@@ -364,7 +396,7 @@ jsd_wrap:
     test edx, edx
     jnz .have
     mov ecx, JC_NODE
-    mov rdx, [jsd_node_proto]
+    call jsd_proto_for
     call jsd_host_new
     mov [rbx + N_JSOBJ], eax
     mov edx, eax
@@ -373,6 +405,121 @@ jsd_wrap:
     BOX rax, rcx, JS_OBJ_BITS
     pop rdx
     pop rcx
+    pop rbx
+    ret
+
+; jsd_proto_for: RBX = node record -> RDX = the prototype of its object
+; (Document, Text, Comment, DocumentFragment, HTMLDivElement, ...)
+jsd_proto_for:
+    push rax
+    push rbx
+    push rcx
+    push rsi
+    push rdi
+    mov rdx, [jsd_document_proto]
+    cmp rbx, DOM_ADDR
+    je .chosen
+    mov rdx, [jsd_comment_proto]
+    test byte [rbx + N_FLAGS], NF_COMMENT
+    jnz .chosen
+    mov rdx, [jsd_text_proto]
+    cmp byte [rbx + N_TYPE], NODE_TEXT
+    je .chosen
+    mov rdx, [jsd_fragment_proto]
+    test byte [rbx + N_FLAGS], NF_FRAGMENT
+    jnz .chosen
+    ; an element: by its tag name
+    mov rdx, [jsd_element_proto]
+    cmp qword [jsd_tag_protos], 0
+    je .chosen
+    mov rsi, [rbx + N_NAME]
+    mov ecx, [rbx + N_NAME_LEN]
+    cmp ecx, 32
+    ja .chosen
+    ; (lower case in a buffer of its own: callers keep things in jsd_name_buf)
+    sub rsp, 32
+    mov rdi, rsp
+    push rcx
+.lower:
+    test ecx, ecx
+    jz .lowered
+    lodsb
+    cmp al, 'A'
+    jb .put
+    cmp al, 'Z'
+    ja .put
+    or al, 0x20
+.put:
+    stosb
+    dec ecx
+    jmp .lower
+.lowered:
+    pop rcx
+    mov rsi, rsp
+    call jsstr_find_atom
+    lea rsp, [rsp + 32]
+    jc .chosen
+    push rdx
+    mov rdx, rax
+    mov rax, [jsd_tag_protos]
+    call jsobj_find_own
+    pop rdx
+    jc .chosen
+    mov rax, [rbx + JPE_VAL]
+    mov rcx, rax
+    shr rcx, 48
+    cmp ecx, JS_TAG_OBJECT
+    jne .chosen
+    mov edx, eax
+.chosen:
+    test rdx, rdx
+    jnz .out
+    mov rdx, [jsd_node_proto]
+.out:
+    pop rdi
+    pop rsi
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; __domProtos(tags, element, text, comment, fragment, document): the page
+; prelude's prototypes for wrapped nodes (objects; anything else: the default)
+jsd_set_protos:
+    push rbx
+    push rdx
+    lea rbx, [jsd_tag_protos]
+    xor edx, edx
+.arg:
+    mov eax, edx
+    call jsb_arg
+    push rcx
+    mov rcx, rax
+    shr rcx, 48
+    cmp ecx, JS_TAG_OBJECT
+    pop rcx
+    je .object
+    xor eax, eax
+.object:
+    mov eax, eax
+    mov [rbx + rdx*8], rax
+    inc edx
+    cmp edx, 6
+    jb .arg
+    ; -> [the nodes' prototype (the native methods), the events' prototype]
+    push rcx
+    mov ecx, 2
+    call jsarr_new
+    mov rbx, rax
+    mov rcx, [jsd_node_proto]
+    BOX rcx, rdx, JS_OBJ_BITS
+    call jsarr_push
+    mov rcx, [jsd_event_proto]
+    BOX rcx, rdx, JS_OBJ_BITS
+    call jsarr_push
+    pop rcx
+    BOX rax, rdx, JS_OBJ_BITS
+    pop rdx
     pop rbx
     ret
 
@@ -721,6 +868,8 @@ jsd_text_of:
     call dom_node
     cmp byte [rbx + N_TYPE], NODE_TEXT
     jne .next
+    test byte [rbx + N_FLAGS], NF_COMMENT
+    jnz .next
     call jsd_text_node_text
 .next:
     call jsd_next
@@ -794,9 +943,20 @@ jsd_serialize:
     call dom_node
     cmp byte [rbx + N_TYPE], NODE_TEXT
     jne .element
+    test byte [rbx + N_FLAGS], NF_COMMENT
+    jnz .comment
     mov rsi, [rbx + N_NAME]
     mov ecx, [rbx + N_NAME_LEN]
     call jsd_bld_bytes
+    jmp .done
+.comment:
+    lea rsi, [jsd_str_comment_open]
+    call jsd_bld_cstr
+    mov rsi, [rbx + N_NAME]
+    mov ecx, [rbx + N_NAME_LEN]
+    call jsd_bld_bytes
+    lea rsi, [jsd_str_comment_close]
+    call jsd_bld_cstr
     jmp .done
 .element:
     test eax, eax
@@ -1271,6 +1431,14 @@ jsd_find_tag:
     stc
     ret
 
+; jsd_bad_selector: RAX = a selector list with one the engine cannot use ->
+; SyntaxError (scripts with a fallback, like jQuery's, use it)
+jsd_bad_selector:
+    mov rdi, rax
+    lea rsi, [jsmsg_bad_selector]
+    mov edx, JE_SYNTAX
+    jmp js_throw
+
 ; ------------------------------------------------------------------------------
 ; jsd_compile_selectors: RAX = selector list (heap string) -> jsd_sels /
 ; jsd_sel_count (unsupported selectors are left out, jsd_sel_bad set)
@@ -1598,6 +1766,12 @@ jsd_g_node_type:
     mov eax, 9                      ; the document
     cmp rbx, DOM_ADDR
     je .number
+    mov eax, 8
+    test byte [rbx + N_FLAGS], NF_COMMENT
+    jnz .number
+    mov eax, 11
+    test byte [rbx + N_FLAGS], NF_FRAGMENT
+    jnz .number
     mov eax, 1
     cmp byte [rbx + N_TYPE], NODE_ELEMENT
     je .number
@@ -1608,9 +1782,19 @@ jsd_g_node_type:
 jsd_g_node_name:
     cmp rbx, DOM_ADDR
     je .document
+    test byte [rbx + N_FLAGS], NF_COMMENT
+    jnz .comment
+    test byte [rbx + N_FLAGS], NF_FRAGMENT
+    jnz .fragment
     cmp byte [rbx + N_TYPE], NODE_TEXT
     je .text
     jmp jsd_g_tag_name
+.comment:
+    lea rsi, [jsd_str_comment_name]
+    jmp jsb_cstr
+.fragment:
+    lea rsi, [jsd_str_fragment_name]
+    jmp jsb_cstr
 .document:
     lea rsi, [jsd_str_document_name]
     jmp jsb_cstr
@@ -3058,6 +3242,8 @@ jsd_query:
     call jsb_arg
     call js_to_string
     call jsd_compile_selectors
+    cmp byte [jsd_sel_bad], 0
+    jne jsd_bad_selector
     xor ecx, ecx
     call jsarr_new
     mov r8, rax
@@ -3263,6 +3449,229 @@ jsd_create_element:
     mov ecx, [rax + JSTR_LEN]
     call dom_new_element
     jc .full
+    call jsd_wrap
+    jmp .out
+.full:
+    mov rax, JS_NULL
+.out:
+    pop rsi
+    pop rcx
+    pop rbx
+    ret
+
+; element.getAttributeNames(): the names of its attributes (lower case)
+jsd_get_attribute_names:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r12
+    push r13
+    call jsd_this_node
+    push rax
+    xor ecx, ecx
+    call jsarr_new
+    mov r13, rax
+    pop rax
+    cmp rbx, DOM_ADDR
+    je .done
+    cmp byte [rbx + N_TYPE], NODE_ELEMENT
+    jne .done
+    mov r12, [rbx + N_ATTRS]
+    mov r8d, [rbx + N_ATTRS_LEN]
+    add r8, r12
+.attr:
+    call jsd_attr_next              ; RDI/ECX = its name
+    jc .done
+    cmp ecx, 120
+    ja .attr
+    ; in lower case
+    push rcx
+    mov rsi, rdi
+    lea rdi, [jsd_name_buf]
+.lower:
+    test ecx, ecx
+    jz .lowered
+    lodsb
+    cmp al, 'A'
+    jb .put
+    cmp al, 'Z'
+    ja .put
+    or al, 0x20
+.put:
+    stosb
+    dec ecx
+    jmp .lower
+.lowered:
+    pop rcx
+    lea rsi, [jsd_name_buf]
+    call jsstr_new
+    mov rcx, rax
+    BOX rcx, rdx, JS_STR_BITS
+    mov rax, r13
+    call jsarr_push
+    jmp .attr
+.done:
+    mov rax, r13
+    BOX rax, rdx, JS_OBJ_BITS
+    pop r13
+    pop r12
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; target.dispatchEvent(event): an event made by a script, delivered to the
+; target's listeners, then (when event.bubbles) its ancestors, the document
+; and window -> false if a listener called preventDefault
+jsd_dispatch_event:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    mov rsi, rdx                    ; the target
+    xor eax, eax
+    call jsb_arg
+    mov rcx, rax
+    shr rcx, 48
+    cmp ecx, JS_TAG_OBJECT
+    jne .not_event
+    mov r8d, eax                    ; the event (raw)
+    mov r11, rax                    ; (boxed)
+    mov rdx, [atom_d_type]
+    call js_get
+    call js_to_key
+    mov r10, rax                    ; the type atom
+    mov rax, r11
+    mov rdx, [atom_d_bubbles]
+    call js_get
+    call js_truthy
+    setc bl                         ; BL = 1: bubbles
+    ; (a stop from an earlier dispatch of the same event is forgotten)
+    mov rax, r8
+    mov rdx, [atom_d_stop]
+    call jsobj_delete
+    mov rax, rsi
+    call jsd_node_of
+    jc .window
+    mov r9d, eax                    ; the target node
+    mov rax, r8
+    mov rcx, rsi
+    mov rdx, [atom_d_target]
+    call jsobj_define
+    mov eax, r9d
+.node:
+    push rax
+    call jsd_wrap
+    call jsd_deliver
+    pop rax
+    jc .done
+    test bl, bl
+    jz .done
+    test eax, eax
+    jz .at_window                   ; the document was last
+    push rbx
+    call dom_node
+    mov eax, [rbx + N_PARENT]
+    pop rbx
+    test eax, eax
+    jnz .node
+    ; a top-level node: the document next, if it is in it
+    mov eax, r9d
+    call dom_connected
+    mov eax, 0
+    jc .node
+    jmp .done
+.window:
+    mov rax, [js_global]
+    BOX rax, rdx, JS_OBJ_BITS
+    mov rcx, rax
+    mov rax, r8
+    mov rdx, [atom_d_target]
+    call jsobj_define
+.at_window:
+    mov rax, [js_global]
+    BOX rax, rdx, JS_OBJ_BITS
+    call jsd_deliver
+.done:
+    mov rax, r11
+    mov rdx, [atom_d_defaultPrevented]
+    call js_get
+    call js_truthy
+    cmc
+    call js_bool
+    jmp .out
+.not_event:
+    mov rax, JS_TRUE
+.out:
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; __currentScript(): the page's <script> running now, or null (the page
+; prelude's document.currentScript)
+jsd_current_script:
+    mov rax, JS_NULL
+    cmp byte [jsd_in_script], 0
+    je .ret
+    mov eax, [jsd_script_node]
+    jmp jsd_wrap
+.ret:
+    ret
+
+; document.createComment(text): a comment (an empty text node that says so)
+jsd_create_comment:
+    push rbx
+    push rcx
+    push rsi
+    xor eax, eax
+    call jsb_arg
+    call jsd_encoded_string
+    lea rsi, [rax + JSTR_DATA]
+    mov ecx, [rax + JSTR_LEN]
+    call dom_new_text
+    jc .full
+    or byte [rbx + N_FLAGS], NF_COMMENT
+    call jsd_wrap
+    jmp .out
+.full:
+    mov rax, JS_NULL
+.out:
+    pop rsi
+    pop rcx
+    pop rbx
+    ret
+
+; document.createDocumentFragment(): an element that holds nodes until they
+; are inserted somewhere (the page prelude moves its children)
+jsd_create_fragment:
+    push rbx
+    push rcx
+    push rsi
+    lea rsi, [jsd_str_fragment_name]
+    mov ecx, jsd_str_fragment_name_len
+    call dom_new_element
+    jc .full
+    or byte [rbx + N_FLAGS], NF_FRAGMENT
     call jsd_wrap
     jmp .out
 .full:
@@ -3697,6 +4106,8 @@ jsd_matches:
     call jsb_arg
     call js_to_string
     call jsd_compile_selectors
+    cmp byte [jsd_sel_bad], 0
+    jne jsd_bad_selector
     pop rax
     call jsd_selector_match
     cmc
@@ -3713,6 +4124,8 @@ jsd_closest:
     call jsb_arg
     call js_to_string
     call jsd_compile_selectors
+    cmp byte [jsd_sel_bad], 0
+    jne jsd_bad_selector
     pop rax
 .up:
     test eax, eax
@@ -4599,7 +5012,9 @@ jsd_run_script:
     call browser_fetch_quiet        ; RSI/RCX = the script
     jc .done
 .run:
+    mov byte [jsd_in_script], 1
     call js_eval
+    mov byte [jsd_in_script], 0
     jnc .drain
     call js_print_error
 .drain:

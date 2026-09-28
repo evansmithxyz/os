@@ -28,8 +28,12 @@ jsout_len:              resd 1
 jsi_top:                resd 1
 jsi_stack:              resq 8          ; objects being printed (cycles)
 jsout_buf:              resb JSOUT_MAX + 16
+js_dump_wanted:         resb 1          ; js_compile_dump: print the code
 
 section .rodata
+; the parts of the library written in JavaScript (run by js_run_prelude)
+js_prelude_src:         incbin "js/prelude.js"
+js_prelude_len          equ $ - js_prelude_src
 jsmsg_uncaught:         db "Uncaught ", 0
 jsmsg_line:             db " (line ", 0
 jsi_function:           db "[Function: ", 0
@@ -61,8 +65,25 @@ section .text
 js_reset:
     inc dword [js_realm]            ; whoever used the old heap must not any more
     mov byte [jsc_dump], 0
+    mov dword [jsc_tag_sites], 0
+    mov qword [vm_tag_cache], 0
+    mov qword [jsb_array_generics], 0
     call js_heap_reset
     call js_init_builtins
+    ret
+
+; ------------------------------------------------------------------------------
+; js_run_prelude: RSI = JavaScript source, ECX = its length: a part of the
+; built-in library written in JavaScript, run in the current realm (an error
+; in it is printed, like a script's)
+; ------------------------------------------------------------------------------
+js_run_prelude:
+    push rax
+    call js_eval
+    jnc .ok
+    call js_print_error
+.ok:
+    pop rax
     ret
 
 ; ------------------------------------------------------------------------------
@@ -141,6 +162,16 @@ js_protected:
     push rax
     mov rax, [timer_ticks]
     mov [vm_idle_tick], rax
+    ; a page's scripts get JS_TASK_TIME each (vm_check_budget stops them);
+    ; (RCX is an input of the routine: kept)
+    cmp byte [jsd_enabled], 0
+    je .no_deadline
+    add rax, TICKS(JS_TASK_TIME)
+    mov [js_deadline], rax
+    jmp .deadline_set
+.no_deadline:
+    mov qword [js_deadline], 0
+.deadline_set:
     pop rax
     finit                           ; x87 for % and Math (64-bit precision)
 .nested:
@@ -181,16 +212,20 @@ js_protected_out:
     pop rbx
     ret
 
-; js_compile_dump: RSI = source, RCX = length -> the script's bytecode printed
-; as hex, and each function's with its line (debugging: `js -d code`)
+; js_compile_dump: RSI = source, RCX = length -> compiled, CF=1 if it has a
+; syntax error; with js_dump_wanted, each function's bytecode is printed in
+; hex with its line (debugging: `js -d code`)
 js_compile_dump:
     lea rbx, [.body]
     push rbx
     jmp js_protected
 .body:
     inc dword [jsgc_off]
-    call jsp_parse_script
-    mov byte [jsc_dump], 1
+    call jsp_parse_script           ; RAX = the script's function info
+    push rcx
+    mov cl, [js_dump_wanted]
+    mov [jsc_dump], cl
+    pop rcx
     call jsc_compile_script
     mov byte [jsc_dump], 0
     dec dword [jsgc_off]
@@ -312,6 +347,65 @@ js_print_error:
     call jsout_byte
 .flush:
     call jsout_flush
+    ; in the browser, where it happened too (the error's stack, a line each)
+    cmp byte [jsd_enabled], 0
+    je .done
+    mov rax, [js_exception]
+    mov rcx, rax
+    shr rcx, 48
+    cmp ecx, JS_TAG_OBJECT
+    jne .done
+    mov eax, eax
+    cmp byte [rax + JH_KIND], JK_OBJECT
+    jne .done
+    push rbx
+    mov rdx, [atom_stack]
+    call jsobj_find_own
+    jc .no_stack
+    mov rax, [rbx + JPE_VAL]
+.no_stack:
+    pop rbx
+    jc .done
+    mov rcx, rax
+    shr rcx, 48
+    cmp ecx, JS_TAG_STRING
+    jne .done
+    mov eax, eax
+    push rdi
+    lea rsi, [rax + JSTR_DATA]
+    mov ecx, [rax + JSTR_LEN]
+    lea rdi, [rsi + rcx]            ; the end
+.skip_first:
+    cmp rsi, rdi
+    jae .lines_done
+    lodsb
+    cmp al, 10
+    jne .skip_first
+.stack_line:
+    cmp rsi, rdi
+    jae .lines_done
+    mov rdx, rsi
+.find_end:
+    cmp rsi, rdi
+    jae .have_line
+    cmp byte [rsi], 10
+    je .have_line
+    inc rsi
+    jmp .find_end
+.have_line:
+    push rsi
+    mov rcx, rsi
+    sub rcx, rdx
+    mov rsi, rdx
+    call jsout_reset
+    call jsout_bytes
+    call jsout_flush
+    pop rsi
+    inc rsi                         ; past the line break
+    jmp .stack_line
+.lines_done:
+    pop rdi
+.done:
     pop rsi
     pop rdx
     pop rcx
@@ -566,7 +660,37 @@ jsi_value:
 .not_error:
     cmp dword [rbx + JOBJ_CLASS], JC_HOST
     jb .not_host
+    cmp dword [rbx + JOBJ_CLASS], JC_TYPED
+    je .typed
+    cmp dword [rbx + JOBJ_CLASS], JC_PROXY
+    je .proxy
+    cmp dword [rbx + JOBJ_CLASS], JC_LOCATION
+    ja .not_host
     call jsd_inspect
+    jmp .out
+.typed:
+    ; Uint8Array(3) [ 1, 2, 3 ]
+    movzx esi, byte [rbx + JTA_KIND]
+    mov rsi, [jsta_kind_names + rsi*8]
+    call jsout_cstr
+    mov al, '('
+    call jsout_byte
+    mov eax, [rbx + JTA_LEN]
+    call jsout_u64
+    mov al, ')'
+    call jsout_byte
+    mov al, ' '
+    call jsout_byte
+    mov rax, rbx
+    BOX rax, rsi, JS_OBJ_BITS
+    call jsl_array_like_to_array
+    BOX rax, rsi, JS_OBJ_BITS
+    call jsi_value
+    jmp .out
+.proxy:
+    ; (as Node.js does: the target)
+    mov rax, [rbx + JPX_TARGET]
+    call jsi_value
     jmp .out
 .not_host:
     ; cycles

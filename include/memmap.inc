@@ -52,6 +52,7 @@ KERNEL_ADDR             equ 0x00010000
 KERNEL_BSS_ADDR         equ 0x00100000
 KERNEL_BSS_MAX          equ 0x00100000  ; 1 MB
 KERNEL_STACK_TOP        equ 0x00300000  ; stack occupies 0x200000 - 0x2FFFFF
+KERNEL_STACK_BOTTOM     equ 0x00200000
 
 ; --- Device buffers -----------------------------------------------------------
 NIC_RX_RING_ADDR        equ 0x00300000  ; 8 KB + 16 + 1500 (WRAP mode overflow)
@@ -79,6 +80,8 @@ GUI_MIN_RAM             equ 0x02000000  ; GUI refuses to start below 32 MB RAM
 ; --- Profiler (js -p) ---------------------------------------------------------
 PROF_ADDR               equ 0x01C00000  ; the timer's samples of RIP (dwords)
 PROF_SIZE               equ 0x00100000
+INFLATE_ADDR            equ 0x01D00000  ; a compressed HTTP body, decompressed (kernel/net/inflate.asm)
+INFLATE_SIZE            equ 0x00100000
 
 ; --- JavaScript engine (kernel/js/) ------------------------------------------
 JS_STACK_ADDR           equ 0x02000000  ; value stack (8-byte values)

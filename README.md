@@ -97,7 +97,7 @@ and `... cat build/os.img welcome.txt` read its files from the host.
 ls  cat  touch  write  rm  df                     files
 ifconfig  arp  ping  dns  curl  tcplisten         network
 sysinfo  about  cpu  mem  regs  uptime  clear     system
-js [-p | -d] <code | file.js>  prof on|off        JavaScript, profiling
+js [-p | -d | -c] <code | file.js>  prof on|off   JavaScript, profiling
 gui  browser [url]  ws  exit                      desktop
 ```
 
@@ -207,17 +207,24 @@ left, so `js setTimeout(() => console.log('later'), 500)` prints `later`
 half a second on. Esc or Ctrl+C stops a script that doesn't end, or the
 waiting.
 
-`js -p ...` runs the same way under the profiler, and `js -d <code>`
-prints each compiled function's bytecode in hex instead of running it.
+`js -p ...` runs the same way under the profiler, `js -d ...` prints each
+compiled function's bytecode in hex instead of running it, and `js -c ...`
+only compiles (it says `ok`, or shows the syntax error). An error's `stack`
+names the functions it happened in (`at name (line N)`).
 `python tools/profile.py bench/core.js` boots a copy of the image, runs
 the benchmarks in `bench/` and prints where the time went (see
 Debugging).
 
 In the browser, every HTML page gets its own engine with `window` and
 `document`. Its `<script>`s run in order (inline or `src=`, which is
-fetched), then `DOMContentLoaded` and `load` fire. `console.log` output
-and errors go to the serial log as `[klog] js: ...`; an error ends only
-the script it happened in. Clicks run the page's handlers (`onclick=""`,
+fetched), then `DOMContentLoaded` and `load` fire; scripts that scripts add
+to the document run too (`src=` ones fetched as a task, then their `load`
+or `error` event), which is how bundlers load their chunks. `type="module"`
+scripts are skipped, so the `nomodule` fallbacks run. `console.log` output
+and errors (with their stack) go to the serial log as `[klog] js: ...`; an
+error ends only the script it happened in, and a script that runs for more
+than 15 seconds is stopped. Pages that send gzip or deflate bodies, chunked
+or not, are decompressed (`kernel/net/inflate.asm`). Clicks run the page's handlers (`onclick=""`,
 `onclick` properties and `addEventListener`), which bubble up the tree;
 `preventDefault()` stops a link from being followed. The page's timers,
 animation frames and `fetch` / `XMLHttpRequest` requests run from the
@@ -241,6 +248,22 @@ styled and laid out again. The DOM API (`kernel/js/jsdom.asm`):
   ...; setting `href` loads the page), `navigator.userAgent`,
   `innerWidth` / `innerHeight`
 
+The rest of the web platform a page expects is written in JavaScript
+(`kernel/js/dom.js`, run before the page's scripts): the classes (`Node`,
+`Element`, `HTMLElement`, `HTMLDivElement`, ... `Text`, `Document`, each
+node an instance of the right one), `DocumentFragment`, `insertAdjacentHTML`,
+`before` / `after` / `replaceWith`, `dataset`, `attributes`, selectors the
+native engine does not know (attributes, `+`, `~`, `:not`, `:is`, `:has`,
+`:nth-child`, ...; the native one does the common ones first),
+`dispatchEvent` with `Event` / `CustomEvent` / `MouseEvent` ...,
+listener options (`once`, `signal`), `localStorage`, `matchMedia`,
+`getComputedStyle`, `history`, `requestIdleCallback`, the observers
+(`MutationObserver`, `IntersectionObserver`, `ResizeObserver`),
+`TreeWalker`, `DOMParser`, `FormData`, `Blob`, `MessageChannel`,
+`performance.timing`, `crypto.getRandomValues` and more. Comments in the
+page are nodes too (server-rendered React pages mark their parts with
+them). Layout is not visible to scripts: shown elements report a nominal
+size.
 Lists from `querySelectorAll` and friends are plain arrays, not live
 collections. The engine (`kernel/js/`) works like the big ones, minus the
 optimising compilers:
@@ -284,6 +307,16 @@ optimising compilers:
    program and matches with backtracking on its own stack; `regexp2.asm`
    has `RegExp` and the string methods that take one. `date.asm` has
    `Date`.
+9. `typed.asm` has `ArrayBuffer`, the typed arrays and `DataView`;
+   `proxy.asm` has `Proxy` (the `get`, `set`, `has`, `deleteProperty` and
+   `ownKeys` traps); `text.asm` has the URI functions and `atob` / `btoa`.
+10. `prelude.js` is the part of the library written in JavaScript, run in
+   every realm: `Reflect`, `URL`, `URLSearchParams`, `TextEncoder` /
+   `TextDecoder`, `structuredClone`, `EventTarget`, `AbortController`,
+   `Intl` (English, UTC), the typed arrays' methods, and the newer `Object`,
+   `Array`, `String` and `Number` methods. Array methods called on
+   array-likes (`Array.prototype.slice.call(arguments)`, jQuery objects)
+   come here too.
 
 The language: `var`/`let`/`const`, functions, arrow functions, closures,
 default and rest parameters, `arguments`, `this`, `new`, prototypes,
@@ -293,8 +326,13 @@ keys and spread, destructuring (declarations, parameters, `for-of`,
 `catch`, assignments), spread in arrays and calls, template literals,
 optional chaining, every operator including `**`, `??` and the logical
 assignments, `if`/`for`/`for-in`/`for-of`/`while`/`do`/`switch`, labels,
-and `try`/`catch`/`finally` with `Error`, `TypeError`, `RangeError`,
-`SyntaxError` and `ReferenceError`.
+`try`/`catch`/`finally` with `Error`, `TypeError`, `RangeError`,
+`SyntaxError`, `ReferenceError`, `URIError` and `EvalError`, tagged
+templates, private class members (`#x`, `#m()`, `static #y`, `#x in obj`),
+class `static { }` blocks, `new.target`, `for await`, `with`, `eval` (in
+the global scope) and `new Function(...)`. Regular expressions know the
+common `\p{...}` properties (letters, numbers, punctuation, scripts such as
+Latin or Han; close to Unicode's lists, not exact).
 
 The library: `console.log`, `Math` (all functions), `JSON.stringify` (with
 a replacer function, indent and `toJSON`) and `JSON.parse`, `parseInt`,
@@ -335,9 +373,17 @@ quantifiers, the `g i m s u y` flags; `exec`, `test`, `match`,
 function, `split`) and `Date` (parsing ISO and the usual English forms;
 the local time zone is UTC).
 
-Not yet: tagged templates, private `#fields`, `with`, modules, async
-generators; in the browser, `localStorage`, many DOM methods and typing
-into form fields. Strings are UTF-8 bytes, so `length` counts bytes.
+Not yet: modules (`import` / `export`; `import()` gives a rejected
+promise), async generators, real `BigInt` (`10n` is read as the number 10
+so scripts that use it still load), callable proxies; in the browser,
+layout information, canvas drawing, workers, WebSockets, keeping
+`localStorage` across pages and typing into form fields. Strings are
+UTF-8 bytes, so `length` and `charCodeAt` count bytes. A response of more
+than 1 MB is cut off.
+
+The libraries tried so far all load and run in pages: jQuery, lodash,
+underscore, React, Vue 3 (with its template compiler), Preact, d3, axios,
+moment, dayjs, handlebars and marked.
 
 ## Project layout
 
@@ -368,7 +414,9 @@ kernel/
                         async functions, timers, event loop), jsnet (fetch, XHR),
                         iter (symbols, iterators, generators), collections (Map, Set),
                         regexp + regexp2 (regular expressions), date (Date),
-                        jsdom (the DOM API), js (API, printing)
+                        typed (typed arrays), proxy (Proxy), text (URI, base64),
+                        jsdom (the DOM API), js (API, printing),
+                        prelude.js / dom.js (the library parts written in JavaScript)
   gfx/                  clipped 2D drawing, font, back buffer, mouse pointer
   gui/                  window manager + event loop, taskbar/footer, theme colours
   apps/                 terminal, browser, canvas, sysmon windows
@@ -405,7 +453,7 @@ docs/                   CONVENTIONS.md, screenshots
 |---|---|
 | 0 | stage 1 (MBR) |
 | 1–31 | stage 2 |
-| 32–1055 | kernel slot (512 KB; the kernel uses about 260 KB today) |
+| 32–1055 | kernel slot (512 KB; the kernel uses about 465 KB today) |
 | 1056 | AFS superblock `"AFS1"` |
 | 1057–1058 | inode table (32 × 32 bytes) |
 | 1059–4095 | file data (2 MB image) |
@@ -425,6 +473,7 @@ docs/                   CONVENTIONS.md, screenshots
 | `0x600000` / `0xA00000` / `0xC00000` | DOM nodes / CSS rules / layout display list |
 | `0x1000000` | GUI back buffer, wallpaper, canvas (3 MB each) |
 | `0x1C00000` | profiler samples (1 MB) |
+| `0x1D00000` | a compressed HTTP body, decompressed (1 MB) |
 | `0x2000000` | JavaScript: value stack, call frames, source, compiler scratch, syntax tree, name tables, regular expression matching |
 | `0x3000000` | JavaScript heap (62 MB) |
 | `0x6E00000` / `0x6F00000` | the garbage collector's start bitmap / mark stack |

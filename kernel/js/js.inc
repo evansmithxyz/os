@@ -80,11 +80,19 @@ JC_WEAKMAP              equ 11
 JC_WEAKSET              equ 12
 JC_REGEXP               equ 13          ; a RegExp (JRE_*, regexp2.asm)
 JC_DATE                 equ 14          ; a Date (JDATE_TIME, date.asm)
+JC_WRAPPER              equ 15          ; new String / Number / Boolean: JWRAP_VALUE is the primitive
+JWRAP_VALUE             equ JOBJ_SIZE
+JWRAP_SIZE              equ JOBJ_SIZE + 8
 JC_HOST                 equ 16          ; classes from here on are host objects (jsdom.asm)
 JC_NODE                 equ 16          ; a DOM node (JSD_NODE = its index)
 JC_STYLE                equ 17          ; element.style
 JC_CLASSLIST            equ 18          ; element.classList
 JC_LOCATION             equ 19          ; window.location
+JC_ARRAYBUFFER          equ 20          ; ArrayBuffer (JAB_*, typed.asm)
+JC_DATAVIEW             equ 21          ; DataView (JDV_*)
+JC_EXOTIC               equ 24          ; classes from here on: js_get / js_put go to jsx_*
+JC_TYPED                equ 24          ; Int8Array ... Float64Array (JTA_*)
+JC_PROXY                equ 25          ; Proxy (JPX_*, proxy.asm)
 JSD_NODE                equ 32          ; dword: node index in a host object
 JSD_SIZE                equ 40
 
@@ -182,7 +190,10 @@ JE_TYPE                 equ 1
 JE_REFERENCE            equ 2
 JE_SYNTAX               equ 3
 JE_RANGE                equ 4
-JE_COUNT                equ 5
+JE_URI                  equ 5
+JE_EVAL                 equ 6
+JE_COUNT                equ 7
+JS_TASK_TIME            equ 15000       ; ms a page's script (a task) may run before it is stopped
 
 ; --- Exception handlers (TRY .. ENDTRY) ---------------------------------------
 JTH_PC                  equ 0           ; where the catch code starts
@@ -370,6 +381,10 @@ JSVM_MAX_HANDLERS       equ 256
     OPC INCLOC
     OPC DECLOC
     OPC SETLOCP
+    OPC TAGSTR
+    OPC WITHGET
+    OPC WITHSET
+    OPC NEWTARGET
 %endmacro
 
 %assign js_opc_n 0

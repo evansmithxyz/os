@@ -72,6 +72,8 @@ jsev_next_id:           resq 1
 jsev_origin:            resq 1          ; timer_ticks at the start (performance.now)
 jsev_last_frame:        resq 1
 jsev_draining:          resb 1
+alignb 8
+jsev_drain_until:       resq 1          ; a page's jobs this turn: run until this tick
 
 section .rodata
 jsa_ctors:
@@ -1082,6 +1084,19 @@ jsev_drain:
     mov rax, [jsev_micro_head]
     cmp eax, [rbx + JARR_LEN]
     jae .empty
+    ; (a page's endless chain of jobs: the rest wait for the next turn)
+    cmp byte [jsd_enabled], 0
+    je .run
+    cmp qword [jsev_drain_until], 0
+    jne .limit
+    mov rcx, [timer_ticks]
+    add rcx, TICKS(JS_TASK_TIME)
+    mov [jsev_drain_until], rcx
+.limit:
+    mov rcx, [timer_ticks]
+    cmp rcx, [jsev_drain_until]
+    ja .later
+.run:
     inc qword [jsev_micro_head]
     mov rcx, [rbx + JARR_ELEMS]
     mov rax, [rcx + rax*8]
@@ -1096,6 +1111,8 @@ jsev_drain:
     mov dword [rbx + JARR_LEN], 0
     mov qword [jsev_micro_head], 0
     call jsev_report_unhandled
+.later:
+    mov qword [jsev_drain_until], 0
     pop rcx
     pop rbx
     pop rax

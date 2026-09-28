@@ -28,7 +28,9 @@ NODE_TEXT               equ 2
 N_TYPE                  equ 0       ; db NODE_*
 N_TAG                   equ 1       ; db TAGID_* (0 = not in the tag table)
 N_NCLS                  equ 2       ; db number of class hashes
-N_FLAGS                 equ 3       ; db
+N_FLAGS                 equ 3       ; db NF_*
+NF_COMMENT              equ 1       ; a text node that is a comment (its text is the comment's)
+NF_FRAGMENT             equ 2       ; an element that is a DocumentFragment
 N_PARENT                equ 4       ; dd node index (the document is 0)
 N_FIRST                 equ 8       ; dd first child, 0 = none
 N_LAST                  equ 12      ; dd last child
@@ -387,6 +389,8 @@ dom_tag:
     cmp word [r12 + 1], '--'
     jne .skip_to_gt
     add r12, 3
+    ; a comment node: never drawn, but scripts see it (React's markers)
+    mov rsi, r12                    ; its text
 .comment:
     mov al, [r12]
     test al, al
@@ -396,7 +400,16 @@ dom_tag:
     jne .comment
     cmp word [r12], '->'
     jne .comment
+    lea rcx, [r12 - 1]
+    sub rcx, rsi                    ; its length
     add r12, 2
+    call dom_new
+    jc .done
+    mov [rbx + N_NAME], rsi
+    mov [rbx + N_NAME_LEN], ecx
+    mov byte [rbx + N_TYPE], NODE_TEXT
+    mov byte [rbx + N_FLAGS], NF_COMMENT
+    call dom_append
     jmp .done
 .not_bang:
     cmp byte [r12], '?'

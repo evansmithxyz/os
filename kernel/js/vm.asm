@@ -71,8 +71,10 @@ JS_OPCODE_LIST
 
 jsvm_one:               dq 1.0
 jsvm_kind_names:        dq jsmsg_kind_error, jsmsg_kind_type, jsmsg_kind_reference
-                        dq jsmsg_kind_syntax, jsmsg_kind_range
+                        dq jsmsg_kind_syntax, jsmsg_kind_range, jsmsg_kind_uri, jsmsg_kind_eval
 jsmsg_kind_error:       db "Error", 0
+jsmsg_kind_uri:         db "URIError", 0
+jsmsg_kind_eval:        db "EvalError", 0
 jsmsg_kind_type:        db "TypeError", 0
 jsmsg_kind_reference:   db "ReferenceError", 0
 jsmsg_kind_syntax:      db "SyntaxError", 0
@@ -97,6 +99,10 @@ jsmsg_class_call:       db "Class constructor % cannot be invoked without 'new'"
 jsmsg_extends:          db "Class extends value % is not a constructor or null", 0
 jsmsg_super:            db "'super' keyword unexpected here", 0
 jsvm_at_line:           db 10, "    at line ", 0
+jsvm_at:                db 10, "    at ", 0
+jsmsg_too_long:         db "Script took too long (stopped)", 0
+jsvm_anonymous:         db "<anonymous>", 0
+jsvm_frame_line:        db " (line ", 0
 jsmsg_handlers:         db "Too many nested try blocks", 0
 
 section .bss
@@ -104,6 +110,8 @@ alignb 8
 vm_sp:                  resq 1          ; value stack top when JavaScript is called out
 vm_fp:                  resq 1          ; current frame record
 vm_completion:          resq 1          ; value of the last top-level expression statement
+js_deadline:            resq 1          ; timer tick a page's script must end by (0: none)
+vm_tag_cache:           resq 1          ; array: each tagged template's strings, by TAGSTR number
 vm_idle_tick:           resq 1
 js_catch_rsp:           resq 1          ; kernel RSP to unwind to (js_eval)
 js_exception:           resq 1          ; thrown value; JS_HOLE = message in js_err_buf
@@ -253,10 +261,22 @@ js_error_fill:
     mov rax, rdi
     call jsout_str
 .at:
-    lea rsi, [jsvm_at_line]
-    call jsout_cstr
-    mov eax, [vm_line]
-    call jsout_u64
+    ; where it happened: the running function, then its callers
+    mov rax, r15
+    mov edx, [vm_line]
+    call js_stack_frame
+    mov rcx, [vm_fp]
+    mov esi, 9                      ; (ten lines at most)
+.caller:
+    cmp rcx, JS_FRAMES_ADDR
+    jbe .frames_done
+    mov rax, [rcx + JFR_FUNC]
+    mov edx, [rcx + JFR_LINE]
+    call js_stack_frame
+    sub rcx, JFR_SIZE
+    dec esi
+    jnz .caller
+.frames_done:
     call jsout_take
     mov rcx, rax
     mov rax, rbx
@@ -268,6 +288,51 @@ js_error_fill:
     pop rdx
     pop rcx
     pop rbx
+    pop rax
+    ret
+
+; js_stack_frame: RAX = a function (raw, or anything else), EDX = line ->
+; a line break and "    at name (line N)" appended to the jsout text
+js_stack_frame:
+    push rax
+    push rcx
+    push rsi
+    ; (no function and no line: the start of a run, left out)
+    mov rcx, JS_HEAP_ADDR
+    cmp rax, rcx
+    jb .no_function
+    mov rcx, JS_HEAP_ADDR + JS_HEAP_SIZE
+    cmp rax, rcx
+    jae .no_function
+    cmp byte [rax + JH_KIND], JK_FUNC
+    jne .no_function
+    lea rsi, [jsvm_at]
+    call jsout_cstr
+    mov rax, [rax + JFN_CODE]
+    mov rax, [rax + JCODE_NAME]
+    lea rsi, [jsvm_anonymous]
+    test rax, rax
+    jz .name
+    call jsout_str
+    jmp .line
+.no_function:
+    test edx, edx
+    jz .skip
+    lea rsi, [jsvm_at]
+    call jsout_cstr
+    lea rsi, [jsvm_anonymous]
+.name:
+    call jsout_cstr
+.line:
+    lea rsi, [jsvm_frame_line]
+    call jsout_cstr
+    mov eax, edx
+    call jsout_u64
+    mov al, ')'
+    call jsout_byte
+.skip:
+    pop rsi
+    pop rcx
     pop rax
     ret
 
@@ -1031,6 +1096,27 @@ js_in:
     je .yes
 .lookup:
     mov eax, eax
+    cmp byte [rax + JH_KIND], JK_OBJECT
+    jne .ordinary
+    cmp dword [rax + JOBJ_CLASS], JC_TYPED
+    je .typed
+    cmp dword [rax + JOBJ_CLASS], JC_PROXY
+    jne .ordinary
+    call jsprx_has
+    jc .yes
+    jmp .no
+.typed:
+    ; an index below its length
+    push rax
+    mov eax, edx
+    call jsstr_array_index
+    mov ebx, eax
+    pop rax
+    jc .ordinary
+    cmp ebx, [rax + JTA_LEN]
+    jb .yes
+    jmp .no
+.ordinary:
     call jsobj_lookup
     jc .no
 .yes:
@@ -1121,7 +1207,13 @@ js_get:
     je .native
     cmp dword [rdi + JOBJ_CLASS], JC_HOST
     jb .object_lookup
+    cmp dword [rdi + JOBJ_CLASS], JC_EXOTIC
+    jae .exotic
     call jsd_get                    ; DOM properties (CF=0: RAX = the value)
+    jnc .out
+    jmp .object_lookup
+.exotic:
+    call jsx_get                    ; typed arrays, proxies (CF=0: RAX = the value)
     jnc .out
 .object_lookup:
     mov rax, rdi
@@ -1272,7 +1364,13 @@ js_put:
 .plain:
     cmp dword [rax + JOBJ_CLASS], JC_HOST
     jb .ordinary
+    cmp dword [rax + JOBJ_CLASS], JC_EXOTIC
+    jae .exotic
     call jsd_put                    ; DOM properties (CF=0: handled)
+    jnc .out
+    jmp .ordinary
+.exotic:
+    call jsx_put                    ; typed arrays, proxies (CF=0: handled)
     jnc .out
 .ordinary:
     ; an accessor here or on a prototype: its setter
@@ -1342,7 +1440,15 @@ js_get_elem:
 .object:
     mov ebx, eax
     cmp byte [rbx + JH_KIND], JK_ARRAY
+    je .array
+    cmp byte [rbx + JH_KIND], JK_OBJECT
     jne .named
+    cmp dword [rbx + JOBJ_CLASS], JC_EXOTIC
+    jb .named
+    call jsx_get_elem               ; typed arrays, proxies
+    jnc .out
+    jmp .named
+.array:
     push rax
     call js_index
     mov ecx, eax
@@ -1410,7 +1516,15 @@ js_put_elem:
     jne .named
     mov ebx, eax
     cmp byte [rbx + JH_KIND], JK_ARRAY
+    je .array
+    cmp byte [rbx + JH_KIND], JK_OBJECT
     jne .named
+    cmp dword [rbx + JOBJ_CLASS], JC_EXOTIC
+    jb .named
+    call jsx_put_elem               ; typed arrays, proxies
+    jnc .out
+    jmp .named
+.array:
     push rax
     call js_index
     mov edx, eax
@@ -1478,6 +1592,14 @@ js_delete:
     je .no
 .remove:
     mov rax, rbx
+    cmp byte [rax + JH_KIND], JK_OBJECT
+    jne .own
+    cmp dword [rax + JOBJ_CLASS], JC_PROXY
+    jne .own
+    call jsprx_delete               ; CF=1: gone
+    jc .yes
+    jmp .no
+.own:
     call jsobj_delete
     jc .no
 .yes:
@@ -1520,6 +1642,28 @@ js_forin_keys:
 .object:
     test rbx, rbx
     jz .done
+    cmp byte [rbx + JH_KIND], JK_OBJECT
+    jne .not_proxy
+    cmp dword [rbx + JOBJ_CLASS], JC_PROXY
+    jne .not_proxy
+    ; a proxy: its ownKeys trap, or its target's keys
+    call jsprx_keys
+    jc .object                      ; (RBX = the target)
+    push rcx
+    mov ecx, [rax + JARR_LEN]
+    mov rsi, [rax + JARR_ELEMS]
+.proxy_key:
+    test ecx, ecx
+    jz .proxy_done
+    mov rax, [rsi]
+    call .add_key
+    add rsi, 8
+    dec ecx
+    jmp .proxy_key
+.proxy_done:
+    pop rcx
+    jmp .done
+.not_proxy:
     cmp byte [rbx + JH_KIND], JK_ARRAY
     jne .props
     xor edx, edx
@@ -1929,6 +2073,10 @@ jsfn_native:
 js_call:
     mov dword [js_call_flags], JFRF_BOUNDARY
 js_call_flagged:
+    ; natives calling JavaScript calling natives ... use the kernel stack:
+    ; too deep is a RangeError, before the stack runs into .bss
+    cmp rsp, KERNEL_STACK_BOTTOM + JS_KSTACK_RESERVE
+    jb vm_stack_overflow
     push rbx
     mov rbx, rax
     shr rbx, 48
@@ -2086,6 +2234,8 @@ js_construct:
     mov rdi, rax
     lea rsi, [jsmsg_not_constructor]
     jmp js_throw_type
+
+JS_KSTACK_RESERVE       equ 0x20000     ; kernel stack kept free for throwing and the rest
 
 vm_stack_overflow:
     mov edx, JE_RANGE
@@ -2259,6 +2409,13 @@ vm_enter_js:
 vm_check_budget:
     mov dword [vm_budget], JSVM_BUDGET
     push rax
+    ; a page's script that runs too long is stopped (the page goes on)
+    mov rax, [js_deadline]
+    test rax, rax
+    jz .no_deadline
+    cmp rax, [timer_ticks]
+    jb .too_long
+.no_deadline:
     mov rax, [timer_ticks]
     sub rax, [vm_idle_tick]
     cmp rax, TICKS(20)
@@ -2274,6 +2431,13 @@ vm_check_budget:
 .cancel:
     mov byte [js_interrupted], 1    ; (the event loop stops too)
     lea rsi, [jsmsg_interrupted]
+    call jsstr_from_cstr
+    xor edx, edx
+    call js_make_error
+    jmp js_throw_uncatchable
+.too_long:
+    mov qword [js_deadline], 0
+    lea rsi, [jsmsg_too_long]
     call jsstr_from_cstr
     xor edx, edx
     call js_make_error
@@ -2513,6 +2677,11 @@ vmop_TYPEOFGLOB:
     mov rax, JS_UNDEF
     jc .typeof
     mov rax, [rbx + JPE_VAL]
+    bt qword [rbx + JPE_KEY], 34    ; an accessor: its getter's value
+    jnc .typeof
+    mov rax, [js_global]
+    BOX rax, rbx, JS_OBJ_BITS
+    VMCALL js_get
 .typeof:
     call js_typeof
     BOX rax, rdx, JS_STR_BITS
@@ -3916,6 +4085,157 @@ vmop_YIELDSTAR:
     NEXT
 
 ; REGEXP pattern32 flags32 -> a new RegExp (each time the literal is reached)
+; NEWTARGET: -> the function `new` called (this frame's), else undefined
+vmop_NEWTARGET:
+    mov rdx, [vm_fp]
+    mov rax, JS_UNDEF
+    test dword [rdx + JFR_FLAGS], JFRF_CONSTRUCT
+    jz .push
+    mov rax, r15
+    BOX rax, rdx, JS_OBJ_BITS
+.push:
+    PUSHV rax
+    NEXT
+
+; WITHGET atom32, rel32: [object] -> when the object has that property, its
+; value and a jump; else nothing (and the next lookup)
+vmop_WITHGET:
+    mov edx, [rsi]
+    movsxd rcx, dword [rsi + 4]
+    add rsi, 8
+    POPV rax
+    call vm_with_has
+    jnc .next
+    VMCALL js_get
+    PUSHV rax
+    add rsi, rcx
+.next:
+    NEXT
+
+; WITHSET atom32, rel32: [value][object] -> when the object has that property,
+; the value stored in it (and kept) and a jump; else [value]
+vmop_WITHSET:
+    mov edx, [rsi]
+    movsxd rcx, dword [rsi + 4]
+    add rsi, 8
+    POPV rax
+    call vm_with_has
+    jnc .next
+    push rcx
+    mov rcx, [r12 - 8]
+    VMCALL js_put
+    pop rcx
+    add rsi, rcx
+.next:
+    NEXT
+
+; vm_with_has: RAX = with object, EDX = atom -> CF=1 if it is an object with
+; that property (RAX, RCX, RDX kept)
+vm_with_has:
+    push rbx
+    mov rbx, rax
+    shr rbx, 48
+    cmp ebx, JS_TAG_OBJECT
+    jne .no
+    push rax
+    push rcx
+    push rdx
+    mov rbx, rax
+    mov eax, edx
+    BOX rax, rcx, JS_STR_BITS       ; js_in: RAX = key, RDX = object
+    mov rdx, rbx
+    VMCALL js_in
+    pop rdx
+    pop rcx
+    pop rax
+    pop rbx
+    ret
+.no:
+    pop rbx
+    clc
+    ret
+
+; TAGSTR site32, n16, n x (cooked32, raw32): a tagged template's strings
+; array (the same one each time that template runs)
+vmop_TAGSTR:
+    VMCALL jsv_tag_strings
+    PUSHV rax
+    NEXT
+
+; jsv_tag_strings: RSI = TAGSTR's operands -> RAX = the strings array, RSI
+; past the operands
+jsv_tag_strings:
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+    push r8
+    push r9
+    mov edx, [rsi]                  ; site
+    movzx ecx, word [rsi + 4]       ; strings
+    lea r8, [rsi + 6]
+    lea rsi, [r8 + rcx*8]
+    mov rax, [vm_tag_cache]
+    test rax, rax
+    jnz .cache
+    push rcx
+    mov ecx, 16
+    call jsarr_new
+    pop rcx
+    mov [vm_tag_cache], rax
+.cache:
+    cmp edx, [rax + JARR_LEN]
+    jae .make
+    mov rbx, [rax + JARR_ELEMS]
+    mov rax, [rbx + rdx*8]
+    mov rbx, JS_HOLE
+    cmp rax, rbx
+    jne .out
+.make:
+    call jsarr_new
+    mov rdi, rax                    ; strings
+    call jsarr_new
+    mov rbx, rax                    ; raw
+    xor r9d, r9d
+.string:
+    cmp r9d, ecx
+    jae .made
+    push rcx
+    mov eax, [r8 + r9*8]
+    mov rcx, rax
+    BOX rcx, rax, JS_STR_BITS
+    mov rax, rdi
+    call jsarr_push
+    mov eax, [r8 + r9*8 + 4]
+    mov rcx, rax
+    BOX rcx, rax, JS_STR_BITS
+    mov rax, rbx
+    call jsarr_push
+    pop rcx
+    inc r9d
+    jmp .string
+.made:
+    mov rcx, rbx
+    BOX rcx, rax, JS_OBJ_BITS
+    mov rax, rdi
+    push rdx
+    mov rdx, [atom_raw]
+    call jsobj_define_hidden
+    pop rdx
+    mov rcx, rdi
+    BOX rcx, rax, JS_OBJ_BITS
+    mov rax, [vm_tag_cache]
+    call jsarr_set
+    mov rax, rcx
+.out:
+    pop r9
+    pop r8
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
 vmop_REGEXP:
     mov eax, [rsi]
     mov edx, [rsi + 4]

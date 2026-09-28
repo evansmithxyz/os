@@ -109,7 +109,7 @@ jsy_str_values:         db "values", 0
 jsmsg_symbol_new:       db "Symbol is not a constructor", 0
 jsmsg_symbol_string:    db "Cannot convert a Symbol value to a string", 0
 jsmsg_symbol_number:    db "Cannot convert a Symbol value to a number", 0
-jsmsg_not_symbol:       db "% is not a symbol", 0
+jsmsg_not_symbol:       db "Symbol.prototype method called on a value that is not a symbol", 0
 jsmsg_iter_result:      db "Iterator result % is not an object", 0
 jsmsg_gen_running:      db "Generator is already running", 0
 jsmsg_not_generator:    db "next method called on incompatible receiver %", 0
@@ -298,9 +298,8 @@ jsy_this_symbol:
     mov eax, edx
     ret
 .bad:
-    mov rax, rdx
-    call js_to_string
-    mov rdi, rax
+    ; (no text of the value: its toString may be this very method)
+    xor edi, edi
     lea rsi, [jsmsg_not_symbol]
     jmp js_throw_type
 

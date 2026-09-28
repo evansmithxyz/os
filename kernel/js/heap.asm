@@ -71,6 +71,10 @@ KW_ENUM                 equ 37
 section .rodata
 jsatom_table:
 JSATOM atom_length,      "length"
+JSATOM atom_raw,         "raw"
+JSATOM atom_static_block, " static"
+JSATOM atom_import_fn,   "__import"
+JSATOM atom_import_meta, "__importMeta"
 JSATOM atom_prototype,   "prototype"
 JSATOM atom_constructor, "constructor"
 JSATOM atom_name,        "name"

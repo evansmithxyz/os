@@ -5,8 +5,10 @@ so these tests run a small HTTP server on the host and fetch from it.
 Set AGOS_TEST_INTERNET=1 to also run the DNS test against the real internet.
 """
 
+import gzip
 import http.server
 import os
+import zlib
 import threading
 import time
 import unittest
@@ -118,6 +120,31 @@ console.log('tree', out.parentNode.tagName, out.nextElementSibling.id, out.nextS
 <script>console.log('after an error', document.getElementById('written').tagName)</script>
 </body></html>"""
 EXTRA_JS = "console.log('external', document.title, location.pathname);\n"
+
+# The web APIs of step 7 (kernel/js/dom.js): classes, fragments, selectors the
+# native engine does not know, events, storage, and a script that adds a script
+MODERN_HTML = """<html><head><title>Modern</title></head><body>
+<ul id="list"><li class="a" data-id="1">one</li><li data-id="2">two</li></ul>
+<p id="c">a<!-- note -->b</p>
+<script id="first">
+var c = document.getElementById('c');
+console.log('comments', c.childNodes.length, c.childNodes[1].nodeType, c.childNodes[1].data, c.textContent, c.innerHTML);
+var list = document.getElementById('list');
+console.log('classes', list instanceof HTMLUListElement, list instanceof HTMLElement, list instanceof Node,
+    list.firstChild instanceof HTMLLIElement, document instanceof Document, Object.prototype.toString.call(list));
+var f = document.createDocumentFragment(); f.append('x', document.createElement('b')); list.after(f);
+list.insertAdjacentHTML('beforeend', '<li data-id="3">three</li>');
+console.log('dom', list.children.length, list.lastElementChild.dataset.id, document.querySelectorAll('li[data-id]').length,
+    document.querySelector('li:nth-child(2)').textContent, list.querySelector(':scope > li:not(.a)').textContent);
+var hits = []; list.addEventListener('ping', function (e) { hits.push(e.detail) }, { once: true });
+list.dispatchEvent(new CustomEvent('ping', { detail: 7 })); list.dispatchEvent(new CustomEvent('ping', { detail: 8 }));
+localStorage.setItem('k', 'v');
+console.log('events', hits.join(), localStorage.getItem('k'), matchMedia('(min-width: 100px)').matches,
+    getComputedStyle(list).display, typeof MutationObserver, document.currentScript.id);
+var s = document.createElement('script'); s.src = 'modern-extra.js';
+s.onload = function () { console.log('loaded', window.extraLoaded) }; document.head.appendChild(s);
+</script></body></html>"""
+MODERN_EXTRA_JS = "window.extraLoaded = document.currentScript.src.split('/').pop();\n"
 
 # More of the DOM: tree changes, queries, styles, window
 DOM_HTML = """<html><head><title>DOM</title></head><body>
@@ -235,6 +262,8 @@ class HostWebServer:
         (self.root / "gc.html").write_text(GC_HTML)
         (self.root / "async.html").write_text(ASYNC_HTML)
         (self.root / "data.json").write_text(DATA_JSON)
+        (self.root / "modern.html").write_text(MODERN_HTML)
+        (self.root / "modern-extra.js").write_text(MODERN_EXTRA_JS)
         # GET /sub answers "301 Location: /sub/" (http.server adds the slash)
         (self.root / "sub").mkdir(exist_ok=True)
         (self.root / "sub" / "index.html").write_text("<html><body><p>Sub page</p></body></html>")
@@ -252,9 +281,39 @@ class HostWebServer:
         self.httpd.server_close()
 
 
+# /enc/<kind>: ENCODED_TEXT sent compressed and/or chunked (as servers do even
+# when not asked); the browser decodes it (kernel/net/inflate.asm)
+ENCODED_TEXT = "".join(f"line {i}: the quick brown fox jumps over the lazy dog\n" for i in range(3000))
+
+
 class _QuietHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *args):
         pass
+
+    def do_GET(self):
+        if not self.path.startswith("/enc/"):
+            return super().do_GET()
+        kind = self.path[5:]
+        data = ENCODED_TEXT.encode()
+        body = {"gzip": gzip.compress(data), "deflate": zlib.compress(data), "stored": gzip.compress(data, 0),
+                "chunked": data, "gzip-chunked": gzip.compress(data)}[kind]
+        self.protocol_version = "HTTP/1.1"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        if kind != "chunked":
+            self.send_header("Content-Encoding", "deflate" if kind == "deflate" else "gzip")
+        self.send_header("Connection", "close")
+        if kind.endswith("chunked"):
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            for i in range(0, len(body), 4000):
+                part = body[i:i + 4000]
+                self.wfile.write(b"%x\r\n" % len(part) + part + b"\r\n")
+            self.wfile.write(b"0\r\n\r\n")
+        else:
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
 
 class NetworkTest(OSTestCase):
@@ -276,6 +335,16 @@ class NetworkTest(OSTestCase):
         self.assertIn("HTTP/1.0 200 OK", out)          # headers (first segment)
         self.assertIn("Hello from the host", out)      # body (second segment)
         self.assertLess(out.index("HTTP/1.0 200 OK"), out.index("Hello from the host"))
+
+    def test_compressed_and_chunked_bodies(self):
+        # what fetch and XMLHttpRequest get is the text itself
+        want = f"{len(ENCODED_TEXT)} line 2999"
+        with HostWebServer() as web:
+            base = f"http://10.0.2.2:{web.port}/enc"
+            for kind in ("gzip", "deflate", "stored", "chunked", "gzip-chunked"):
+                out = self.vm.run(f"js fetch('{base}/{kind}').then(r => r.text()).then(t => console.log(t.length, "
+                                  "t.trim().split('\\n').pop().slice(0, 9)))", timeout=30)
+                self.assertIn(want, out, kind)
 
     def test_fetch_and_xhr_from_js(self):
         with HostWebServer() as web:

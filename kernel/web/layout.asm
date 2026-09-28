@@ -188,7 +188,11 @@ lay_node:
     call dom_node
     mov r13, rbx                    ; R13 = its record
     cmp byte [r13 + N_TYPE], NODE_TEXT
-    je .text
+    jne .not_text
+    test byte [r13 + N_FLAGS], NF_COMMENT
+    jnz .done                       ; (comments are not drawn)
+    jmp .text
+.not_text:
     movzx eax, byte [r13 + S_DISPLAY]
     cmp eax, DISP_NONE
     je .done

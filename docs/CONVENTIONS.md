@@ -24,7 +24,7 @@ suite and the reviewers (human or not) assume them.
 - **XMM registers and the x87 stack are scratch** everywhere: nothing keeps
   a value in them across a call, and interrupt handlers never touch them
   (`fpu_init` turns them on; the JavaScript engine uses them for doubles).
-- **JavaScript** (`kernel/js/`) has six more rules:
+- **JavaScript** (`kernel/js/`) has seven more rules:
   - opcode handlers in `vm.asm` keep the interpreter's registers (RSI = pc,
     R12 = value stack, R13 = frame base, R14 = environment, R15 = function,
     RBP = opcode table) and store R12 in `vm_sp` before calling anything
@@ -52,7 +52,12 @@ suite and the reviewers (human or not) assume them.
   - the parser decides which variables closures capture from the names
     each function uses: new syntax that reads or writes a variable by name
     calls `jsp_note_use` for it. A missed name stops the compiler with
-    "internal: 'x' is used by an inner function but was not captured".
+    "internal: 'x' is used by an inner function but was not captured";
+  - library code that needs nothing native is JavaScript: `prelude.js`
+    (every realm) or `dom.js` (pages). The build strips their comment lines
+    and indentation, so only whole-line `//` comments, and no multi-line
+    strings or template literals. Natives meant only for them start with
+    `__` and are deleted from the global object once the prelude has them.
 
 ## Sections and memory
 

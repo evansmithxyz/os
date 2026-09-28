@@ -175,6 +175,16 @@ jsobj_add:
     mov [rbx + JPE_KEY], rdx
     mov [rbx + JPE_VAL], rcx
     inc dword [rax + JOBJ_COUNT]
+    ; (a class's #private names are never enumerable)
+    mov edi, edx
+    cmp byte [rdi + JH_KIND], JK_STRING
+    jne .added
+    cmp byte [rdi + JSTR_DATA], '#'
+    jne .added
+    cmp dword [rdi + JSTR_LEN], 1
+    jbe .added
+    bts qword [rbx + JPE_KEY], 32
+.added:
     pop rdi
     pop rsi
     pop rcx

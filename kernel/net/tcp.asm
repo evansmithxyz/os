@@ -723,7 +723,13 @@ http_build_request:
     movzx eax, byte [tcp_remote_ip + 3]
     call .append_dec
 .host_done:
-    ; 3. the fixed headers and the blank line
+    ; 3. the browser's requests take compressed bodies (http_decode_body)
+    cmp byte [http_quiet], 0
+    je .fixed_headers
+    lea rsi, [.STR_ACCEPT_ENCODING]
+    call .append_str
+.fixed_headers:
+    ; 4. the fixed headers and the blank line
     lea rsi, [.STR_GET_SUFFIX]
     call .append_str
 
@@ -776,6 +782,8 @@ http_build_request:
     db "/", 0
 .STR_GET_PREFIX:
     db " HTTP/1.0", 0x0D, 0x0A, "Host: ", 0
+.STR_ACCEPT_ENCODING:
+    db 0x0D, 0x0A, "Accept-Encoding: gzip, deflate", 0
 .STR_GET_SUFFIX:
     db 0x0D, 0x0A
     db "User-Agent: AntigravityOS/1.0 (x86_64)", 0x0D, 0x0A
@@ -854,6 +862,7 @@ tcp_http_client:
     mov bl, COLOR_LIGHT_GRAY
     lea rsi, [MSG_TCP_CLOSED]
     call tcp_say
+    call http_decode_body           ; (a gzip body: decompressed)
     xor eax, eax
     jmp .exit_client
 .error:

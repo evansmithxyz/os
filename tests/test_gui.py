@@ -233,6 +233,20 @@ class DesktopTest(OSTestCase):
             self.vm.expect(f"js: navigate -> http://10.0.2.2:{web.port}/hello.html")
             self.vm.expect("browser text: Hello from the host", timeout=20)
 
+    def test_browser_modern_web_apis(self):
+        with HostWebServer() as web:
+            self.open_page(web, "modern.html")
+            self.vm.expect("js: loaded modern-extra.js", timeout=20)
+        out = self.vm.output
+        for expected in (
+            "js: classes true true true true true [object HTMLUListElement]",
+            "js: dom 3 3 3 two two",
+            "js: events 7 v true block function first",
+            "js: comments 3 8  note  ab a<!-- note -->b",
+        ):
+            self.assertIn(expected, out)
+        self.assertNotIn("Uncaught", out)
+
     def test_browser_page_survives_garbage_collection(self):
         with HostWebServer() as web:
             line = self.open_page(web, "gc.html")

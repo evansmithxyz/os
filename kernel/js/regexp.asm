@@ -55,6 +55,7 @@ RXF_DOTALL              equ 8
 RXF_UNICODE             equ 16
 RXF_STICKY              equ 32
 RXF_INDICES             equ 64
+RXF_UNICODE_SETS        equ 128         ; v (taken as u)
 
 JSRE_MAX_PROG           equ 0x10000     ; program bytes
 JSRE_MAX_GROUPS         equ 126
@@ -109,7 +110,7 @@ jsmsg_rx_escape:        db "Invalid escape", 0
 jsmsg_rx_flags:         db "Invalid flags supplied to RegExp constructor '%'", 0
 jsmsg_rx_slash:         db "Invalid regular expression: missing /", 0
 jsmsg_rx_stack:         db "Maximum call stack size exceeded", 0
-jsre_flag_chars:        db "gimsuyd", 0
+jsre_flag_chars:        db "gimsuydv", 0   ; (v: unicode sets, taken as u)
 
 section .text
 
@@ -1225,6 +1226,127 @@ jsre_class_shorthand:
     pop rax
     ret
 
+; jsre_class_property: [jsre_pos] = the p or P of \p{Name} -> its code points
+; added to the class being built (for \P, all the others);
+; AL = p or P, jsre_pos past the }
+jsre_class_property:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push r8
+    mov rsi, [jsre_pos]
+    mov bl, [rsi]                   ; p / P
+    inc rsi
+    cmp byte [rsi], '{'
+    jne .bad
+    inc rsi
+    mov rdx, rsi                    ; the name
+.name_end:
+    cmp rsi, [jsre_end]
+    jae .bad
+    cmp byte [rsi], '}'
+    je .name_found
+    inc rsi
+    jmp .name_end
+.name_found:
+    lea rax, [rsi + 1]
+    mov [jsre_pos], rax
+    ; (Script=, sc=, General_Category=, gc=, scx= before it: skipped)
+    mov rcx, rdx
+.equals:
+    cmp rcx, rsi
+    jae .lookup
+    cmp byte [rcx], '='
+    je .after_equals
+    inc rcx
+    jmp .equals
+.after_equals:
+    lea rdx, [rcx + 1]
+.lookup:
+    mov rcx, rsi
+    sub rcx, rdx                    ; its length
+    lea r8, [jsre_prop_names]
+.name:
+    mov rax, [r8]
+    test rax, rax
+    jz .bad
+    ; the same name? (the table's are NUL-terminated)
+    push rcx
+    push rdx
+.cmp:
+    test ecx, ecx
+    jz .cmp_end
+    mov bh, [rdx]
+    cmp bh, [rax]
+    jne .differ
+    inc rdx
+    inc rax
+    dec ecx
+    jmp .cmp
+.cmp_end:
+    cmp byte [rax], 0
+    jne .differ
+    pop rdx
+    pop rcx
+    mov rsi, [r8 + 8]
+    jmp .ranges
+.differ:
+    pop rdx
+    pop rcx
+    add r8, 16
+    jmp .name
+.ranges:
+    cmp bl, 'P'
+    jne .add
+    ; \P in a class: the ranges between them (the table is in order)
+    xor edx, edx                    ; the next code point not covered
+.gap:
+    mov eax, [rsi]
+    cmp eax, -1
+    je .gap_last
+    test eax, eax
+    jz .gap_next
+    push rdx
+    xchg eax, edx                   ; EAX = from, EDX = the range's start
+    dec edx
+    cmp eax, edx
+    ja .no_gap
+    call jsre_class_add
+.no_gap:
+    pop rdx
+.gap_next:
+    mov edx, [rsi + 4]
+    inc edx
+    add rsi, 8
+    jmp .gap
+.gap_last:
+    cmp edx, 0x10FFFF
+    ja .done
+    mov eax, edx
+    mov edx, 0x10FFFF
+    call jsre_class_add
+    jmp .done
+.add:
+    mov eax, [rsi]
+    cmp eax, -1
+    je .done
+    mov edx, [rsi + 4]
+    call jsre_class_add
+    add rsi, 8
+    jmp .add
+.done:
+    mov al, bl
+    pop r8
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+.bad:
+    lea rdi, [jsmsg_rx_escape]
+    jmp jsre_error_throw
+
 ; jsre_class_atom: after '[' -> RX_CLASS
 jsre_class_atom:
     push rax
@@ -1321,6 +1443,18 @@ jsre_class_atom:
     je .shorthand
     cmp bl, 's'
     je .shorthand
+    cmp bl, 'p'
+    jne .not_property
+    test dword [jsre_flags], RXF_UNICODE | RXF_UNICODE_SETS
+    jz .not_property
+    push rax
+    mov [jsre_pos], rsi
+    call jsre_class_property
+    mov rsi, [jsre_pos]
+    pop rax
+    mov eax, -1
+    ret
+.not_property:
     cmp al, 'b'
     jne .other_escape
     inc rsi
@@ -1525,6 +1659,8 @@ jsre_escape_atom:
     je .shorthand
     cmp bl, 's'
     je .shorthand
+    cmp bl, 'p'
+    je .property
     cmp al, 'k'
     je .named_ref
     cmp al, '1'
@@ -1615,6 +1751,15 @@ jsre_escape_atom:
     call jsre_class_emit
     clc
     jmp .out
+.property:
+    ; \p{Name} / \P{Name} (under /u; else the letter p)
+    test dword [jsre_flags], RXF_UNICODE | RXF_UNICODE_SETS
+    jz .char
+    call jsre_class_begin
+    call jsre_class_property        ; (\P: the other code points)
+    call jsre_class_emit
+    clc
+    jmp .out
 .char:
     mov [jsre_pos], rsi
     call jsre_char_escape
@@ -1638,6 +1783,193 @@ jsre_escape_atom:
 section .rodata
 align 4
 ; code point ranges, -1 ends a list
+; \p{...}: code point ranges of the Unicode properties most used (close, not exact)
+jsre_prop_letter:
+                        dd 0x41, 0x5A, 0x61, 0x7A, 0xAA, 0xAA, 0xB5, 0xB5, 0xBA, 0xBA, 0xC0, 0xD6
+                        dd 0xD8, 0xF6, 0xF8, 0x2C1, 0x2C6, 0x2D1, 0x2E0, 0x2E4, 0x370, 0x374, 0x376, 0x3FF
+                        dd 0x400, 0x481, 0x48A, 0x52F, 0x531, 0x556, 0x561, 0x587, 0x5D0, 0x5EA, 0x620, 0x64A
+                        dd 0x671, 0x6D3, 0x904, 0x939, 0xE01, 0xE30, 0x10A0, 0x10FF, 0x1100, 0x11FF, 0x1E00, 0x1FFF
+                        dd 0x2C00, 0x2DFF, 0x3041, 0x3096, 0x30A1, 0x30FA, 0x3105, 0x312F, 0x3131, 0x318E, 0x3400, 0x4DBF
+                        dd 0x4E00, 0x9FFF, 0xA000, 0xA48C, 0xAC00, 0xD7A3, 0xF900, 0xFAFF, 0xFB00, 0xFDFF, 0xFE70, 0xFEFC
+                        dd 0xFF21, 0xFF3A, 0xFF41, 0xFF5A, 0xFF66, 0xFFDC, 0x20000, 0x2FA1F
+                        dd -1
+jsre_prop_upper:
+                        dd 0x41, 0x5A, 0xC0, 0xD6, 0xD8, 0xDE, 0x391, 0x3A9, 0x410, 0x42F
+                        dd -1
+jsre_prop_lower:
+                        dd 0x61, 0x7A, 0xB5, 0xB5, 0xDF, 0xF6, 0xF8, 0xFF, 0x3B1, 0x3C9, 0x430, 0x44F
+                        dd -1
+jsre_prop_number:
+                        dd 0x30, 0x39, 0xB2, 0xB3, 0xB9, 0xB9, 0xBC, 0xBE, 0x660, 0x669, 0x6F0, 0x6F9
+                        dd 0x966, 0x96F, 0x2150, 0x2189, 0xFF10, 0xFF19
+                        dd -1
+jsre_prop_decimal:
+                        dd 0x30, 0x39, 0x660, 0x669, 0x6F0, 0x6F9, 0x966, 0x96F, 0xFF10, 0xFF19
+                        dd -1
+jsre_prop_punct:
+                        dd 0x21, 0x23, 0x25, 0x2A, 0x2C, 0x2F, 0x3A, 0x3B, 0x3F, 0x40, 0x5B, 0x5D
+                        dd 0x5F, 0x5F, 0x7B, 0x7B, 0x7D, 0x7D, 0xA1, 0xA1, 0xA7, 0xA7, 0xAB, 0xAB
+                        dd 0xB6, 0xB7, 0xBB, 0xBB, 0xBF, 0xBF, 0x2010, 0x2027, 0x2030, 0x205E, 0x3001, 0x3003
+                        dd 0x3008, 0x3011
+                        dd -1
+jsre_prop_symbol:
+                        dd 0x24, 0x24, 0x2B, 0x2B, 0x3C, 0x3E, 0x5E, 0x5E, 0x60, 0x60, 0x7C, 0x7C
+                        dd 0x7E, 0x7E, 0xA2, 0xA6, 0xA8, 0xA9, 0xAC, 0xAC, 0xAE, 0xB1, 0xB4, 0xB4
+                        dd 0xB8, 0xB8, 0xD7, 0xD7, 0xF7, 0xF7, 0x2190, 0x23FF, 0x2500, 0x27BF, 0x1F300, 0x1FAFF
+                        dd -1
+jsre_prop_space:
+                        dd 0x9, 0xD, 0x20, 0x20, 0xA0, 0xA0, 0x1680, 0x1680, 0x2000, 0x200A, 0x2028, 0x2029
+                        dd 0x202F, 0x202F, 0x205F, 0x205F, 0x3000, 0x3000
+                        dd -1
+jsre_prop_emoji:
+                        dd 0xA9, 0xA9, 0xAE, 0xAE, 0x203C, 0x203C, 0x2049, 0x2049, 0x2122, 0x2122, 0x2139, 0x2139
+                        dd 0x2194, 0x21AA, 0x231A, 0x23FF, 0x24C2, 0x24C2, 0x25AA, 0x27BF, 0x2934, 0x2935, 0x2B05, 0x2B55
+                        dd 0x3030, 0x3030, 0x303D, 0x303D, 0x3297, 0x3297, 0x3299, 0x3299, 0x1F000, 0x1FAFF
+                        dd -1
+jsre_prop_latin:
+                        dd 0x41, 0x5A, 0x61, 0x7A, 0xAA, 0xAA, 0xBA, 0xBA, 0xC0, 0xD6, 0xD8, 0xF6
+                        dd 0xF8, 0x24F, 0x1E00, 0x1EFF, 0xFF21, 0xFF3A, 0xFF41, 0xFF5A
+                        dd -1
+jsre_prop_greek:
+                        dd 0x370, 0x3FF, 0x1F00, 0x1FFF
+                        dd -1
+jsre_prop_cyrillic:
+                        dd 0x400, 0x52F
+                        dd -1
+jsre_prop_han:
+                        dd 0x2E80, 0x2FDF, 0x3005, 0x3005, 0x3007, 0x3007, 0x3021, 0x3029, 0x3400, 0x4DBF, 0x4E00, 0x9FFF
+                        dd 0xF900, 0xFAFF, 0x20000, 0x2FA1F
+                        dd -1
+jsre_prop_hiragana:
+                        dd 0x3041, 0x309F
+                        dd -1
+jsre_prop_katakana:
+                        dd 0x30A0, 0x30FF
+                        dd -1
+jsre_prop_arabic:
+                        dd 0x600, 0x6FF, 0x750, 0x77F
+                        dd -1
+jsre_prop_hebrew:
+                        dd 0x591, 0x5F4
+                        dd -1
+jsre_prop_hangul:
+                        dd 0x1100, 0x11FF, 0x3131, 0x318E, 0xAC00, 0xD7A3
+                        dd -1
+jsre_prop_thai:
+                        dd 0xE01, 0xE5B
+                        dd -1
+jsre_prop_devanagari:
+                        dd 0x900, 0x97F
+                        dd -1
+jsre_prop_ascii:
+                        dd 0x0, 0x7F
+                        dd -1
+jsre_prop_any:
+                        dd 0x0, 0x10FFFF
+                        dd -1
+jsre_prop_hex:
+                        dd 0x30, 0x39, 0x41, 0x46, 0x61, 0x66
+                        dd -1
+jsre_prop_names:
+                        dq jsre_propname_L, jsre_prop_letter
+                        dq jsre_propname_Letter, jsre_prop_letter
+                        dq jsre_propname_Alphabetic, jsre_prop_letter
+                        dq jsre_propname_Alpha, jsre_prop_letter
+                        dq jsre_propname_ID_Start, jsre_prop_letter
+                        dq jsre_propname_ID_Continue, jsre_prop_letter
+                        dq jsre_propname_Lu, jsre_prop_upper
+                        dq jsre_propname_Uppercase_Letter, jsre_prop_upper
+                        dq jsre_propname_Uppercase, jsre_prop_upper
+                        dq jsre_propname_Ll, jsre_prop_lower
+                        dq jsre_propname_Lowercase_Letter, jsre_prop_lower
+                        dq jsre_propname_Lowercase, jsre_prop_lower
+                        dq jsre_propname_N, jsre_prop_number
+                        dq jsre_propname_Number, jsre_prop_number
+                        dq jsre_propname_Nd, jsre_prop_decimal
+                        dq jsre_propname_Decimal_Number, jsre_prop_decimal
+                        dq jsre_propname_digit, jsre_prop_decimal
+                        dq jsre_propname_P, jsre_prop_punct
+                        dq jsre_propname_Punctuation, jsre_prop_punct
+                        dq jsre_propname_S, jsre_prop_symbol
+                        dq jsre_propname_Symbol, jsre_prop_symbol
+                        dq jsre_propname_Z, jsre_prop_space
+                        dq jsre_propname_Zs, jsre_prop_space
+                        dq jsre_propname_Separator, jsre_prop_space
+                        dq jsre_propname_Space_Separator, jsre_prop_space
+                        dq jsre_propname_White_Space, jsre_prop_space
+                        dq jsre_propname_space, jsre_prop_space
+                        dq jsre_propname_Emoji, jsre_prop_emoji
+                        dq jsre_propname_Emoji_Presentation, jsre_prop_emoji
+                        dq jsre_propname_Extended_Pictographic, jsre_prop_emoji
+                        dq jsre_propname_Latin, jsre_prop_latin
+                        dq jsre_propname_Latn, jsre_prop_latin
+                        dq jsre_propname_Greek, jsre_prop_greek
+                        dq jsre_propname_Grek, jsre_prop_greek
+                        dq jsre_propname_Cyrillic, jsre_prop_cyrillic
+                        dq jsre_propname_Cyrl, jsre_prop_cyrillic
+                        dq jsre_propname_Han, jsre_prop_han
+                        dq jsre_propname_Hani, jsre_prop_han
+                        dq jsre_propname_Hiragana, jsre_prop_hiragana
+                        dq jsre_propname_Katakana, jsre_prop_katakana
+                        dq jsre_propname_Arabic, jsre_prop_arabic
+                        dq jsre_propname_Hebrew, jsre_prop_hebrew
+                        dq jsre_propname_Hangul, jsre_prop_hangul
+                        dq jsre_propname_Thai, jsre_prop_thai
+                        dq jsre_propname_Devanagari, jsre_prop_devanagari
+                        dq jsre_propname_ASCII, jsre_prop_ascii
+                        dq jsre_propname_Any, jsre_prop_any
+                        dq jsre_propname_ASCII_Hex_Digit, jsre_prop_hex
+                        dq jsre_propname_Hex_Digit, jsre_prop_hex
+                        dq 0
+jsre_propname_L: db "L", 0
+jsre_propname_Letter: db "Letter", 0
+jsre_propname_Alphabetic: db "Alphabetic", 0
+jsre_propname_Alpha: db "Alpha", 0
+jsre_propname_ID_Start: db "ID_Start", 0
+jsre_propname_ID_Continue: db "ID_Continue", 0
+jsre_propname_Lu: db "Lu", 0
+jsre_propname_Uppercase_Letter: db "Uppercase_Letter", 0
+jsre_propname_Uppercase: db "Uppercase", 0
+jsre_propname_Ll: db "Ll", 0
+jsre_propname_Lowercase_Letter: db "Lowercase_Letter", 0
+jsre_propname_Lowercase: db "Lowercase", 0
+jsre_propname_N: db "N", 0
+jsre_propname_Number: db "Number", 0
+jsre_propname_Nd: db "Nd", 0
+jsre_propname_Decimal_Number: db "Decimal_Number", 0
+jsre_propname_digit: db "digit", 0
+jsre_propname_P: db "P", 0
+jsre_propname_Punctuation: db "Punctuation", 0
+jsre_propname_S: db "S", 0
+jsre_propname_Symbol: db "Symbol", 0
+jsre_propname_Z: db "Z", 0
+jsre_propname_Zs: db "Zs", 0
+jsre_propname_Separator: db "Separator", 0
+jsre_propname_Space_Separator: db "Space_Separator", 0
+jsre_propname_White_Space: db "White_Space", 0
+jsre_propname_space: db "space", 0
+jsre_propname_Emoji: db "Emoji", 0
+jsre_propname_Emoji_Presentation: db "Emoji_Presentation", 0
+jsre_propname_Extended_Pictographic: db "Extended_Pictographic", 0
+jsre_propname_Latin: db "Latin", 0
+jsre_propname_Latn: db "Latn", 0
+jsre_propname_Greek: db "Greek", 0
+jsre_propname_Grek: db "Grek", 0
+jsre_propname_Cyrillic: db "Cyrillic", 0
+jsre_propname_Cyrl: db "Cyrl", 0
+jsre_propname_Han: db "Han", 0
+jsre_propname_Hani: db "Hani", 0
+jsre_propname_Hiragana: db "Hiragana", 0
+jsre_propname_Katakana: db "Katakana", 0
+jsre_propname_Arabic: db "Arabic", 0
+jsre_propname_Hebrew: db "Hebrew", 0
+jsre_propname_Hangul: db "Hangul", 0
+jsre_propname_Thai: db "Thai", 0
+jsre_propname_Devanagari: db "Devanagari", 0
+jsre_propname_ASCII: db "ASCII", 0
+jsre_propname_Any: db "Any", 0
+jsre_propname_ASCII_Hex_Digit: db "ASCII_Hex_Digit", 0
+jsre_propname_Hex_Digit: db "Hex_Digit", 0
 jsre_digit_ranges:      dd '0', '9', -1
 jsre_word_ranges:       dd '0', '9', 'A', 'Z', '_', '_', 'a', 'z', -1
 jsre_space_ranges:      dd 9, 13, ' ', ' ', 0xA0, 0xA0, 0x1680, 0x1680, 0x2000, 0x200A
@@ -2240,6 +2572,7 @@ jsre_backref:
 ; ------------------------------------------------------------------------------
 jsre_look:
     push rcx
+    push rdx
     push rsi
     push rdi
     push r13
@@ -2270,6 +2603,7 @@ jsre_look:
 .result:
     ; CF=0: it matched. Negative kinds want the opposite.
     setc al                         ; 1 = did not match
+    mov edx, [rsp + 32]             ; the kind (jsre_run clobbers RDX)
     cmp edx, LK_NOT_AHEAD
     je .negative
     cmp edx, LK_NOT_BEHIND
@@ -2283,6 +2617,7 @@ jsre_look:
     pop r13
     pop rdi
     pop rsi
+    pop rdx
     pop rcx
     shr al, 1                       ; CF = the assertion fails
     ret
