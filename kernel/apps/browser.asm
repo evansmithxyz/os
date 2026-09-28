@@ -751,6 +751,15 @@ browser_navigate:
     pop rax
     ret
 
+; browser_js_tick: (desktop loop) the page's due timers and animation frames,
+; and the page a timer asked to go to
+browser_js_tick:
+    call jsd_tick
+    jnc .ret
+    call browser_js_navigation
+.ret:
+    ret
+
 ; browser_js_navigation: a script asked for another page (location.href):
 ; load it (at most a few in a row, so pages cannot bounce forever)
 browser_js_navigation:
@@ -917,6 +926,36 @@ browser_fetch_quiet:
     push rdx
     push rdi
     push r8
+    push r9
+    call browser_fetch_any
+    jc .fail
+    cmp eax, 200
+    jne .fail
+    mov rsi, rdi
+    pop r9
+    pop r8
+    pop rdi
+    pop rdx
+    pop rax
+    clc
+    ret
+.fail:
+    pop r9
+    pop r8
+    pop rdi
+    pop rdx
+    pop rax
+    stc
+    ret
+
+; ------------------------------------------------------------------------------
+; browser_fetch_any: RSI = href, ECX = its length (resolved against the page;
+; the absolute URL is left in browser_resolved) -> a GET of it, whatever the
+; status: EAX = the status code, R8/R9 = its text ("OK"), RSI/RDX = the header
+; lines, RDI/RCX = the body, all in http_resp_buf (valid until the next
+; fetch); CF=1 if no response came back
+; ------------------------------------------------------------------------------
+browser_fetch_any:
     call browser_resolve_link
     jc .fail
     mov rsi, [browser_resolved]
@@ -944,34 +983,73 @@ browser_fetch_quiet:
     mov byte [http_quiet], 0
     test eax, eax
     jnz .fail
-    ; only a 200 response counts
+    ; "HTTP/1.1 200 OK\r\n"
     lea rsi, [abs http_resp_buf]
-    cmp byte [rsi + 9], '2'
+    cmp dword [rsi], 'HTTP'
     jne .fail
-    ; the body, after the blank line
-.find_body:
+.space:
     mov al, [rsi]
     test al, al
     jz .fail
-    cmp dword [rsi], 0x0A0D0A0D
-    je .body
     inc rsi
-    jmp .find_body
-.body:
-    add rsi, 4
-    call strlen
-    mov rcx, rax
-    pop r8
-    pop rdi
-    pop rdx
-    pop rax
+    cmp al, ' '
+    jne .space
+    xor eax, eax                    ; the status
+    mov ecx, 3
+.digit:
+    movzx edx, byte [rsi]
+    sub edx, '0'
+    cmp edx, 9
+    ja .fail
+    imul eax, eax, 10
+    add eax, edx
+    inc rsi
+    dec ecx
+    jnz .digit
+    cmp byte [rsi], ' '
+    jne .text
+    inc rsi
+.text:
+    mov r8, rsi                     ; the status text
+.text_end:
+    mov dl, [rsi]
+    test dl, dl
+    jz .fail
+    cmp dl, 13
+    je .line_end
+    cmp dl, 10
+    je .line_end
+    inc rsi
+    jmp .text_end
+.line_end:
+    mov r9, rsi
+    sub r9, r8
+    cmp byte [rsi], 13
+    jne .lf
+    inc rsi
+.lf:
+    inc rsi                         ; the header lines start here
+    mov rdi, rsi
+.blank:
+    cmp byte [rdi], 0
+    je .fail
+    cmp dword [rdi], 0x0A0D0A0D     ; \r\n\r\n
+    je .headers_end
+    inc rdi
+    jmp .blank
+.headers_end:
+    mov rdx, rdi
+    sub rdx, rsi
+    add rdi, 4                      ; the body
+    lea rcx, [abs http_resp_buf]
+    add ecx, [http_resp_len]
+    sub rcx, rdi
+    jns .done
+    xor ecx, ecx
+.done:
     clc
     ret
 .fail:
-    pop r8
-    pop rdi
-    pop rdx
-    pop rax
     stc
     ret
 

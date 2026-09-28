@@ -110,6 +110,7 @@ js_exception:           resq 1          ; thrown value; JS_HOLE = message in js_
 vm_line:                resd 1          ; current source line
 vm_budget:              resd 1
 vm_nesting:             resd 1          ; js_call depth
+js_interrupted:         resb 1          ; Esc / Ctrl+C stopped a script (cleared by js_reset)
 js_call_flags:          resd 1          ; JFRF_* for the frame js_call makes
 js_exception_line:      resd 1
 js_err_buf:             resb 256
@@ -2263,6 +2264,7 @@ vm_check_budget:
     pop rax
     ret
 .cancel:
+    mov byte [js_interrupted], 1    ; (the event loop stops too)
     lea rsi, [jsmsg_interrupted]
     call jsstr_from_cstr
     xor edx, edx
@@ -2791,6 +2793,12 @@ vmop_RET:
     POPV rax
 vm_return:
     mov rdx, [vm_fp]
+    test dword [rdx + JFR_FLAGS], JFRF_ASYNC
+    jz vm_return_rdx
+    VMCALL jsco_finish              ; the async function's promise resolves
+vm_return_plain:                    ; RAX = the value, no async bookkeeping
+    mov rdx, [vm_fp]
+vm_return_rdx:
     test dword [rdx + JFR_FLAGS], JFRF_CONSTRUCT
     jz .value
     mov rcx, rax
@@ -3678,6 +3686,28 @@ vmop_TRY:
 vmop_ENDTRY:
     dec dword [vm_handler_count]
     NEXT
+
+; --- async functions (the coroutines are in async.asm) --------------------------
+; ASYNCSTART: first in an async function: its coroutine and promise
+vmop_ASYNCSTART:
+    VMCALL jsco_new
+    mov rdx, [vm_fp]
+    mov [rdx + JFR_CORO], rax
+    or dword [rdx + JFR_FLAGS], JFRF_ASYNC
+    NEXT
+
+; AWAIT v -> (later) the value v settles to: the frame is saved and the caller
+; gets the function's promise
+vmop_AWAIT:
+    POPV rax
+    VMCALL jsco_suspend
+    jmp vm_return_plain
+
+; ASYNCREJECT e: where the implicit try of an async function lands
+vmop_ASYNCREJECT:
+    POPV rax
+    VMCALL jsco_reject
+    jmp vm_return_plain
 
 vmop_CONSTERR:
     lea rsi, [jsmsg_const]

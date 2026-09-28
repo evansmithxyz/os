@@ -46,6 +46,7 @@ JK_ENV                  equ 6           ; captured variables of a scope
 JK_CODE                 equ 7           ; compiled function (template)
 JK_ITER                 equ 8           ; for-in / for-of state
 JK_ACCESSOR             equ 9           ; a getter/setter pair (JPA_ACCESSOR properties)
+JK_CORO                 equ 10          ; a suspended async function (async.asm)
 
 ; Strings: bytes (UTF-8 passes through), NUL-terminated for convenience
 JSTR_LEN                equ 4           ; dword
@@ -67,6 +68,7 @@ JC_MATH                 equ 2
 JC_GLOBAL               equ 3
 JC_CONSOLE              equ 4
 JC_ERROR                equ 5           ; made by Error / TypeError / ... (or thrown by the engine)
+JC_PROMISE              equ 6           ; a Promise (JPROM_* fields, async.asm)
 JC_HOST                 equ 16          ; classes from here on are host objects (jsdom.asm)
 JC_NODE                 equ 16          ; a DOM node (JSD_NODE = its index)
 JC_STYLE                equ 17          ; element.style
@@ -124,7 +126,8 @@ JCODE_ARGSLOT           equ 32          ; dword, slot of `arguments` (JCF_ARGUME
 JCODE_SELFSLOT          equ 36          ; dword, slot of its own name (JCF_SELF)
 JCODE_LINE              equ 40          ; dword, line of the `function` keyword
 JCODE_RESTSLOT          equ 44          ; dword, slot of a ...rest parameter (JCF_REST)
-JCODE_SIZE              equ 48
+JCODE_FLAGS2            equ 48          ; dword, JCF2_*
+JCODE_SIZE              equ 56
 JCF_HEAPENV             equ 1           ; variables live in a heap env (has inner functions)
 JCF_ARGUMENTS           equ 2           ; uses `arguments`
 JCF_SELF                equ 4           ; named function expression binds its name
@@ -133,6 +136,7 @@ JCF_ARROW               equ 16          ; arrow function: `this` from where it w
 JCF_REST                equ 32          ; has a ...rest parameter
 JCF_CLASSCTOR           equ 64          ; a class constructor (only with new)
 JCF_DERIVED             equ 128         ; ... of a class that extends another
+JCF2_ASYNC              equ 1           ; an async function (JCODE_FLAGS2)
 
 ; Iterators (for-in / for-of)
 JIT_MODE                equ 1           ; byte: JIM_*
@@ -151,9 +155,11 @@ JFR_ENV                 equ 24          ; caller's environment
 JFR_RESULT              equ 32          ; where the result goes (callee slot)
 JFR_FLAGS               equ 40          ; dword, JFRF_*
 JFR_LINE                equ 44          ; dword, caller's current line
-JFR_SIZE                equ 48
+JFR_CORO                equ 48          ; an async function's coroutine (JFRF_ASYNC)
+JFR_SIZE                equ 56
 JFRF_BOUNDARY           equ 1           ; return leaves vm_run (js_call)
 JFRF_CONSTRUCT          equ 2           ; `new`: a non-object result becomes `this`
+JFRF_ASYNC              equ 4           ; an async function: returns settle its promise
 
 ; --- Errors (js_throw) --------------------------------------------------------
 JE_ERROR                equ 0
@@ -332,6 +338,9 @@ JSVM_MAX_HANDLERS       equ 256
     OPC SUPERCALL
     OPC SUPERCALLA
     OPC SUPERGET
+    OPC ASYNCSTART
+    OPC ASYNCREJECT
+    OPC AWAIT
 %endmacro
 
 %assign js_opc_n 0

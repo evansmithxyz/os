@@ -290,6 +290,64 @@ class JavaScriptTest(OSTestCase):
         self.assertJs("var t = 0; for (var k = 0; k < 30; k++) { var big = JSON.parse(JSON.stringify("
                       "Array.from({length: 2000}, (v, i) => ({i, s: 'q' + i})))); t += big[1999].i } t", "59970")
 
+    # --- step 4: timers and async --------------------------------------------------
+    def test_promises(self):
+        self.assertJs("[Promise.resolve(5), new Promise(() => {}), Promise.reject(1).catch(() => {}) instanceof Promise]",
+                      "[ Promise { 5 }, Promise { <pending> }, true ]")
+        self.assertJs("Promise.resolve(1).then(v => v + 1).then(v => console.log('then', v)); 'sync'", "'sync'\nthen 2")
+        self.assertJs("Promise.reject(new Error('no')).catch(e => e.message).finally(() => console.log('fin'))"
+                      ".then(v => console.log('after', v)); 1", "1\nfin\nafter no")
+        self.assertJs("new Promise(r => r(Promise.resolve('adopted'))).then(console.log); 0", "0\nadopted")
+        self.assertJs("Promise.all([1, Promise.resolve(2), new Promise(r => setTimeout(() => r(3), 10))])"
+                      ".then(v => console.log('all', v)); 0", "0\nall [ 1, 2, 3 ]")
+        self.assertJs("Promise.allSettled([Promise.reject(1), 2]).then(v => console.log(JSON.stringify(v))); 0",
+                      """0\n[{"status":"rejected","reason":1},{"status":"fulfilled","value":2}]""")
+        self.assertJs("Promise.race([new Promise(r => setTimeout(() => r('slow'), 50)), "
+                      "new Promise(r => setTimeout(() => r('fast'), 10))]).then(console.log); 0", "0\nfast")
+        self.assertJs("Promise.any([Promise.reject(1), Promise.reject(2)]).catch(e => console.log(e.name, e.errors)); 0",
+                      "0\nAggregateError [ 1, 2 ]")
+        self.assertJs("Promise.reject(42); 0", "0\nUncaught (in promise) 42")
+
+    def test_async_functions(self):
+        self.assertJs("async function f(x) { return x * 2 } [f(21), f]", "[ Promise { 42 }, [AsyncFunction: f] ]")
+        self.assertJs("async function g() { var a = await 1; var b = await Promise.resolve(2); return a + b } "
+                      "g().then(v => console.log('g', v)); 0", "0\ng 3")
+        self.assertJs("async function h() { try { await Promise.reject(new TypeError('bad')) } catch (e) { "
+                      "return 'caught ' + e.message } finally { console.log('finally') } } h().then(console.log); 0",
+                      "0\nfinally\ncaught bad")
+        self.assertJs("async function k() { await 1; null.x } k().catch(e => console.log('k:', e.message)); 0",
+                      "0\nk: Cannot read properties of null (reading 'x')")
+        self.assertJs("var o = {v: 9, async m() { return this.v }}; class C { async get() { await null; return 'cls' } } "
+                      "o.m().then(console.log); new C().get().then(console.log); (async x => x + 1)(1).then(console.log); 0",
+                      "0\n9\n2\ncls")
+        self.assertJs("var order = []; (async () => { order.push(1); await undefined; order.push(3) })(); order.push(2); "
+                      "queueMicrotask(() => console.log(order.join())); 0", "0\n1,2,3")
+        self.assertJs("async function thrower() { await 1; throw new RangeError('late') } thrower(); 0",
+                      "0\nUncaught (in promise) RangeError: late")
+        self.assertJs("var await = 5; async function a() { return await await 2 } a().then(v => console.log(v, await)); 0",
+                      "0\n2 5")
+
+    def test_timers_and_event_loop(self):
+        self.assertJs("console.log(1); setTimeout(() => console.log(4), 20); Promise.resolve().then(() => console.log(3)); "
+                      "console.log(2)", "1\n2\n3\n4")
+        self.assertJs("const sleep = ms => new Promise(r => setTimeout(r, ms)); (async () => { for (let i = 0; i < 3; i++) "
+                      "{ await sleep(20); console.log('tick', i) } })(); 0", "0\ntick 0\ntick 1\ntick 2")
+        self.assertJs("var n = 0; var id = setInterval(() => { if (++n == 3) { clearInterval(id); console.log('done', n) } }, 10); "
+                      "var t = setTimeout(() => console.log('never'), 5); clearTimeout(t); typeof id",
+                      "'number'\ndone 3")
+        self.assertJs("setTimeout((a, b) => console.log(a + b), 0, 'x', 'y'); requestAnimationFrame(t => "
+                      "console.log('frame', typeof t, t >= 0)); var t0 = performance.now(); setTimeout(() => "
+                      "console.log(performance.now() - t0 >= 50), 50); 0", "0\nxy\nframe number true\ntrue")
+        self.assertJs("setTimeout(() => { throw new Error('in timer') }, 0); setTimeout(() => console.log('next'), 10); 0",
+                      "0\nUncaught Error: in timer (line 1)\nnext")
+
+    def test_ctrl_c_stops_waiting_for_timers(self):
+        self.vm.send("js setInterval(() => {}, 1000)\r")
+        time.sleep(1.0)
+        self.vm.send("\x03")
+        self.vm.expect(PROMPT, timeout=10)
+        self.assertEqual(self.js("1 + 1"), "2")
+
     def test_ctrl_c_stops_a_runaway_script(self):
         self.vm.send("js for (;;) {}\r")
         time.sleep(1.0)

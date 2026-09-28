@@ -216,41 +216,7 @@ js_init_builtins:
     mov [jsb_console], rax
     ; constructors
     lea r8, [jsb_ctors]
-.ctor:
-    mov rdi, [r8]
-    test rdi, rdi
-    jz .ctors_done
-    movzx ecx, byte [r8 + 25]
-    lea rsi, [r8 + 26]
-    call jsstr_atom
-    mov rdx, rax                    ; name
-    mov rax, [r8 + 8]
-    movzx ecx, byte [r8 + 24]
-    call jsfn_native
-    mov [rdi], rax
-    ; global.Name = ctor
-    mov rcx, rax
-    BOX rcx, rsi, JS_OBJ_BITS
-    push rax
-    mov rax, [js_global]
-    call jsobj_define_hidden
-    pop rax
-    ; ctor.prototype = proto, proto.constructor = ctor
-    mov rsi, [r8 + 16]
-    mov rsi, [rsi]                  ; prototype object
-    push rcx
-    mov rcx, rsi
-    BOX rcx, rdx, JS_OBJ_BITS
-    mov rdx, [atom_prototype]
-    call jsobj_define_hidden
-    pop rcx
-    mov rax, rsi
-    mov rdx, [atom_constructor]
-    call jsobj_define_hidden
-    movzx ecx, byte [r8 + 25]
-    lea r8, [r8 + rcx + 26]
-    jmp .ctor
-.ctors_done:
+    call jsb_define_ctors
     call jsb_init_errors
     ; global values
     mov rax, [js_global]
@@ -293,6 +259,8 @@ js_init_builtins:
     lea r8, [jsb_natives]
     call jsb_define_natives
     call jsl_init
+    call jsa_init
+    call jsn_init
     ; constants
     lea r8, [jsb_constants]
 .constant:
@@ -501,6 +469,58 @@ jsb_error_to_string:
     pop rdx
     pop rcx
     pop rbx
+    ret
+
+; jsb_define_ctors: R8 = a JSCTOR table -> each constructor made, defined on
+; the global object (hidden) and linked with its prototype object
+jsb_define_ctors:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+.ctor:
+    mov rdi, [r8]
+    test rdi, rdi
+    jz .done
+    movzx ecx, byte [r8 + 25]
+    lea rsi, [r8 + 26]
+    call jsstr_atom
+    mov rdx, rax                    ; name
+    mov rax, [r8 + 8]
+    movzx ecx, byte [r8 + 24]
+    call jsfn_native
+    mov [rdi], rax
+    ; global.Name = ctor
+    mov rcx, rax
+    BOX rcx, rsi, JS_OBJ_BITS
+    push rax
+    mov rax, [js_global]
+    call jsobj_define_hidden
+    pop rax
+    ; ctor.prototype = proto, proto.constructor = ctor
+    mov rsi, [r8 + 16]
+    mov rsi, [rsi]                  ; prototype object
+    push rcx
+    mov rcx, rsi
+    BOX rcx, rdx, JS_OBJ_BITS
+    mov rdx, [atom_prototype]
+    call jsobj_define_hidden
+    pop rcx
+    mov rax, rsi
+    mov rdx, [atom_constructor]
+    call jsobj_define_hidden
+    movzx ecx, byte [r8 + 25]
+    lea r8, [r8 + rcx + 26]
+    jmp .ctor
+.done:
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
     ret
 
 ; jsb_define_natives: R8 = a JSNATIVE table -> its functions defined (hidden)

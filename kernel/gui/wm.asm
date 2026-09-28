@@ -226,6 +226,7 @@ gui_run:
     cmp byte [gui_exit_request], 0
     jne .exit
     call gui_ticks
+    call browser_js_tick            ; page timers (setTimeout, animation frames)
     cmp byte [gui_dirty], 0
     je .no_redraw
     call gui_redraw

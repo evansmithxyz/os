@@ -4537,6 +4537,7 @@ jsd_page_load:
     call jsd_fire_at
     lea rsi, [jsd_str_load]
     call jsd_fire_at
+    call jsev_drain
     call jsd_leave
     call jsd_after
 .done:
@@ -4599,8 +4600,10 @@ jsd_run_script:
     jc .done
 .run:
     call js_eval
-    jnc .done
+    jnc .drain
     call js_print_error
+.drain:
+    call jsev_drain                 ; its promise jobs
 .done:
     pop rdi
     pop rsi
@@ -4633,6 +4636,7 @@ jsd_page_click:
     lea rsi, [jsd_str_click]
     call jsd_fire
     pushf
+    call jsev_drain
     call jsd_leave
     call jsd_after
     popf
@@ -4643,6 +4647,31 @@ jsd_page_click:
     pop rsi
     pop rbx
     pop rax
+    ret
+
+; ------------------------------------------------------------------------------
+; jsd_tick: (desktop loop, ~1000 times a second) the page's timers and
+; animation frames that are due -> CF=1 if any ran (a navigation they asked
+; for is up to the browser)
+; ------------------------------------------------------------------------------
+jsd_tick:
+    call jsd_live
+    jnc .ret
+    push rax
+    call jsev_next_due
+    cmp rax, [timer_ticks]
+    ja .none                        ; (-1: nothing waits)
+    call jsd_enter
+    call jsev_run_due
+    call jsd_leave
+    call jsd_after
+    pop rax
+    stc
+    ret
+.none:
+    pop rax
+    clc
+.ret:
     ret
 
 ; jsd_after: after scripts ran: restyle and lay out again if the DOM changed

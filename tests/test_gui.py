@@ -241,6 +241,18 @@ class DesktopTest(OSTestCase):
         self.assertIn("js: after gc 0,1,2,3,4 GC-4-TEXT", out)
         self.assertIn("browser text: GC-0-TEXT GC-1-TEXT GC-2-TEXT GC-3-TEXT GC-4-TEXT", line)
 
+    def test_browser_timers_promises_fetch(self):
+        with HostWebServer() as web:
+            self.open_page(web, "async.html")
+            self.vm.expect("js: timeout", timeout=20)          # the last one (300 ms)
+            self.vm.expect("browser text: TIMER FIRED FETCHED ag", timeout=20)
+        out = self.vm.output
+        for expected in ("js: sync", "js: microtask", "js: fetched 200 3", "js: xhr 200 33",
+                         "js: frames 3", "js: interval 3"):
+            self.assertIn(expected, out)
+        self.assertLess(out.index("js: sync"), out.index("js: microtask"))
+        self.assertLess(out.index("js: interval 3"), out.index("js: timeout"))
+
     def test_browser_click_events(self):
         with HostWebServer() as web:
             self.open_page(web, "click.html")

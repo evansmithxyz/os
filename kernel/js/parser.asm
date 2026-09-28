@@ -88,11 +88,13 @@ NT_CLASSMEM             equ 57          ; OP = CM_*, A = key atom (or expression
                                         ; NT_FUNC or a field's initial value (or 0)
 NT_SUPERCALL            equ 58          ; super(B...), C = argument count
 NT_SUPERMEMBER          equ 59          ; super.B (B = atom)
+NT_AWAIT                equ 60          ; await A
 CM_STATIC               equ 1
 CM_GET                  equ 2
 CM_SET                  equ 4
 CM_FIELD                equ 8
 CM_COMPUTED             equ 16
+CM_ASYNC                equ 32
 
 JNF_PATTERN             equ 1           ; NT_DECL: A is a pattern node
 JNF_OPTIONAL            equ 2           ; member / index / call after ?.
@@ -146,7 +148,8 @@ JFI_NGLOBALS            equ 80          ; dword (JFI_GLOBALS works as a scope's 
 JFI_PARAMS              equ 88          ; first NT_PARAM
 JFI_REST                equ 96          ; the variable of a ...rest parameter, or 0
 JFI_FIELDS              equ 104         ; class constructor: first instance field (NT_CLASSMEM)
-JFI_SIZE                equ 112
+JFI_ASYNCTRY            equ 112         ; qword: the implicit TRY of an async function
+JFI_SIZE                equ 120
 FIF_INNER               equ 1           ; contains function definitions
 FIF_ARGS                equ 2           ; uses `arguments`
 FIF_SELF                equ 4           ; named function expression
@@ -155,6 +158,7 @@ FIF_ARROW               equ 16          ; an arrow function (this and arguments 
 FIF_PARAMCODE           equ 32          ; defaults or patterns in its parameters
 FIF_CLASSCTOR           equ 64          ; a class's constructor
 FIF_DERIVED             equ 128         ; ... of a class that extends another
+FIF_ASYNC               equ 256         ; an async function
 
 JSP_MAX_DEPTH           equ 1500        ; nesting limit (~250 bytes of kernel stack each)
 
@@ -184,7 +188,8 @@ jsp_arena:              resq 1
 jsp_func:               resq 1          ; current function info
 jsp_scope:              resq 1          ; current scope
 jsp_depth:              resd 1
-jsp_no_in:              resd 1          ; 1 = `in` is not an operator (for-init)
+jsp_no_in:              resq 1          ; 1 = `in` is not an operator (for-init; saved as a qword)
+jsp_next_async:         resd 1          ; 1 = the next function made is async
 jsp_ahead_tpl:          resd 32         ; jsp_arrow_ahead: depths of open ${
 jsp_ahead_saved:        resb 64
 
@@ -292,6 +297,11 @@ jsp_new_func:
 .top:
     mov ecx, [tok_line]
     mov [rbx + JFI_LINE], ecx
+    cmp dword [jsp_next_async], 0
+    je .sync
+    mov dword [jsp_next_async], 0
+    or dword [rbx + JFI_FLAGS], FIF_ASYNC
+.sync:
     mov [jsp_func], rbx
     mov al, SK_FUNC
     call jsp_push_scope
@@ -561,6 +571,8 @@ jsp_statement_inner:
 .not_punct:
     cmp dword [tok_type], TK_NAME
     jne jsp_expression_statement
+    call jsp_async_function
+    je jsp_function_declaration
     mov eax, [tok_kw]
     cmp eax, KW_VAR
     je .var
@@ -2104,6 +2116,22 @@ jsp_unary:
     push rcx
     cmp dword [tok_type], TK_PUNCT
     je .punct
+    ; await, inside async functions
+    mov rcx, [tok_val]
+    cmp rcx, [atom_await]
+    jne .keyword
+    mov rcx, [jsp_func]
+    test dword [rcx + JFI_FLAGS], FIF_ASYNC
+    jz .keyword
+    mov al, NT_AWAIT
+    call jsp_node
+    mov rbx, rax
+    call jslex_next
+    call jsp_unary
+    mov [rbx + JN_A], rax
+    mov rax, rbx
+    jmp .done
+.keyword:
     mov ecx, [tok_kw]
     cmp ecx, KW_TYPEOF
     je .unary
@@ -2495,6 +2523,43 @@ jsp_primary:
     call jsp_node
     jmp .next_done
 .ident:
+    call jsp_async_function
+    je .function
+    mov rax, [tok_val]
+    cmp rax, [atom_async]
+    jne .plain_ident
+    call jslex_peek
+    cmp byte [peek_nl], 0
+    jne .plain_ident
+    cmp dword [peek_type], TK_NAME
+    jne .async_paren
+    cmp dword [peek_kw], 0
+    je .async_name
+    jmp .plain_ident
+.async_paren:
+    cmp dword [peek_type], TK_PUNCT
+    jne .plain_ident
+    cmp qword [peek_val], P_LPAREN
+    jne .plain_ident
+    ; async (a, b) => ... or a call of a function named async
+    call jslex_next
+    call jsp_arrow_ahead
+    jnc .async_call
+    mov dword [jsp_next_async], 1
+    xor edx, edx
+    call jsp_arrow
+    jmp .done
+.async_call:
+    mov al, NT_IDENT
+    call jsp_node
+    mov rdx, [atom_async]
+    mov [rax + JN_A], rdx
+    jmp .done
+.async_name:
+    ; async x => ... (x => made async)
+    call jslex_next
+    mov dword [jsp_next_async], 1
+.plain_ident:
     mov al, NT_IDENT
     call jsp_node
     mov rbx, rax
@@ -2503,6 +2568,7 @@ jsp_primary:
     call jslex_next
     AT_PUNCT P_ARROW
     je .single_arrow
+    mov dword [jsp_next_async], 0   ; (async x without =>)
     cmp rdx, [atom_arguments]
     jne .ident_done
     call jsp_use_arguments
@@ -2594,6 +2660,48 @@ jsp_primary:
 .generator:
     lea rdi, [jsfeat_generator]
     jmp jsp_unsupported
+
+; jsp_async_function: current token a name -> ZF=1 (and `async` consumed,
+; the next function marked async) if it is `async function`
+jsp_async_function:
+    push rax
+    mov rax, [tok_val]
+    cmp rax, [atom_async]
+    jne .out
+    call jslex_peek
+    cmp byte [peek_nl], 0
+    jne .out
+    cmp dword [peek_kw], KW_FUNCTION
+    jne .out
+    call jslex_next
+    mov dword [jsp_next_async], 1
+    xor eax, eax                    ; ZF=1
+.out:
+    pop rax
+    ret
+
+; jsp_modifier_ahead: current token `async` in an object or class -> CF=1 if
+; a method name follows on the same line (so it is a modifier)
+jsp_modifier_ahead:
+    call jslex_peek
+    cmp byte [peek_nl], 0
+    jne .no
+    cmp dword [peek_type], TK_NAME
+    je .yes
+    cmp dword [peek_type], TK_STR
+    je .yes
+    cmp dword [peek_type], TK_NUM
+    je .yes
+    cmp dword [peek_type], TK_PUNCT
+    jne .no
+    cmp qword [peek_val], P_LBRACK
+    jne .no
+.yes:
+    stc
+    ret
+.no:
+    clc
+    ret
 
 ; jsp_use_arguments: the current function reads `arguments`: declare it
 jsp_use_arguments:
@@ -2766,6 +2874,14 @@ jsp_class:
     cmp dword [tok_type], TK_NAME
     jne .key
     mov rax, [tok_val]
+    cmp rax, [atom_async]
+    jne .not_async
+    call jsp_modifier_ahead
+    jnc .key
+    or byte [rcx + JN_OP], CM_ASYNC
+    call jslex_next
+    jmp .key
+.not_async:
     mov dl, CM_GET
     cmp rax, [atom_get]
     je .maybe_accessor
@@ -2819,7 +2935,7 @@ jsp_class:
     AT_PUNCT P_LPAREN
     jne .field
     ; the constructor?
-    test byte [rcx + JN_OP], CM_STATIC | CM_GET | CM_SET | CM_COMPUTED
+    test byte [rcx + JN_OP], CM_STATIC | CM_GET | CM_SET | CM_COMPUTED | CM_ASYNC
     jnz .method
     mov rax, [rcx + JN_A]
     cmp rax, [atom_constructor]
@@ -2848,6 +2964,10 @@ jsp_class:
     mov rdx, [rcx + JN_A]
 .method_fn:
     push rcx
+    test byte [rcx + JN_OP], CM_ASYNC
+    jz .method_sync
+    mov dword [jsp_next_async], 1
+.method_sync:
     mov al, NT_FUNC
     call jsp_node
     push rax
@@ -2996,6 +3116,7 @@ jsp_object:
     mov dword [jsp_no_in], 0
     xor r8d, r8d                    ; last property
 .property:
+    xor esi, esi                    ; 1 = an async method
     AT_PUNCT P_RBRACE
     je .done
     mov al, NT_PROP
@@ -3028,8 +3149,19 @@ jsp_object:
     je .key_computed
     jmp jsp_unexpected
 .key_name:
-    ; get/set accessors: `get name(` ...
+    ; async methods: `async name(` ...
     mov rdx, [tok_val]
+    test esi, esi
+    jnz .not_async
+    cmp rdx, [atom_async]
+    jne .not_async
+    call jsp_modifier_ahead
+    jnc .not_async
+    mov esi, 1
+    call jslex_next
+    jmp .key
+.not_async:
+    ; get/set accessors: `get name(` ...
     cmp rdx, [atom_get]
     je .maybe_accessor
     cmp rdx, [atom_set]
@@ -3104,6 +3236,7 @@ jsp_object:
     mov al, NT_FUNC
     call jsp_node
     push rax
+    mov [jsp_next_async], esi
     xor ecx, ecx                    ; a method does not bind its own name
     call jsp_function_rest
     mov rcx, rax

@@ -297,6 +297,15 @@ jsc_function:
     mov rsi, [rsi + JVR_NEXT]
     jmp .globals
 .body:
+    ; an async function: a promise, and every error rejects it
+    test dword [rbx + JFI_FLAGS], FIF_ASYNC
+    jz .params
+    mov al, OP_ASYNCSTART
+    call jsc_op
+    mov al, OP_TRY
+    call jsc_jump
+    mov [rbx + JFI_ASYNCTRY], rax
+.params:
     test dword [rbx + JFI_FLAGS], FIF_PARAMCODE
     jz .fields
     call jsc_param_code
@@ -322,6 +331,12 @@ jsc_function:
     jmp .template
 .plain_end:
     mov al, OP_RETUNDEF
+    call jsc_op
+    test dword [rbx + JFI_FLAGS], FIF_ASYNC
+    jz .template
+    mov rax, [rbx + JFI_ASYNCTRY]
+    call jsc_patch_here
+    mov al, OP_ASYNCREJECT
     call jsc_op
 .template:
     mov ecx, JCODE_SIZE
@@ -366,6 +381,12 @@ jsc_function:
     mov [rdi + JCODE_RESTSLOT], ecx
 .f6:
     mov [rdi + JCODE_FLAGS], al
+    xor eax, eax
+    test dword [rbx + JFI_FLAGS], FIF_ASYNC
+    jz .f7
+    or eax, JCF2_ASYNC
+.f7:
+    mov [rdi + JCODE_FLAGS2], eax
     mov eax, [rbx + JFI_NPARAMS]
     mov [rdi + JCODE_NPARAMS], ax
     mov eax, [rbx + JFI_NLOCALS]
@@ -1830,6 +1851,8 @@ jsc_expr:
     je .supermember
     cmp ecx, NT_CHAIN
     je .chain
+    cmp ecx, NT_AWAIT
+    je .await
     ; NT_HOLE outside an array: undefined
     mov al, OP_UNDEF
     call jsc_op
@@ -1948,6 +1971,12 @@ jsc_expr:
     jmp .out
 .unary:
     call jsc_unary
+    jmp .out
+.await:
+    mov rax, [rbx + JN_A]
+    call jsc_expr
+    mov al, OP_AWAIT
+    call jsc_op
     jmp .out
 .update:
     call jsc_update

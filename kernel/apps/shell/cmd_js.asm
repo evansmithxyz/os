@@ -4,7 +4,9 @@
 ;   js <code>        run a line of JavaScript and print its value, e.g. js 1 + 2
 ;   js <file.js>     run a script from the disk
 ; Every run starts with a fresh engine (kernel/js/). console.log prints to the
-; console; an uncaught error prints "Uncaught <error> (line N)".
+; console; an uncaught error prints "Uncaught <error> (line N)". Like Node.js,
+; the command then runs promise jobs and waits for timers until none are left
+; (Esc / Ctrl+C stops waiting).
 ; ==============================================================================
 
 [bits 64]
@@ -59,7 +61,8 @@ cmd_js:
     call js_reset
     call js_eval
     jc .error
-    jmp js_print_result
+    call js_print_result
+    jmp jsev_loop                   ; promise jobs, then timers
 .error:
     mov al, [con_attr]
     push rax
@@ -67,7 +70,7 @@ cmd_js:
     call js_print_error
     pop rax
     mov [con_attr], al
-    ret
+    jmp jsev_loop
 .dump:
     ; js -d <code>: the compiled script's bytecode in hex (debugging)
     add rsi, 3

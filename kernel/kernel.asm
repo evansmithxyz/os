@@ -219,6 +219,8 @@ kernel_report_boot:
 %include "js/vm.asm"
 %include "js/builtins.asm"
 %include "js/stdlib.asm"
+%include "js/async.asm"
+%include "js/jsnet.asm"
 %include "js/js.asm"
 %include "js/jsdom.asm"
 %include "apps/shell/shell.asm"

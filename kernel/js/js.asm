@@ -45,6 +45,10 @@ jsi_iterator:           db "[iterator]", 0
 jsi_getter:             db "[Getter]", 0
 jsi_setter:             db "[Setter]", 0
 jsi_getter_setter:      db "[Getter/Setter]", 0
+jsi_async_function:     db "[AsyncFunction: ", 0
+jsi_async_anonymous:    db "[AsyncFunction (anonymous)]", 0
+jsi_pending:            db "<pending>", 0
+jsi_rejected:           db "<rejected> ", 0
 
 section .text
 
@@ -243,6 +247,29 @@ js_print_result:
     call jsi_value
     call jsout_flush
 .out:
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; js_print_uncaught: RAX = a value, RSI = what to say first -> printed like an
+; uncaught error, without a line ("Uncaught (in promise) ...")
+js_print_uncaught:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    call jsout_reset
+    call jsout_cstr
+    xor edx, edx
+    call jsi_error
+    jnc .flush
+    xor ecx, ecx
+    mov edx, 1
+    call jsi_value
+.flush:
+    call jsout_flush
+    pop rsi
     pop rdx
     pop rcx
     pop rax
@@ -595,6 +622,13 @@ jsi_value:
     call jsi_quoted
     jmp .out
 .function:
+    xor edi, edi                    ; async?
+    cmp byte [rbx + JH_KIND], JK_FUNC
+    jne .fn_name
+    mov rax, [rbx + JFN_CODE]
+    mov edi, [rax + JCODE_FLAGS2]
+    and edi, JCF2_ASYNC
+.fn_name:
     mov rax, JS_OBJ_BITS
     or rax, rbx
     mov rdx, [atom_name]
@@ -603,6 +637,10 @@ jsi_value:
     cmp dword [rax + JSTR_LEN], 0
     je .anonymous
     lea rsi, [jsi_function]
+    test edi, edi
+    jz .fn_prefix
+    lea rsi, [jsi_async_function]
+.fn_prefix:
     call jsout_cstr
     call jsout_str
     mov al, ']'
@@ -610,6 +648,9 @@ jsi_value:
     jmp .out
 .anonymous:
     lea rsi, [jsi_anonymous]
+    test edi, edi
+    jz .cstr
+    lea rsi, [jsi_async_anonymous]
     jmp .cstr
 .iterator:
     lea rsi, [jsi_iterator]
@@ -866,6 +907,8 @@ jsi_object:
     push rdi
     mov rdi, rbx
     call jsi_class_name
+    cmp dword [rdi + JOBJ_CLASS], JC_PROMISE
+    je .promise
     mov rax, rdi
     call jsi_has_props_rax
     jc .items
@@ -893,6 +936,35 @@ jsi_object:
     pop rbx
     pop rax
     ret
+.promise:
+    ; Promise { 1 }, Promise { <pending> }, Promise { <rejected> Error: x }
+    push rsi
+    mov al, '{'
+    call jsout_byte
+    mov al, ' '
+    call jsout_byte
+    lea rsi, [jsi_pending]
+    cmp byte [rdi + JPROM_STATE], 0
+    je .state
+    cmp byte [rdi + JPROM_STATE], 1
+    je .settled
+    lea rsi, [jsi_rejected]
+    call jsout_cstr
+.settled:
+    mov rax, [rdi + JPROM_VALUE]
+    inc ecx
+    mov edx, 1
+    call jsi_value
+    jmp .promise_end
+.state:
+    call jsout_cstr
+.promise_end:
+    mov al, ' '
+    call jsout_byte
+    mov al, '}'
+    call jsout_byte
+    pop rsi
+    jmp .out
 
 ; jsi_class_name: RDI = object; made by a constructor (its prototype is not
 ; Object.prototype and has a named `constructor`) -> "Name " like Node.js

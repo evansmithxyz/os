@@ -188,6 +188,32 @@ console.log('after gc', tags.join(), ps[4].textContent);
 </script>
 </body></html>"""
 
+# Timers, promises, async/await and fetch on a page
+ASYNC_HTML = """<html><body>
+<p id="t">WAITING</p>
+<p id="f">NOT FETCHED</p>
+<script>
+console.log('sync');
+Promise.resolve().then(() => console.log('microtask'));
+setTimeout(() => { document.getElementById('t').textContent = 'TIMER FIRED'; console.log('timeout') }, 300);
+(async () => {
+    const r = await fetch('data.json');
+    const d = await r.json();
+    document.getElementById('f').textContent = 'FETCHED ' + d.name;
+    console.log('fetched', r.status, d.list.length);
+})();
+var frames = 0;
+requestAnimationFrame(function f(t) { if (++frames < 3) requestAnimationFrame(f); else console.log('frames', frames) });
+var n = 0;
+var iv = setInterval(() => { if (++n === 3) { clearInterval(iv); console.log('interval', n) } }, 50);
+var x = new XMLHttpRequest();
+x.onload = () => console.log('xhr', x.status, x.responseText.length);
+x.open('GET', 'data.json');
+x.send();
+</script>
+</body></html>"""
+DATA_JSON = '{"name": "ag", "list": [1, 2, 3]}'
+
 
 class HostWebServer:
     """http.server on 127.0.0.1 (reachable from the guest as 10.0.2.2:<port>)."""
@@ -207,6 +233,8 @@ class HostWebServer:
         (self.root / "click.html").write_text(CLICK_HTML)
         (self.root / "dom.html").write_text(DOM_HTML)
         (self.root / "gc.html").write_text(GC_HTML)
+        (self.root / "async.html").write_text(ASYNC_HTML)
+        (self.root / "data.json").write_text(DATA_JSON)
         # GET /sub answers "301 Location: /sub/" (http.server adds the slash)
         (self.root / "sub").mkdir(exist_ok=True)
         (self.root / "sub" / "index.html").write_text("<html><body><p>Sub page</p></body></html>")
@@ -248,6 +276,29 @@ class NetworkTest(OSTestCase):
         self.assertIn("HTTP/1.0 200 OK", out)          # headers (first segment)
         self.assertIn("Hello from the host", out)      # body (second segment)
         self.assertLess(out.index("HTTP/1.0 200 OK"), out.index("Hello from the host"))
+
+    def test_fetch_and_xhr_from_js(self):
+        with HostWebServer() as web:
+            base = f"http://10.0.2.2:{web.port}"
+            out = self.vm.run(f"js fetch('{base}/data.json').then(r => {{ console.log(r.status, r.ok, "
+                              f"r.headers.get('content-type')); return r.json() }}).then(d => console.log(d.name, d.list))",
+                              timeout=30)
+            self.assertIn("200 true application/json", out)
+            self.assertIn("ag [ 1, 2, 3 ]", out)
+            out = self.vm.run(f"js (async () => {{ const r = await fetch('{base}/missing.html'); "
+                              f"console.log(r.status, r.ok) }})()", timeout=30)
+            self.assertIn("404 false", out)
+            out = self.vm.run("js fetch('http://10.0.2.2:1/x').catch(e => console.log(e.name, e.message))", timeout=30)
+            self.assertIn("TypeError Failed to fetch", out)
+            out = self.vm.run(f"js var x = new XMLHttpRequest(); x.responseType = 'json'; x.onreadystatechange = () => "
+                              f"console.log('state', x.readyState); x.addEventListener('load', () => console.log('xhr', "
+                              f"x.status, x.response.list)); x.open('GET', '{base}/data.json'); x.send()", timeout=30)
+            for expected in ("state 1", "state 4", "xhr 200 [ 1, 2, 3 ]"):
+                self.assertIn(expected, out)
+            self.assertLess(out.index("state 4"), out.index("xhr 200"))
+            out = self.vm.run(f"js var x = new XMLHttpRequest(); x.open('GET', '{base}/data.json', false); x.send(); "
+                              f"[x.status, x.readyState, x.responseText.length]", timeout=30)
+            self.assertIn("[ 200, 4, 33 ]", out)
 
     def test_curl_bad_port(self):
         self.assertIn("Invalid port", self.vm.run("curl 10.0.2.2 99999"))

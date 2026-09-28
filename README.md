@@ -35,9 +35,10 @@ windowed desktop with i3-style workspaces.
 - **Shell:** about 30 commands, Tab completion, history (Up/Down) and Ctrl+C.
 - **JavaScript:** an engine written in assembly (`kernel/js/`): a parser,
   a bytecode compiler, an interpreter and a garbage collector, with
-  classes, closures, exceptions, destructuring, the everyday standard
-  library (array and string methods, `Object.*`, `JSON`, `Math`) and
-  correctly rounded number formatting. Run it with `js`; web pages run it too.
+  classes, closures, exceptions, destructuring, promises, `async`/`await`,
+  timers, `fetch`, the everyday standard library (array and string methods,
+  `Object.*`, `JSON`, `Math`) and correctly rounded number formatting. Run it
+  with `js`; web pages run it too.
 - **Desktop:**
   - 1024×768×32 graphics through the Bochs/QEMU display adapter.
   - Movable and resizable windows with minimize and maximize, and 4
@@ -200,8 +201,11 @@ Uncaught ReferenceError: nope is not defined (line 1)
 antigravity64> js script.js
 ```
 
-Each run starts from a fresh engine; Esc or Ctrl+C stops a script that
-doesn't end.
+Each run starts from a fresh engine. Like Node.js, `js` then runs the
+promise jobs the script queued and waits for its timers until none are
+left, so `js setTimeout(() => console.log('later'), 500)` prints `later`
+half a second on. Esc or Ctrl+C stops a script that doesn't end, or the
+waiting.
 
 In the browser, every HTML page gets its own engine with `window` and
 `document`. Its `<script>`s run in order (inline or `src=`, which is
@@ -209,9 +213,10 @@ fetched), then `DOMContentLoaded` and `load` fire. `console.log` output
 and errors go to the serial log as `[klog] js: ...`; an error ends only
 the script it happened in. Clicks run the page's handlers (`onclick=""`,
 `onclick` properties and `addEventListener`), which bubble up the tree;
-`preventDefault()` stops a link from being followed. After scripts
-change the DOM, the page is styled and laid out again. The DOM API
-(`kernel/js/jsdom.asm`):
+`preventDefault()` stops a link from being followed. The page's timers,
+animation frames and `fetch` / `XMLHttpRequest` requests run from the
+desktop loop while it is open. After scripts change the DOM, the page is
+styled and laid out again. The DOM API (`kernel/js/jsdom.asm`):
 
 - `document`: `getElementById`, `querySelector(All)` (the CSS engine's
   selectors), `getElementsByTagName` / `ClassName`, `createElement`,
@@ -255,6 +260,12 @@ optimising compilers:
    heap block keeps it), so the rest of the engine needs no bookkeeping.
    Freed blocks are joined and reused; each collection logs
    `[klog] js gc: live bytes ...`.
+7. `async.asm` has promises, the microtask queue, timers and the event
+   loop. An `await` copies the function's part of the value stack, its
+   `try` handlers and its registers into a heap object and returns the
+   function's promise; a promise job copies it all back and carries on
+   after the `await`. `jsnet.asm` has `fetch` and `XMLHttpRequest`, whose
+   requests run as tasks on the event loop (GET only, for now).
 
 The language: `var`/`let`/`const`, functions, arrow functions, closures,
 default and rest parameters, `arguments`, `this`, `new`, prototypes,
@@ -284,8 +295,17 @@ function), `includes`, `startsWith`, `endsWith`, `indexOf`,
 `lastIndexOf`, `slice`, `substring`, `padStart`, `padEnd`, `repeat`,
 `trim`/`trimStart`/`trimEnd`, `at`, `charAt`, `charCodeAt`, `concat`,
 `toUpperCase`, `toLowerCase`, `localeCompare`; `toFixed` and
-`toString(radix)`. Not yet: regular expressions, `Date`, `Map`/`Set`,
-generators, timers and promises (the next steps).
+`toString(radix)`.
+
+Async: `Promise` (`then`, `catch`, `finally`, `resolve`, `reject`, `all`,
+`allSettled`, `race`, `any`; "Uncaught (in promise)" for rejections nobody
+handles), `async` functions, arrows and methods with `await`,
+`queueMicrotask`, `setTimeout` / `setInterval` (and their `clear`s),
+`requestAnimationFrame`, `performance.now()`, `fetch` (a `Response` with
+`status`, `ok`, `headers.get()`, `text()`, `json()`) and
+`XMLHttpRequest` (asynchronous or not, `onload` and friends,
+`addEventListener`, `responseType = 'json'`). Not yet: regular
+expressions, `Date`, `Map`/`Set`, generators (the next steps).
 
 Not yet (the parser says so): arrow functions, classes, `try`/`catch`,
 template literals, destructuring, spread, getters/setters, optional
@@ -320,8 +340,9 @@ kernel/
                         ua.css / builtin.css (the browser's own style sheets)
   js/                   JavaScript engine: lexer, parser, compiler (bytecode), vm,
                         heap (strings, atoms), gc (allocator, collector), object, number,
-                        builtins + stdlib (the standard library), jsdom (the DOM API),
-                        js (API, printing)
+                        builtins + stdlib (the standard library), async (promises,
+                        async functions, timers, event loop), jsnet (fetch, XHR),
+                        jsdom (the DOM API), js (API, printing)
   gfx/                  clipped 2D drawing, font, back buffer, mouse pointer
   gui/                  window manager + event loop, taskbar/footer, theme colours
   apps/                 terminal, browser, canvas, sysmon windows
