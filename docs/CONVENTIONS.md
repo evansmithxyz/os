@@ -88,6 +88,9 @@ suite and the reviewers (human or not) assume them.
   desktop runs, so the same command works in both places.
 - Colours in console output are VGA attributes (`COLOR_*`); GUI colours are
   `THEME_*` in `kernel/gui/theme.inc`.
+- GUI text: `gfx_print_ui` (proportional, for labels and titles) or
+  `gfx_print_string` (monospace, for text in a grid). Glyphs are 8x16 and
+  live in `kernel/gfx/font.txt`; the build turns them into `build/font.inc`.
 - `klog`, `klog2`, `klog_dec` write debug lines to the serial port only
   (`[klog] ...`). Tests wait for them, so log anything a test might check.
 - Input arrives as key events (`AL` = ASCII or 0, `AH` = scancode) from
@@ -121,8 +124,9 @@ labels use NASM's `.name` form.
   and add one `COMMAND` line to `kernel/apps/shell/commands.asm`. Help and Tab
   completion pick it up automatically.
 - **A window/app:** add a `WINDOW` line to `wm_windows` in `kernel/gui/wm.asm`
-  and a `WIN_*` id, write the callbacks in `kernel/apps/`, add an app pill in
-  `kernel/gui/desktop.asm` if it should have one.
+  and a `WIN_*` id, write the callbacks in `kernel/apps/`, and add it to
+  `desktop_dock_apps` in `kernel/gui/desktop.asm` (with an icon painter) if
+  it should be in the dock.
 - **A file on the default disk:** drop it in `rootfs/` and build with `--fresh`.
 - **More kernel space:** raise `KERNEL_MAX_SECTORS` in `include/layout.inc`
   and move the `FS_*` numbers (and `DISK_SECTORS`) up by the same amount.

@@ -14,9 +14,9 @@
 
 TERM_COLS               equ 128
 TERM_ROWS               equ 200     ; scrollback
-TERM_LINE_H             equ 12
-TERM_PAD_X              equ 8
-TERM_PAD_Y              equ 6
+TERM_LINE_H             equ 16
+TERM_PAD_X              equ 14
+TERM_PAD_Y              equ 10
 TERM_DEFAULT_COLS       equ 110
 
 section .data
@@ -30,18 +30,18 @@ term_chars:             resb TERM_ROWS * TERM_COLS
 term_attrs:             resb TERM_ROWS * TERM_COLS
 
 section .rodata
-term_title:             db "Terminal - antigravity64 shell", 0
+term_title:             db "Terminal", 0
 term_label:             db "Terminal", 0
 term_welcome:           db "Antigravity OS terminal. Every shell command works here - try 'help', 'ls' or 'ping 10.0.2.2'.", 0x0A
                         db "Keys: F1-F4 switch workspace, Up/Down history, Tab completes, Esc returns to the text console.", 0x0A, 0x0A, 0
 
-; VGA text attribute (low nibble) -> RGB, tuned for the dark terminal background
+; VGA text attribute (low nibble) -> RGB, soft colours for the dark background
 align 4
 term_palette:
-    dd 0x0064748B, 0x003B82F6, 0x0010B981, 0x0006B6D4   ; black->slate, blue, green, cyan
-    dd 0x00EF4444, 0x00D946EF, 0x00F59E0B, 0x00CBD5E1   ; red, magenta, brown, light gray
-    dd 0x0064748B, 0x0060A5FA, 0x0034D399, 0x0022D3EE   ; dark gray, light blue, light green, light cyan
-    dd 0x00F87171, 0x00F0ABFC, 0x00FDE047, 0x00FFFFFF   ; light red, light magenta, yellow, white
+    dd 0x00565F77, THEME_ACCENT, THEME_GREEN, THEME_CYAN    ; black->slate, blue, green, cyan
+    dd THEME_RED, THEME_MAGENTA, THEME_YELLOW, THEME_TEXT_SOFT  ; red, magenta, brown, light gray
+    dd 0x006B7390, 0x009CB8FA, 0x00B9E08A, 0x00A4DDFF       ; dark gray, light blue, light green, light cyan
+    dd 0x00FF95A8, 0x00CDB2FA, 0x00F2CA8A, THEME_TEXT       ; light red, light magenta, yellow, white
 
 section .text
 ; ------------------------------------------------------------------------------
@@ -243,12 +243,13 @@ term_draw:
     shl ecx, 3
     add ecx, r12d
     add ecx, TERM_PAD_X
+    add edx, 2                      ; over the glyph rows that have ink
     mov esi, FONT_W
-    mov r8d, FONT_H + 1
-    mov eax, THEME_BORDER_MUTED
+    mov r8d, FONT_H - 3
+    mov eax, THEME_TEXT_FAINT
     cmp byte [wm_focus], WIN_TERM
     jne .draw_cursor
-    mov eax, THEME_CYAN
+    mov eax, THEME_ACCENT
 .draw_cursor:
     call gfx_fill_rect
 .done:

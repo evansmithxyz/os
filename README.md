@@ -41,14 +41,18 @@ windowed desktop with i3-style workspaces.
   number formatting. Run it with `js`; web pages run it too.
 - **Desktop:**
   - 1024×768×32 graphics through the Bochs/QEMU display adapter.
-  - Movable and resizable windows with minimize and maximize, and 4
-    workspaces.
+  - A wallpaper of soft glows, a translucent top bar (workspaces, clock,
+    network, memory, power) and a dock with the apps.
+  - Rounded, anti-aliased windows with soft shadows; movable and resizable,
+    with minimize and maximize, and 4 workspaces.
+  - Its own 8x16 font, drawn as ASCII art in `kernel/gfx/font.txt`:
+    monospace in the terminal and web pages, proportional in the interface.
   - Apps:
     - a terminal that runs the same shell as the text console
     - the CyberSurf web browser: built-in pages, `afs://` files, real HTTP
       and HTTPS with redirects; an HTML parser, a CSS engine (style sheets,
       selectors, the cascade, `@media`), a layout engine drawing with the
-      8x8 font, and page scripts with the DOM and click events; scrolling
+      8x16 font, and page scripts with the DOM and click events; scrolling
       and relative links
     - a paint canvas
     - a live system monitor
@@ -108,11 +112,13 @@ into the browser.
 |---|---|
 | F1–F4, Alt+1–4 | Switch workspace |
 | Shift+F1–F4 | Move the focused window to that workspace |
-| Title bar dots | Close / minimize / maximize |
+| Title bar lights | Close / minimize / maximize |
 | Drag title bar or bottom-right corner | Move / resize |
 | `WS n` badge in the title bar | Send the window to the next workspace |
-| Taskbar `+Term` `+Web` `+Dev` `+Sys` | Open, focus or minimize an app |
-| Esc or `Exit` | Back to the text console |
+| Dock icons | Open, focus or minimize an app |
+| Top bar `1`–`4` | Switch workspace |
+| Top bar logo | Every window back to its default workspace and place |
+| Esc or the power button | Back to the text console |
 
 The terminal window runs the real shell, so every command works there too.
 `ws [n]` and `ws move n` control workspaces from inside it.
@@ -148,8 +154,8 @@ below):
    background colours. It is redone only when the page or the window width
    changes; scrolling just repaints.
 
-Everything is drawn with the 8x8 font, so there are no font sizes, and CSS
-lengths are halved to match it. Not supported: `var()`, attribute
+Everything is drawn with the 8x16 font, so there are no font sizes, and CSS
+lengths are halved to match its 8-pixel width. Not supported: `var()`, attribute
 selectors, `+`/`~`, pseudo-elements, floats, flexbox and grid as layouts
 (they become plain blocks), positioning, images. Scroll with Up/Down,
 PgUp/PgDn, Home/End or the mouse wheel. Pages up to 1 MB are kept.
@@ -417,8 +423,10 @@ kernel/
                         typed (typed arrays), proxy (Proxy), text (URI, base64),
                         jsdom (the DOM API), js (API, printing),
                         prelude.js / dom.js (the library parts written in JavaScript)
-  gfx/                  clipped 2D drawing, font, back buffer, mouse pointer
-  gui/                  window manager + event loop, taskbar/footer, theme colours
+  gfx/                  clipped 2D drawing (alpha blending, anti-aliased rounded
+                        boxes, shadows), font.txt (the font), mouse pointer
+  gui/                  window manager + event loop, wallpaper, top bar, dock,
+                        theme colours
   apps/                 terminal, browser, canvas, sysmon windows
   apps/shell/           line editor + command table + command handlers
 rootfs/                 files copied onto a freshly formatted disk

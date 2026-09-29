@@ -12,19 +12,20 @@
 
 [bits 64]
 
-CANVAS_TOOLBAR_H        equ 34
-CANVAS_MARGIN           equ 8
-CANVAS_BRUSH            equ 4
-CANVAS_SWATCH_X         equ 12
-CANVAS_SWATCH_STEP      equ 30
-CANVAS_SWATCH_W         equ 24
-CANVAS_SWATCH_H         equ 22
-CANVAS_BTN_Y            equ 6
-CANVAS_CLEAR_X          equ 262
-CANVAS_CLEAR_W          equ 110
-CANVAS_ART_X            equ 382
-CANVAS_ART_W            equ 132
-CANVAS_HINT_X           equ 530
+CANVAS_TOOLBAR_H        equ 44
+CANVAS_MARGIN           equ 10
+CANVAS_BRUSH            equ 5
+CANVAS_SWATCH_X         equ 14      ; round swatches
+CANVAS_SWATCH_Y         equ 12
+CANVAS_SWATCH_STEP      equ 28
+CANVAS_SWATCH_W         equ 20
+CANVAS_BTN_Y            equ 10      ; buttons (the swatches' click band too)
+CANVAS_BTN_H            equ 24
+CANVAS_CLEAR_X          equ 252
+CANVAS_CLEAR_W          equ 64
+CANVAS_ART_X            equ 324
+CANVAS_ART_W            equ 88
+CANVAS_HINT_X           equ 428
 CANVAS_ART_CX           equ 440     ; demo art centre inside the bitmap
 CANVAS_ART_CY           equ 300
 
@@ -37,16 +38,16 @@ canvas_last_y:          dd -1
 canvas_origin_x:        dd 0        ; screen position of bitmap (0,0), from the last draw
 canvas_origin_y:        dd 0
 canvas_swatches:
-    dd 0x00000000, 0x00FFFFFF, THEME_CYAN, THEME_RED
-    dd THEME_GREEN, THEME_YELLOW, THEME_MAGENTA, THEME_BLUE
+    dd THEME_TEXT, THEME_CYAN, THEME_BLUE, THEME_RED
+    dd THEME_ORANGE, THEME_YELLOW, THEME_GREEN, THEME_MAGENTA
 
 section .rodata
 canvas_title:           db "Cyber Canvas", 0
 canvas_label:           db "Canvas", 0
-canvas_str_clear:       db "Clear Canvas", 0
-canvas_str_art:         db "Draw Cyber Art", 0
-canvas_str_hint:        db "Mouse: paint  1-8: colour  C: clear  D: art", 0
-canvas_str_banner:      db " [ ANTIGRAVITY OS 64-BIT GUI ] ", 0
+canvas_str_clear:       db "Clear", 0
+canvas_str_art:         db "Draw art", 0
+canvas_str_hint:        db "Mouse paints   1-8 colour   C clear   D art", 0
+canvas_str_banner:      db "ANTIGRAVITY OS", 0
 
 section .text
 ; ------------------------------------------------------------------------------
@@ -97,16 +98,20 @@ canvas_clear:
     pop rax
     ret
 
-; canvas_demo_art: concentric squares, crosshair, banner and corner marks
+; canvas_demo_art: rounded rings in three colours, a crosshair, a banner and
+; corner marks
 canvas_demo_art:
     push rax
     push rbx
     push rcx
     push rdx
     push rsi
+    push rdi
     push r8
+    push r9
     call canvas_target_begin
-    mov ebx, 10
+    mov ebx, 16
+    xor edi, edi                    ; ring number
 .ring:
     mov ecx, CANVAS_ART_CX
     sub ecx, ebx
@@ -114,36 +119,54 @@ canvas_demo_art:
     sub edx, ebx
     lea esi, [ebx * 2]
     mov r8d, esi
-    mov eax, THEME_CYAN
-    test ebx, 0x20
-    jz .ring_color
-    mov eax, THEME_MAGENTA
-.ring_color:
-    call gfx_draw_rect
+    mov eax, edi                    ; colour: ring number mod 3
+    push rdx
+    xor edx, edx
+    mov r9d, 3
+    div r9d
+    lea rax, [canvas_art_colours]
+    mov eax, [rax + rdx * 4]
+    pop rdx
+    mov r9d, 16
+    call gfx_stroke_round_rect
+    inc edi
     add ebx, 14
-    cmp ebx, 110
+    cmp ebx, 128
     jl .ring
 
-    mov ecx, CANVAS_ART_CX - 252    ; crosshair
+    mov ecx, CANVAS_ART_CX - 260    ; crosshair
     mov edx, CANVAS_ART_CY
-    mov esi, 504
+    mov esi, 520
     mov r8d, 1
-    mov eax, THEME_ACCENT
+    mov eax, THEME_ACCENT_DIM
     call gfx_fill_rect
     mov ecx, CANVAS_ART_CX
-    mov edx, CANVAS_ART_CY - 112
+    mov edx, CANVAS_ART_CY - 130
     mov esi, 1
-    mov r8d, 224
+    mov r8d, 260
     call gfx_fill_rect
 
-    mov ecx, CANVAS_ART_CX - 124    ; banner
-    mov edx, CANVAS_ART_CY - 4
+    lea rsi, [canvas_str_banner]    ; banner on a pill
+    call gfx_ui_width_bold
+    lea esi, [eax + 28]
+    mov ecx, CANVAS_ART_CX
+    mov edx, esi
+    shr edx, 1
+    sub ecx, edx
+    mov edx, CANVAS_ART_CY - 13
+    mov r8d, 26
+    mov r9d, 13
+    mov eax, THEME_SURFACE
+    call gfx_fill_round_rect
+    mov eax, THEME_ACCENT
+    call gfx_stroke_round_rect
+    add ecx, 14
+    add edx, 5
     lea rsi, [canvas_str_banner]
     mov eax, THEME_TEXT
-    mov ebx, THEME_PANEL_DARK
-    call gfx_print_string
+    call gfx_print_ui_bold
 
-    mov eax, THEME_CYAN             ; corner marks
+    mov eax, THEME_TEAL             ; corner marks
     mov ecx, 12
     mov edx, 12
     call .corner_h
@@ -165,7 +188,9 @@ canvas_demo_art:
     mov edx, 2 * CANVAS_ART_CY - 32
     call .corner_v
     call canvas_target_end
+    pop r9
     pop r8
+    pop rdi
     pop rsi
     pop rdx
     pop rcx
@@ -181,6 +206,10 @@ canvas_demo_art:
     mov r8d, 20
     jmp gfx_fill_rect
 
+section .rodata
+canvas_art_colours:     dd THEME_ACCENT, THEME_MAGENTA, THEME_TEAL
+
+section .text
 ; canvas_dab: paint one brush dab at bitmap coords ECX,EDX
 canvas_dab:
     push rax
@@ -193,8 +222,11 @@ canvas_dab:
     sub edx, CANVAS_BRUSH / 2
     mov esi, CANVAS_BRUSH
     mov r8d, CANVAS_BRUSH
+    push r9
+    mov r9d, CANVAS_BRUSH / 2
     mov eax, [canvas_color]
-    call gfx_fill_rect
+    call gfx_fill_round_rect
+    pop r9
     call canvas_target_end
     pop r8
     pop rsi
@@ -290,39 +322,29 @@ canvas_draw:
     mov eax, THEME_WIN_BODY
     call gfx_fill_rect
 
-    xor ebx, ebx                    ; swatches
+    xor ebx, ebx                    ; swatches: dots, the current one ringed
 .swatch:
     mov ecx, ebx
     imul ecx, CANVAS_SWATCH_STEP
     add ecx, r12d
     add ecx, CANVAS_SWATCH_X
-    lea edx, [r13d + CANVAS_BTN_Y]
+    lea edx, [r13d + CANVAS_SWATCH_Y]
     mov esi, CANVAS_SWATCH_W
-    mov r8d, CANVAS_SWATCH_H
+    mov r8d, CANVAS_SWATCH_W
+    mov r9d, CANVAS_SWATCH_W / 2
     lea rax, [canvas_swatches]
     mov eax, [rax + rbx * 4]
-    call gfx_fill_rect
-    mov edi, THEME_BORDER_MUTED
+    call gfx_fill_round_rect
     cmp eax, [canvas_color]
-    jne .swatch_border
-    mov edi, THEME_TEXT
-    push rcx
-    push rdx
-    push rsi
-    push r8
-    inc ecx
-    inc edx
-    sub esi, 2
-    sub r8d, 2
-    mov eax, edi
-    call gfx_draw_rect
-    pop r8
-    pop rsi
-    pop rdx
-    pop rcx
-.swatch_border:
-    mov eax, edi
-    call gfx_draw_rect
+    jne .next_swatch
+    sub ecx, 3
+    sub edx, 3
+    add esi, 6
+    add r8d, 6
+    add r9d, 3
+    mov eax, THEME_TEXT_SOFT
+    call gfx_stroke_round_rect
+.next_swatch:
     inc ebx
     cmp ebx, 8
     jb .swatch
@@ -330,30 +352,29 @@ canvas_draw:
     lea ecx, [r12d + CANVAS_CLEAR_X]    ; buttons
     lea edx, [r13d + CANVAS_BTN_Y]
     mov esi, CANVAS_CLEAR_W
-    mov r8d, CANVAS_SWATCH_H
-    mov eax, THEME_BORDER
-    call gfx_fill_rect
-    add ecx, 10
-    add edx, 7
+    mov r8d, CANVAS_BTN_H
+    mov r9d, 7
+    mov eax, THEME_SURFACE_HI
+    call gfx_fill_round_rect
+    add ecx, CANVAS_CLEAR_W / 2
+    add edx, 4
     lea rsi, [canvas_str_clear]
     mov eax, THEME_TEXT
-    mov ebx, -1
-    call gfx_print_string
+    call gfx_print_ui_centered
     lea ecx, [r12d + CANVAS_ART_X]
     lea edx, [r13d + CANVAS_BTN_Y]
     mov esi, CANVAS_ART_W
-    mov r8d, CANVAS_SWATCH_H
     mov eax, THEME_ACCENT
-    call gfx_fill_rect
-    add ecx, 10
-    add edx, 7
+    call gfx_fill_round_rect
+    add ecx, CANVAS_ART_W / 2
+    add edx, 4
     lea rsi, [canvas_str_art]
-    mov eax, THEME_TEXT
-    call gfx_print_string
+    mov eax, THEME_WIN_BODY
+    call gfx_print_ui_centered
     lea ecx, [r12d + CANVAS_HINT_X]
     lea rsi, [canvas_str_hint]
     mov eax, THEME_TEXT_MUTED
-    call gfx_print_string
+    call gfx_print_ui
 
     ; The picture
     lea ecx, [r12d + CANVAS_MARGIN]
@@ -383,8 +404,11 @@ canvas_draw:
     pop r8
     pop rdx
     pop rcx
-    mov esi, r11d
-    mov eax, THEME_CANVAS_BORDER
+    dec ecx                         ; hairline frame around the picture
+    dec edx
+    lea esi, [r11d + 2]
+    add r8d, 2
+    mov eax, THEME_WIN_EDGE
     call gfx_draw_rect
     ret
 
@@ -402,7 +426,7 @@ canvas_mouse:
     jne .done
     cmp edx, CANVAS_BTN_Y
     jl .done
-    cmp edx, CANVAS_BTN_Y + CANVAS_SWATCH_H
+    cmp edx, CANVAS_BTN_Y + CANVAS_BTN_H
     jg .done
     mov eax, ecx                    ; swatch?
     sub eax, CANVAS_SWATCH_X

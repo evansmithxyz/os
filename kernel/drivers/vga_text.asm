@@ -36,15 +36,20 @@ COLOR_WHITE         equ 0x0F
 section .data
 vga_row:            db 0
 vga_col:            db 0
+vga_font_saved:     db 0            ; 1 = vga_font holds the BIOS glyphs
+
+section .bss
+vga_font:           resb 256 * 16   ; the BIOS 8x16 glyphs, saved at boot
 
 section .text
 ; ------------------------------------------------------------------------------
-; vga_init: hide nothing, just home the cursor
+; vga_init: home the cursor and save the BIOS font (the desktop's graphics
+; mode overwrites it; vga_load_font puts it back)
 ; ------------------------------------------------------------------------------
 vga_init:
     mov byte [vga_row], 0
     mov byte [vga_col], 0
-    ret
+    jmp vga_save_font
 
 ; ------------------------------------------------------------------------------
 ; vga_clear: clear the screen with attribute BL and home the cursor
@@ -252,67 +257,124 @@ vga_restore_text_mode:
     ret
 
 ; ------------------------------------------------------------------------------
-; vga_load_font: copy the 8x8 GUI font into VGA plane 2. Text mode uses 16
-; scanlines per glyph, so every font row is written twice (8x16 cells).
+; vga_save_font: copy the BIOS glyphs out of VGA plane 2 into vga_font
+; ------------------------------------------------------------------------------
+vga_save_font:
+    push rcx
+    push rsi
+    push rdi
+    call vga_font_plane
+    mov rsi, 0xA0000
+    lea rdi, [vga_font]
+    mov ecx, 256
+.glyph:
+    push rcx
+    mov ecx, 16
+    rep movsb
+    add rsi, 16                     ; 32-byte slots, 16 rows used
+    pop rcx
+    loop .glyph
+    mov byte [vga_font_saved], 1
+    call vga_text_planes
+    pop rdi
+    pop rsi
+    pop rcx
+    ret
+
+; ------------------------------------------------------------------------------
+; vga_load_font: put the glyphs back into VGA plane 2 (text mode uses 16
+; scanlines per glyph, in 32-byte slots): the saved BIOS font, or the
+; desktop's font if there is none
 ; ------------------------------------------------------------------------------
 vga_load_font:
     push rax
     push rbx
     push rcx
-    push rdx
     push rsi
     push rdi
+    call vga_font_plane
+    mov rdi, 0xA0000                ; clear all 256 glyph slots
+    xor eax, eax
+    mov ecx, 256 * 32 / 4
+    rep stosd
 
+    cmp byte [vga_font_saved], 0
+    je .desktop_font
+    lea rsi, [vga_font]
+    mov rdi, 0xA0000
+    mov ecx, 256
+.saved:
+    push rcx
+    mov ecx, 16
+    rep movsb
+    add rdi, 16
+    pop rcx
+    loop .saved
+    jmp .done
+
+.desktop_font:
+    xor ebx, ebx                    ; glyph index 0 .. FONT_GLYPHS-1 (ASCII 32..)
+.glyph:
+    mov eax, ebx
+    shl eax, 4
+    lea rsi, [font_data]
+    add rsi, rax
+    lea eax, [ebx + FONT_FIRST_CHAR]
+    shl eax, 5
+    mov rdi, 0xA0000
+    add rdi, rax
+    mov ecx, FONT_H
+    rep movsb
+    inc ebx
+    cmp ebx, FONT_GLYPHS
+    jb .glyph
+.done:
+    call vga_text_planes
+    pop rdi
+    pop rsi
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; vga_font_plane: map VGA plane 2 (the glyphs) linearly at 0xA0000 for
+; reading and writing
+vga_font_plane:
+    push rax
+    push rdx
     mov dx, 0x3C4
     mov ax, 0x0402                  ; map mask: plane 2
     out dx, ax
     mov ax, 0x0604                  ; sequential addressing
     out dx, ax
     mov dx, 0x3CE
-    mov ax, 0x0005                  ; write mode 0
+    mov ax, 0x0204                  ; read map: plane 2
+    out dx, ax
+    mov ax, 0x0005                  ; write mode 0, no odd/even
     out dx, ax
     mov ax, 0x0006                  ; map 0xA0000-0xAFFFF
     out dx, ax
+    pop rdx
+    pop rax
+    ret
 
-    mov rdi, 0xA0000                ; clear all 256 glyph slots (32 bytes each)
-    xor eax, eax
-    mov ecx, 256 * 32 / 4
-    rep stosd
-
-    xor ebx, ebx                    ; glyph index 0 .. FONT_GLYPHS-1 (ASCII 32..)
-.glyph:
-    lea rsi, [font_8x8_data + rbx * 8]
-    lea eax, [ebx + FONT_FIRST_CHAR]
-    shl eax, 5
-    mov rdi, 0xA0000
-    add rdi, rax
-    mov ecx, 8
-.row:
-    lodsb
-    mov [rdi], al
-    mov [rdi + 1], al
-    add rdi, 2
-    loop .row
-    inc ebx
-    cmp ebx, FONT_GLYPHS
-    jb .glyph
-
+; vga_text_planes: back to text-mode memory (planes 0 + 1 odd/even at 0xB8000)
+vga_text_planes:
+    push rax
+    push rdx
     mov dx, 0x3C4
     mov ax, 0x0302                  ; planes 0 + 1
     out dx, ax
     mov ax, 0x0204                  ; odd/even
     out dx, ax
     mov dx, 0x3CE
+    mov ax, 0x0004                  ; read map: plane 0
+    out dx, ax
     mov ax, 0x1005                  ; odd/even
     out dx, ax
     mov ax, 0x0E06                  ; map 0xB8000
     out dx, ax
-
-    pop rdi
-    pop rsi
     pop rdx
-    pop rcx
-    pop rbx
     pop rax
     ret
 

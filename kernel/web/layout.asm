@@ -10,7 +10,7 @@
 ;   - inline content forms line boxes, wrapped at word boundaries and shifted
 ;     for text-align: center / right
 ;   - whitespace collapses unless white-space is pre; entities, UTF-8 and
-;     Latin-1 become the nearest ASCII the 8x8 font has
+;     Latin-1 become the nearest ASCII the 8x16 font has
 ;   - list items get a bullet or a number; table rows are one line with the
 ;     cells spaced apart (block boxes inside a cell flow inline)
 ;   - background colours of blocks become rectangles behind their content
@@ -21,7 +21,9 @@
 
 [bits 64]
 
-LAY_LINE_H              equ 14
+LAY_LINE_H              equ 18
+LAY_PAD_X               equ 20      ; page content inset from the viewport
+LAY_PAD_Y               equ 14
 LAY_WORD_MAX            equ 120
 LAY_MAX_ITEMS           equ (LAYOUT_SIZE - LAY_TEXT_SIZE) / LAY_ITEM_SIZE
 LAY_TEXT                equ LAYOUT_ADDR + LAYOUT_SIZE - LAY_TEXT_SIZE
@@ -313,7 +315,7 @@ lay_node:
     jc .hr_done
     mov byte [rbx + I_KIND], IK_RECT
     mov eax, [lay_y]
-    add eax, 6
+    add eax, LAY_LINE_H / 2
     mov [rbx + I_Y], eax
     mov eax, [lay_left]
     mov [rbx + I_X], eax
@@ -709,7 +711,7 @@ lay_marker:
     jc .done
     mov byte [rbx + I_KIND], IK_RECT
     mov eax, [lay_y]
-    add eax, 3
+    add eax, 7
     mov [rbx + I_Y], eax
     mov eax, [lay_left]
     sub eax, 10
@@ -1462,42 +1464,38 @@ browser_render_html_page:
     push r12
     push r13
 
-    ; viewport: x+6, y+80, w-12, h-104 of the window frame
+    ; viewport: between the bookmarks and the status bar, inside the border
     mov eax, [br_wx]
-    add eax, 6
+    add eax, WIN_BORDER
     mov [browser_vp_x], eax
     mov eax, [br_wy]
-    add eax, 80
+    add eax, BR_VIEW_Y
     mov [browser_vp_y], eax
     mov eax, [br_ww]
-    sub eax, 12
+    sub eax, 2 * WIN_BORDER
     mov [browser_vp_w], eax
     mov eax, [br_wh]
-    sub eax, 104
+    sub eax, BR_VIEW_Y + BR_STATUS_H + WIN_BORDER
     mov [browser_vp_h], eax
-    ; content: 8 pixels in from each side
+    ; content: LAY_PAD_X in from each side
     mov eax, [browser_vp_w]
-    sub eax, 16 + 8                 ; (and room for the right edge)
+    sub eax, 2 * LAY_PAD_X + 8      ; (and room for the right edge)
     cmp eax, [lay_width]
     je .laid_out
     call layout_page
 .laid_out:
     ; page background
     mov ecx, [browser_vp_x]
-    inc ecx
     mov edx, [browser_vp_y]
-    inc edx
     mov esi, [browser_vp_w]
-    sub esi, 2
     mov r8d, [browser_vp_h]
-    sub r8d, 2
     mov eax, [lay_page_bg]
     call gfx_fill_rect
 
     mov r10d, [browser_vp_x]
-    add r10d, 8                     ; R10 = content left (screen)
+    add r10d, LAY_PAD_X             ; R10 = content left (screen)
     mov r11d, [browser_vp_y]
-    add r11d, 6
+    add r11d, LAY_PAD_Y
     sub r11d, [browser_scroll]      ; R11 = screen y of page y 0
     mov dword [browser_link_count], 0
     ; rectangles, then text on top
@@ -1569,7 +1567,7 @@ browser_render_html_page:
     jl .next_item
     mov eax, [browser_vp_y]
     add eax, [browser_vp_h]
-    sub eax, 12
+    sub eax, FONT_H + 1
     cmp edx, eax
     jg .next_item
     call paint_text
@@ -1579,7 +1577,6 @@ browser_render_html_page:
     mov esi, [rbx + I_TEXT]         ; width
     mov r8d, [rbx + I_LINK]         ; height
     mov eax, [browser_vp_y]
-    inc eax
     sub eax, edx                    ; rows above the viewport
     jle .rect_bottom
     sub r8d, eax
@@ -1587,7 +1584,6 @@ browser_render_html_page:
 .rect_bottom:
     mov eax, [browser_vp_y]
     add eax, [browser_vp_h]
-    dec eax
     sub eax, edx                    ; rows left in the viewport
     cmp r8d, eax
     jle .rect_h
@@ -1668,7 +1664,7 @@ paint_text:
     test byte [rbx + I_FLAGS], IF_UNDER
     jz .link
     push rdx
-    add edx, 9
+    add edx, 13                     ; just under the baseline
     mov esi, r9d
     sub esi, ecx
     mov r8d, 1
@@ -1689,7 +1685,7 @@ paint_text:
     mov [rdi + LINK_X1], ecx
     mov [rdi + LINK_Y1], edx
     mov [rdi + LINK_X2], r9d
-    lea esi, [edx + 11]
+    lea esi, [edx + LAY_LINE_H - 2]
     mov [rdi + LINK_Y2], esi
     dec eax
     shl eax, 4
@@ -1734,9 +1730,9 @@ layout_node_at:
     push rsi
     push rdi
     sub ecx, [browser_vp_x]
-    sub ecx, 8                      ; document x
+    sub ecx, LAY_PAD_X              ; document x
     sub edx, [browser_vp_y]
-    sub edx, 6
+    sub edx, LAY_PAD_Y
     add edx, [browser_scroll]       ; document y
     ; text, last drawn first
     mov eax, [lay_count]

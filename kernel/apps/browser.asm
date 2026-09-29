@@ -19,18 +19,28 @@ BROWSER_PAGE_BUF_MAX    equ BROWSER_PAGE_SIZE - 1
 browser_page_buf        equ BROWSER_PAGE_ADDR   ; use as [abs browser_page_buf]
 BROWSER_LOG_MAX         equ 80      ; visible text reported by "[klog] browser text:"
 BROWSER_MAX_REDIRECTS   equ 5
-BROWSER_URL_X           equ 182     ; address text, from the window's left edge
-BROWSER_WHEEL_STEP      equ 3 * 14  ; pixels per wheel notch / arrow key
+BROWSER_WHEEL_STEP      equ 3 * LAY_LINE_H  ; pixels per wheel notch / arrow key
 BROWSER_MAX_SHEETS      equ 8       ; external style sheets per page
 
-; Colors for Browser UI
-BROWSER_CLR_TOOLBAR     equ 0x00131D2E   ; Deep Navy Toolbar
-BROWSER_CLR_URL_BG      equ 0x000A0E17   ; Address Bar Background
-BROWSER_CLR_URL_BORDER  equ 0x00334155   ; Unfocused Address Bar Border
-BROWSER_CLR_URL_ACT     equ 0x0000F0FF   ; Focused Address Bar Border (Cyan)
-BROWSER_CLR_BOOKMARK_BG equ 0x001E293B   ; Bookmark Pill Background
-BROWSER_CLR_PAGE_BG     equ 0x00070A0F   ; Webpage Viewport Dark Canvas
-BROWSER_CLR_STATUS_BG   equ 0x000B1120   ; Status Bar Background
+; Window layout, from the frame's top left corner
+BR_TOOLBAR_Y            equ TITLE_H
+BR_TOOLBAR_H            equ 44
+BR_BTN                  equ 28      ; round buttons: back, forward, reload, home
+BR_BTN_X                equ 12
+BR_BTN_Y                equ BR_TOOLBAR_Y + 8
+BR_BTN_STEP             equ 34
+BR_URL_X                equ BR_BTN_X + 4 * BR_BTN_STEP + 6  ; address field
+BR_URL_TEXT_X           equ BR_URL_X + 30
+BR_GO_W                 equ 44      ; Go, at the right end of the toolbar
+BR_BOOKMARKS_H          equ 32
+BR_BOOKMARKS            equ 5
+BR_CHIP_X               equ 12      ; bookmark chips
+BR_CHIP_Y               equ BR_TOOLBAR_Y + BR_TOOLBAR_H + 3
+BR_CHIP_H               equ 22
+BR_CHIP_PAD             equ 12
+BR_CHIP_GAP             equ 6
+BR_VIEW_Y               equ BR_TOOLBAR_Y + BR_TOOLBAR_H + BR_BOOKMARKS_H  ; the page
+BR_STATUS_H             equ 24
 
 section .data
 browser_ready:          db 0
@@ -1653,7 +1663,7 @@ section .text
 
 ; ------------------------------------------------------------------------------
 ; browser_draw_window: toolbar, address bar, bookmarks, page and status bar
-; (inside the frame described by br_wx/br_wy/br_ww/br_wh)
+; (inside the frame described by br_wx/br_wy/br_ww/br_wh; offsets BR_*)
 ; ------------------------------------------------------------------------------
 browser_draw_window:
     push rax
@@ -1665,148 +1675,149 @@ browser_draw_window:
     push r8
     push r9
     push r10
+    push r11
 
-
-    ; 2. Navigation Toolbar Panel (y: br_wy + 28, h: 26)
+    ; toolbar: the title bar's colour carries on down
     mov ecx, [br_wx]
-    add ecx, 2
+    inc ecx
     mov edx, [br_wy]
-    add edx, 28
+    add edx, BR_TOOLBAR_Y
     mov esi, [br_ww]
-    sub esi, 4
-    mov r8d, 26
-    mov eax, BROWSER_CLR_TOOLBAR
+    sub esi, 2
+    mov r8d, BR_TOOLBAR_H + BR_BOOKMARKS_H
+    mov eax, THEME_TITLE
     call gfx_fill_rect
-
-    ; Toolbar bottom divider
-    mov ecx, [br_wx]
-    add ecx, 2
-    mov edx, [br_wy]
-    add edx, 54
-    mov esi, [br_ww]
-    sub esi, 4
+    add edx, BR_TOOLBAR_H + BR_BOOKMARKS_H - 1
     mov r8d, 1
-    mov eax, 0x001E293B
+    mov eax, THEME_SEPARATOR
     call gfx_fill_rect
 
-    ; Nav Button: [ < ] Back
-    mov ecx, [br_wx]
-    add ecx, 10
+    ; icon buttons: back, forward (never enabled), reload, home
+    xor r11d, r11d
+.button:
+    mov ecx, r11d
+    imul ecx, BR_BTN_STEP
+    add ecx, [br_wx]
+    add ecx, BR_BTN_X
     mov edx, [br_wy]
-    add edx, 32
-    mov esi, 24
-    mov r8d, 18
-    mov eax, 0x001E293B
-    call gfx_fill_rect
-    mov ecx, [br_wx]
-    add ecx, 18
-    mov edx, [br_wy]
-    add edx, 37
+    add edx, BR_BTN_Y
+    add ecx, BR_BTN / 2              ; ECX,EDX = the button's centre
+    add edx, BR_BTN / 2
+    cmp r11d, 2
+    je .reload_icon
+    cmp r11d, 3
+    je .home_icon
     lea rsi, [STR_BTN_BACK]
     mov eax, THEME_TEXT
-    mov ebx, -1
-    call gfx_print_string
-
-    ; Nav Button: [ > ] Forward
-    mov ecx, [br_wx]
-    add ecx, 38
-    mov edx, [br_wy]
-    add edx, 32
-    mov esi, 24
-    mov r8d, 18
-    mov eax, 0x001E293B
-    call gfx_fill_rect
-    mov ecx, [br_wx]
-    add ecx, 46
-    mov edx, [br_wy]
-    add edx, 37
+    test r11d, r11d
+    jz .arrow
     lea rsi, [STR_BTN_FWD]
-    mov eax, THEME_TEXT_MUTED
-    mov ebx, -1
-    call gfx_print_string
-
-    ; Nav Button: [ R ] Reload
-    mov ecx, [br_wx]
-    add ecx, 66
-    mov edx, [br_wy]
-    add edx, 32
-    mov esi, 24
-    mov r8d, 18
-    mov eax, 0x001E293B
-    call gfx_fill_rect
-    mov ecx, [br_wx]
-    add ecx, 74
-    mov edx, [br_wy]
-    add edx, 37
-    lea rsi, [STR_BTN_RELOAD]
-    mov eax, THEME_CYAN
-    mov ebx, -1
-    call gfx_print_string
-
-    ; Nav Button: [ Home ]
-    mov ecx, [br_wx]
-    add ecx, 94
-    mov edx, [br_wy]
-    add edx, 32
-    mov esi, 44
-    mov r8d, 18
-    mov eax, 0x001E293B
-    call gfx_fill_rect
-    mov ecx, [br_wx]
-    add ecx, 100
-    mov edx, [br_wy]
-    add edx, 37
-    lea rsi, [STR_BTN_HOME]
+    mov eax, THEME_TEXT_FAINT
+.arrow:
+    sub edx, 9
+    call gfx_print_ui_centered
+    jmp .next_button
+.reload_icon:                       ; a ring with a gap and an arrow tip
+    sub ecx, 6
+    sub edx, 6
+    mov esi, 12
+    mov r8d, 12
+    mov r9d, 6
     mov eax, THEME_TEXT
-    mov ebx, -1
-    call gfx_print_string
-
-    ; Address / URL Bar Input Box
-    mov ecx, [br_wx]
-    add ecx, 144
-    mov edx, [br_wy]
-    add edx, 32
-    mov esi, [br_ww]
-    sub esi, 204                 ; Leave room for [ Go ] button
-    mov r8d, 18
-    mov eax, BROWSER_CLR_URL_BG
+    call gfx_stroke_round_rect
+    add ecx, 7
+    mov esi, 5
+    mov r8d, 5
+    mov eax, THEME_TITLE
     call gfx_fill_rect
+    add ecx, 1
+    sub edx, 2
+    mov esi, 4
+    mov r8d, 1
+    mov eax, THEME_TEXT
+    call gfx_fill_rect
+    add ecx, 3
+    mov esi, 1
+    mov r8d, 5
+    call gfx_fill_rect
+    jmp .next_button
+.home_icon:                         ; a roof in steps over a square
+    mov eax, THEME_TEXT
+    mov esi, 2
+    mov r8d, 1
+    sub edx, 7
+    xor r10d, r10d
+.roof:
+    push rcx
+    sub ecx, r10d
+    lea esi, [r10d * 2 + 1]
+    call gfx_fill_rect
+    pop rcx
+    inc edx
+    inc r10d
+    cmp r10d, 7
+    jb .roof
+    sub ecx, 4
+    mov esi, 9
+    mov r8d, 6
+    call gfx_fill_rect
+    add ecx, 3
+    add edx, 2
+    mov esi, 3
+    mov r8d, 4
+    mov eax, THEME_TITLE
+    call gfx_fill_rect
+.next_button:
+    inc r11d
+    cmp r11d, 4
+    jb .button
 
-    ; Address Bar Border
+    ; address field: a pill with a lock (verified TLS) or a dot, then the URL
     mov ecx, [br_wx]
-    add ecx, 144
+    add ecx, BR_URL_X
     mov edx, [br_wy]
-    add edx, 32
+    add edx, BR_BTN_Y
     mov esi, [br_ww]
-    sub esi, 204
-    mov r8d, 18
+    sub esi, BR_URL_X + BR_GO_W + 20
+    mov r8d, BR_BTN
+    mov r9d, BR_BTN / 2
+    mov eax, THEME_FIELD
+    call gfx_fill_round_rect
+    mov eax, THEME_WIN_EDGE
     cmp byte [browser_url_focused], 1
-    je .url_act_border
-    mov eax, BROWSER_CLR_URL_BORDER
-    jmp .draw_url_bdr
-.url_act_border:
-    mov eax, BROWSER_CLR_URL_ACT
-.draw_url_bdr:
-    call gfx_draw_rect
+    jne .url_edge
+    mov eax, THEME_ACCENT
+.url_edge:
+    call gfx_stroke_round_rect
 
-    ; URL Lock Icon / Prefix
-    mov ecx, [br_wx]
-    add ecx, 150
-    mov edx, [br_wy]
-    add edx, 37
-    lea rsi, [STR_URL_ICON]
-    mov eax, THEME_GREEN
+    add ecx, 14
+    add edx, 9
     cmp byte [browser_page_tls], 0
-    je .url_icon
-    lea rsi, [STR_URL_ICON_TLS]     ; encrypted, certificate verified
-    mov eax, THEME_GREEN_LIGHT
-.url_icon:
-    mov ebx, -1
-    call gfx_print_string
-
-    ; URL Text: the end of it when it is longer than the box
+    je .no_lock
+    mov esi, 10                     ; lock: body and shackle
+    mov r8d, 7
+    mov r9d, 2
+    add edx, 4
+    mov eax, THEME_GREEN
+    call gfx_fill_round_rect
+    add ecx, 2
+    sub edx, 5
+    mov esi, 6
+    mov r8d, 8
+    mov r9d, 3
+    call gfx_stroke_round_rect
+    jmp .url_text
+.no_lock:
+    add edx, 2
+    mov esi, 8
+    mov r8d, 8
+    mov r9d, 4
+    mov eax, THEME_TEXT_FAINT
+    call gfx_stroke_round_rect
+.url_text:
+    ; the end of the URL when it is longer than the field
     mov eax, [br_ww]
-    sub eax, BROWSER_URL_X + 68
+    sub eax, BR_URL_TEXT_X + BR_GO_W + 40
     shr eax, 3                      ; characters that fit (one left for the cursor)
     mov ecx, [browser_url_len]
     xor r9d, r9d                    ; R9 = characters hidden on the left
@@ -1815,232 +1826,120 @@ browser_draw_window:
     mov r9d, ecx
 .url_fits:
     mov ecx, [br_wx]
-    add ecx, BROWSER_URL_X
+    add ecx, BR_URL_TEXT_X
     mov edx, [br_wy]
-    add edx, 37
+    add edx, BR_BTN_Y + 6
     lea rsi, [browser_url_buf]
     add rsi, r9
     mov eax, THEME_TEXT
     mov ebx, -1
     call gfx_print_string
 
-    ; URL Cursor (if URL bar focused)
     cmp byte [browser_url_focused], 1
-    jne .skip_url_cursor
-    mov ecx, [br_wx]
-    add ecx, BROWSER_URL_X
+    jne .no_url_cursor
+    mov ecx, [br_wx]                ; text cursor after the last character
+    add ecx, BR_URL_TEXT_X
     mov eax, [browser_url_len]
     sub eax, r9d
-    shl eax, 3                  ; len * 8
+    shl eax, 3
     add ecx, eax
     mov edx, [br_wy]
-    add edx, 36
-    mov esi, 8
-    mov r8d, 10
-    mov eax, THEME_CYAN
-    call gfx_fill_rect
-.skip_url_cursor:
-
-    ; [ Go ] Button
-    mov ecx, [br_wx]
-    add ecx, [br_ww]
-    sub ecx, 54
-    mov edx, [br_wy]
-    add edx, 32
-    mov esi, 44
-    mov r8d, 18
+    add edx, BR_BTN_Y + 7
+    mov esi, 2
+    mov r8d, 14
     mov eax, THEME_ACCENT
     call gfx_fill_rect
+.no_url_cursor:
+
+    ; Go
     mov ecx, [br_wx]
     add ecx, [br_ww]
-    sub ecx, 42
+    sub ecx, BR_GO_W + 12
     mov edx, [br_wy]
-    add edx, 37
+    add edx, BR_BTN_Y
+    mov esi, BR_GO_W
+    mov r8d, BR_BTN
+    mov r9d, BR_BTN / 2
+    mov eax, THEME_ACCENT
+    call gfx_fill_round_rect
+    add ecx, BR_GO_W / 2
+    add edx, 6
     lea rsi, [STR_BTN_GO]
-    mov eax, THEME_TEXT
-    mov ebx, -1
-    call gfx_print_string
+    mov eax, THEME_WIN_BODY
+    call gfx_print_ui_centered
 
-    ; 3. Bookmarks Bar (y: br_wy + 55, h: 22)
+    ; bookmarks: chips as wide as their labels
     mov ecx, [br_wx]
-    add ecx, 2
+    add ecx, BR_CHIP_X
+    xor r11d, r11d
+.chip:
+    mov rax, r11
+    shl rax, 4
+    lea rbx, [browser_bookmarks]
+    mov rsi, [rbx + rax]
+    call gfx_ui_width
+    lea r10d, [eax + BR_CHIP_PAD * 2]   ; chip width
     mov edx, [br_wy]
-    add edx, 55
-    mov esi, [br_ww]
-    sub esi, 4
-    mov r8d, 22
-    mov eax, 0x000F172A
-    call gfx_fill_rect
+    add edx, BR_CHIP_Y
+    push rsi
+    mov esi, r10d
+    mov r8d, BR_CHIP_H
+    mov r9d, BR_CHIP_H / 2
+    mov eax, THEME_SURFACE_HI
+    call gfx_fill_round_rect
+    pop rsi
+    push rcx
+    add ecx, BR_CHIP_PAD
+    add edx, 3
+    mov eax, THEME_TEXT_SOFT
+    call gfx_print_ui
+    pop rcx
+    lea ecx, [ecx + r10d + BR_CHIP_GAP]
+    inc r11d
+    cmp r11d, BR_BOOKMARKS
+    jb .chip
 
-    ; Bookmark 1: [ Portal ]
-    mov ecx, [br_wx]
-    add ecx, 10
-    mov edx, [br_wy]
-    add edx, 58
-    mov esi, 64
-    mov r8d, 16
-    mov eax, BROWSER_CLR_BOOKMARK_BG
-    call gfx_fill_rect
-    mov ecx, [br_wx]
-    add ecx, 16
-    mov edx, [br_wy]
-    add edx, 62
-    lea rsi, [STR_BM_PORTAL]
-    mov eax, THEME_TEXT
-    mov ebx, -1
-    call gfx_print_string
-
-    ; Bookmark 2: [ Demo HTML ]
-    mov ecx, [br_wx]
-    add ecx, 80
-    mov edx, [br_wy]
-    add edx, 58
-    mov esi, 78
-    mov r8d, 16
-    mov eax, BROWSER_CLR_BOOKMARK_BG
-    call gfx_fill_rect
-    mov ecx, [br_wx]
-    add ecx, 86
-    mov edx, [br_wy]
-    add edx, 62
-    lea rsi, [STR_BM_DEMO]
-    mov eax, THEME_TEXT
-    mov ebx, -1
-    call gfx_print_string
-
-    ; Bookmark 3: [ Telemetry ]
-    mov ecx, [br_wx]
-    add ecx, 164
-    mov edx, [br_wy]
-    add edx, 58
-    mov esi, 80
-    mov r8d, 16
-    mov eax, BROWSER_CLR_BOOKMARK_BG
-    call gfx_fill_rect
-    mov ecx, [br_wx]
-    add ecx, 170
-    mov edx, [br_wy]
-    add edx, 62
-    lea rsi, [STR_BM_STATUS]
-    mov eax, THEME_TEXT
-    mov ebx, -1
-    call gfx_print_string
-
-    ; Bookmark 4: [ AFS Docs ]
-    mov ecx, [br_wx]
-    add ecx, 250
-    mov edx, [br_wy]
-    add edx, 58
-    mov esi, 75
-    mov r8d, 16
-    mov eax, BROWSER_CLR_BOOKMARK_BG
-    call gfx_fill_rect
-    mov ecx, [br_wx]
-    add ecx, 256
-    mov edx, [br_wy]
-    add edx, 62
-    lea rsi, [STR_BM_AFS]
-    mov eax, THEME_TEXT
-    mov ebx, -1
-    call gfx_print_string
-
-    ; Bookmark 5: [ Host Web ]
-    mov ecx, [br_wx]
-    add ecx, 331
-    mov edx, [br_wy]
-    add edx, 58
-    mov esi, 75
-    mov r8d, 16
-    mov eax, BROWSER_CLR_BOOKMARK_BG
-    call gfx_fill_rect
-    mov ecx, [br_wx]
-    add ecx, 337
-    mov edx, [br_wy]
-    add edx, 62
-    lea rsi, [STR_BM_HOST]
-    mov eax, THEME_TEXT
-    mov ebx, -1
-    call gfx_print_string
-
-    ; 4. Webpage Viewport Area
-    mov ecx, [br_wx]
-    add ecx, 4
-    mov edx, [br_wy]
-    add edx, 78
-    mov esi, [br_ww]
-    sub esi, 8
-    mov r8d, [br_wh]
-    sub r8d, 102
-    mov eax, BROWSER_CLR_PAGE_BG
-    call gfx_fill_rect
-
-    ; Viewport Inner Border
-    mov ecx, [br_wx]
-    add ecx, 4
-    mov edx, [br_wy]
-    add edx, 78
-    mov esi, [br_ww]
-    sub esi, 8
-    mov r8d, [br_wh]
-    sub r8d, 102
-    mov eax, 0x001E293B
-    call gfx_draw_rect
-
-    ; 5. Parse and Render HTML Page into Viewport
+    ; the page
     call browser_render_html_page
 
-    ; 6. Status Bar Panel (Bottom of browser window)
+    ; status bar
     mov ecx, [br_wx]
-    add ecx, 2
+    inc ecx
     mov edx, [br_wy]
     add edx, [br_wh]
-    sub edx, 22
+    sub edx, BR_STATUS_H + 1
     mov esi, [br_ww]
-    sub esi, 4
-    mov r8d, 20
-    mov eax, BROWSER_CLR_STATUS_BG
+    sub esi, 2
+    mov r8d, BR_STATUS_H
+    mov eax, THEME_TITLE_IDLE
     call gfx_fill_rect
-
-    ; Status Bar Top Line
-    mov ecx, [br_wx]
-    add ecx, 2
-    mov edx, [br_wy]
-    add edx, [br_wh]
-    sub edx, 22
-    mov esi, [br_ww]
-    sub esi, 4
     mov r8d, 1
-    mov eax, 0x001E293B
+    mov eax, THEME_SEPARATOR
     call gfx_fill_rect
 
-    ; Status text
     mov ecx, [br_wx]
-    add ecx, 12
-    mov edx, [br_wy]
-    add edx, [br_wh]
-    sub edx, 16
+    add ecx, 14
+    add edx, 4
     lea rsi, [browser_status_text]
-    mov eax, THEME_GREEN
-    mov ebx, -1
-    call gfx_print_string
-
-    ; Protocol badge on right
-    mov ecx, [br_wx]
-    add ecx, [br_ww]
-    sub ecx, 130
-    mov edx, [br_wy]
-    add edx, [br_wh]
-    sub edx, 16
-    lea rsi, [STR_STATUS_BADGE]
     mov eax, THEME_TEXT_MUTED
+    call gfx_print_ui
+
+    lea rsi, [STR_STATUS_BADGE]     ; protocol, right-aligned
+    mov r10d, THEME_TEXT_FAINT
     cmp byte [browser_page_tls], 0
     je .badge
     lea rsi, [STR_BADGE_VERIFIED]
-    mov eax, THEME_GREEN_LIGHT
+    mov r10d, THEME_GREEN
 .badge:
-    mov ebx, -1
-    call gfx_print_string
+    call gfx_ui_width
+    mov ecx, [br_wx]
+    add ecx, [br_ww]
+    sub ecx, 16
+    sub ecx, eax
+    mov eax, r10d
+    call gfx_print_ui
 
+    pop r11
     pop r10
     pop r9
     pop r8
@@ -2052,7 +1951,7 @@ browser_draw_window:
     pop rax
     ret
 
-; (the HTML renderer is in browser_html.asm)
+; (the HTML renderer is in web/layout.asm)
 ; ------------------------------------------------------------------------------
 ; browser_handle_click: a click inside the browser window at [mouse_x],[mouse_y]
 ; ------------------------------------------------------------------------------
@@ -2066,184 +1965,102 @@ browser_handle_click:
     mov ecx, [mouse_x]
     mov edx, [mouse_y]
 
-    ; 3. Check Nav Toolbar Buttons (y: br_wy + 30 .. br_wy + 52)
+    ; toolbar row: buttons, address field, Go
     mov eax, [br_wy]
-    add eax, 30
+    add eax, BR_BTN_Y
     cmp edx, eax
     jl .chk_bookmarks
-    add eax, 22
+    add eax, BR_BTN
     cmp edx, eax
-    jg .chk_bookmarks
+    jge .chk_bookmarks
 
-    ; [ < ] Back Button (x: br_wx + 10 .. br_wx + 34)
-    mov eax, [br_wx]
-    add eax, 10
-    cmp ecx, eax
-    jl .chk_fwd
-    add eax, 24
-    cmp ecx, eax
-    jg .chk_fwd
-    ; Back clicked!
+    mov eax, ecx
+    sub eax, [br_wx]                ; EAX = x in the window
+    cmp eax, BR_URL_X
+    jge .chk_url_bar
+    sub eax, BR_BTN_X
+    jl .chk_bookmarks
+    xor edx, edx
+    mov ebx, BR_BTN_STEP
+    div ebx                         ; EAX = button, EDX = x inside its step
+    cmp edx, BR_BTN
+    jae .chk_bookmarks
+    test eax, eax
+    jz .back
+    cmp eax, 2
+    je .reload
+    cmp eax, 3
+    je .home
+    jmp .browser_click_done         ; forward: nothing to go forward to
+.back:
     lea rdi, [browser_url_buf]
     lea rsi, [browser_prev_url]
     mov ecx, BROWSER_URL_MAX
     call strlcpy
     call browser_navigate
-    mov rax, 1
     jmp .browser_click_done
-
-.chk_fwd:
-    ; [ R ] Reload Button (x: br_wx + 66 .. br_wx + 90)
-    mov eax, [br_wx]
-    add eax, 66
-    cmp ecx, eax
-    jl .chk_home
-    add eax, 24
-    cmp ecx, eax
-    jg .chk_home
+.reload:
     call browser_navigate
-    mov rax, 1
     jmp .browser_click_done
-
-.chk_home:
-    ; [ Home ] Button (x: br_wx + 94 .. br_wx + 138)
-    mov eax, [br_wx]
-    add eax, 94
-    cmp ecx, eax
-    jl .chk_url_bar
-    add eax, 44
-    cmp ecx, eax
-    jg .chk_url_bar
+.home:
     lea rdi, [browser_url_buf]
     lea rsi, [STR_URL_HOME]
     call strcpy
     call browser_navigate
-    mov rax, 1
     jmp .browser_click_done
 
 .chk_url_bar:
-    ; Address / URL Bar (x: br_wx + 144 .. br_wx + br_ww - 60)
-    mov eax, [br_wx]
-    add eax, 144
-    cmp ecx, eax
-    jl .chk_go_btn
-    mov eax, [br_wx]
-    add eax, [br_ww]
-    sub eax, 60
-    cmp ecx, eax
-    jg .chk_go_btn
-    ; Focused URL bar!
+    mov ebx, [br_ww]
+    sub ebx, BR_GO_W + 20
+    cmp eax, ebx
+    jge .chk_go_btn
     mov byte [browser_url_focused], 1
-    mov rax, 1
     jmp .browser_click_done
-
 .chk_go_btn:
-    ; [ Go ] Button (x: br_wx + br_ww - 54 .. br_wx + br_ww - 10)
-    mov eax, [br_wx]
-    add eax, [br_ww]
-    sub eax, 54
-    cmp ecx, eax
-    jl .chk_bookmarks
-    mov eax, [br_wx]
-    add eax, [br_ww]
-    sub eax, 10
-    cmp ecx, eax
-    jg .chk_bookmarks
+    add ebx, 8
+    cmp eax, ebx
+    jl .browser_click_done
     mov byte [browser_url_focused], 0
     call browser_navigate
-    mov rax, 1
     jmp .browser_click_done
 
 .chk_bookmarks:
-    ; Unfocus URL bar if clicked outside
-    mov byte [browser_url_focused], 0
-
-    ; 4. Check Bookmarks Bar (y: br_wy + 55 .. br_wy + 76)
+    mov byte [browser_url_focused], 0   ; a click anywhere else unfocuses the URL
+    mov edx, [mouse_y]
     mov eax, [br_wy]
-    add eax, 55
+    add eax, BR_CHIP_Y
     cmp edx, eax
     jl .chk_hyperlinks
-    add eax, 22
+    add eax, BR_CHIP_H
     cmp edx, eax
-    jg .chk_hyperlinks
-
-    ; Bookmark 1: [ Portal ] (x: br_wx + 10 .. br_wx + 74)
-    mov eax, [br_wx]
-    add eax, 10
-    cmp ecx, eax
-    jl .chk_bm_demo
-    add eax, 64
-    cmp ecx, eax
-    jg .chk_bm_demo
-    lea rdi, [browser_url_buf]
-    lea rsi, [STR_URL_HOME]
-    call strcpy
-    call browser_navigate
-    mov rax, 1
-    jmp .browser_click_done
-
-.chk_bm_demo:
-    ; Bookmark 2: [ Demo HTML ] (x: br_wx + 80 .. br_wx + 158)
-    mov eax, [br_wx]
-    add eax, 80
-    cmp ecx, eax
-    jl .chk_bm_status
-    add eax, 78
-    cmp ecx, eax
-    jg .chk_bm_status
-    lea rdi, [browser_url_buf]
-    lea rsi, [STR_URL_DEMO]
-    call strcpy
-    call browser_navigate
-    mov rax, 1
-    jmp .browser_click_done
-
-.chk_bm_status:
-    ; Bookmark 3: [ Telemetry ] (x: br_wx + 164 .. br_wx + 244)
-    mov eax, [br_wx]
-    add eax, 164
-    cmp ecx, eax
-    jl .chk_bm_afs
-    add eax, 80
-    cmp ecx, eax
-    jg .chk_bm_afs
-    lea rdi, [browser_url_buf]
-    lea rsi, [STR_URL_STATUS]
-    call strcpy
-    call browser_navigate
-    mov rax, 1
-    jmp .browser_click_done
-
-.chk_bm_afs:
-    ; Bookmark 4: [ AFS Docs ] (x: br_wx + 250 .. br_wx + 325)
-    mov eax, [br_wx]
-    add eax, 250
-    cmp ecx, eax
-    jl .chk_bm_host
-    add eax, 75
-    cmp ecx, eax
-    jg .chk_bm_host
-    lea rdi, [browser_url_buf]
-    lea rsi, [STR_URL_AFS_README]
-    call strcpy
-    call browser_navigate
-    mov rax, 1
-    jmp .browser_click_done
-
-.chk_bm_host:
-    ; Bookmark 5: [ Host Web ] (x: br_wx + 331 .. br_wx + 406)
-    mov eax, [br_wx]
-    add eax, 331
-    cmp ecx, eax
+    jge .chk_hyperlinks
+    mov edi, [br_wx]                ; EDI = left of the chip being tested
+    add edi, BR_CHIP_X
+    xor ebx, ebx
+.chip:
+    cmp ecx, edi
     jl .chk_hyperlinks
-    add eax, 75
-    cmp ecx, eax
-    jg .chk_hyperlinks
+    mov rax, rbx
+    shl rax, 4
+    lea rsi, [browser_bookmarks]
+    mov rsi, [rsi + rax]
+    call gfx_ui_width
+    lea edi, [edi + eax + BR_CHIP_PAD * 2]
+    cmp ecx, edi
+    jl .bookmark
+    add edi, BR_CHIP_GAP
+    inc ebx
+    cmp ebx, BR_BOOKMARKS
+    jb .chip
+    jmp .chk_hyperlinks
+.bookmark:
+    mov rax, rbx
+    shl rax, 4
+    lea rsi, [browser_bookmarks]
+    mov rsi, [rsi + rax + 8]
     lea rdi, [browser_url_buf]
-    lea rsi, [STR_URL_HOST]
     call strcpy
     call browser_navigate
-    mov rax, 1
     jmp .browser_click_done
 
 .chk_hyperlinks:
@@ -2391,16 +2208,20 @@ STR_PROTO_AFS:          db "afs://", 0
 
 STR_BTN_BACK:           db "<", 0
 STR_BTN_FWD:            db ">", 0
-STR_BTN_RELOAD:         db "R", 0
-STR_BTN_HOME:           db "Home", 0
 STR_BTN_GO:             db "Go", 0
-STR_URL_ICON:           db "URL", 0
 
 STR_BM_PORTAL:          db "Portal", 0
 STR_BM_DEMO:            db "Demo HTML", 0
 STR_BM_STATUS:          db "Telemetry", 0
 STR_BM_AFS:             db "AFS Docs", 0
 STR_BM_HOST:            db "Host Web", 0
+align 8
+browser_bookmarks:                  ; label, URL
+    dq STR_BM_PORTAL, STR_URL_HOME
+    dq STR_BM_DEMO,   STR_URL_DEMO
+    dq STR_BM_STATUS, STR_URL_STATUS
+    dq STR_BM_AFS,    STR_URL_AFS_README
+    dq STR_BM_HOST,   STR_URL_HOST
 
 STR_TITLE_HOME:         db "CyberSurf - Antigravity Portal", 0
 STR_TITLE_DEMO:         db "CyberSurf - HTML Showcase Demo", 0
@@ -2499,8 +2320,7 @@ PAGE_TLS_FAIL_HTML:
 
 STR_TITLE_TLS_FAIL:     db "CyberSurf - Secure Connection Failed", 0
 STR_STATUS_TLS_FAIL:    db "Error: TLS ", 0
-STR_BADGE_VERIFIED:     db "TLS 1.3 VERIFIED", 0
-STR_URL_ICON_TLS:       db "TLS", 0
+STR_BADGE_VERIFIED:     db "TLS 1.3 - certificate verified", 0
 STR_HDR_LOCATION:       db "location:", 0
 klog_browser_redirect:  db "browser: redirect -> ", 0
 STR_TITLE_PREFIX:       db "CyberSurf - ", 0
