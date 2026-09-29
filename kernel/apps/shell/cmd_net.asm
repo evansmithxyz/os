@@ -24,7 +24,8 @@ msg_arp_static:     db "  static (gateway)", 0x0A, 0
 msg_arp_dynamic:    db "  dynamic", 0x0A, 0
 msg_usage_ping:     db "Usage: ping <ip or domain>   e.g. ping 10.0.2.2", 0x0A, 0
 msg_usage_dns:      db "Usage: dns <domain>   e.g. dns example.com", 0x0A, 0
-msg_usage_curl:     db "Usage: curl <url> [port]   e.g. curl 10.0.2.2 or curl example.com/index.html", 0x0A, 0
+msg_usage_curl:     db "Usage: curl [-k] <url> [port]   e.g. curl 10.0.2.2 or curl https://example.com/", 0x0A
+                    db "       -k, --insecure: do not check the server's certificate", 0x0A, 0
 msg_resolving:      db "Resolving ", 0
 msg_dots:           db "... ", 0
 msg_resolve_fail:   db "failed (unknown host or DNS timeout)", 0x0A, 0
@@ -33,6 +34,12 @@ msg_dns_for:        db " for ", 0
 msg_dns_name:       db "  Name:    ", 0
 msg_dns_addr:       db "  Address: ", 0
 msg_bad_port:       db "Invalid port number.", 0x0A, 0
+msg_tls_unverified: db "[TLS] TLS 1.3, ChaCha20-Poly1305. WARNING: -k given, the certificate was NOT verified;", 0x0A
+                    db "      anyone on the network path could be impersonating this server.", 0x0A, 0
+msg_tls_verified:   db "[TLS] TLS 1.3, ChaCha20-Poly1305. Certificate verified for ", 0
+msg_opt_k:          db "-k ", 0
+msg_opt_insecure:   db "--insecure ", 0
+msg_tls_failed:     db "[TLS] Handshake failed: ", 0
 
 section .text
 ; cmd_require_nic: CF=1 (and a message) if there is no network card
@@ -275,6 +282,20 @@ cmd_dns:
 cmd_curl:
     call cmd_require_nic
     jc .done
+    ; -k / --insecure: do not check the server's certificate
+    mov byte [tls_insecure], 0
+    lea rdi, [msg_opt_k]
+    call str_has_prefix
+    je .insecure3
+    lea rdi, [msg_opt_insecure]
+    call str_has_prefix
+    jne .no_option
+    add rsi, 8
+.insecure3:
+    add rsi, 2
+    mov byte [tls_insecure], 1
+    call skip_spaces
+.no_option:
     cmp byte [rsi], 0
     je .usage
     call url_parse                  ; RSI -> after the URL
@@ -298,8 +319,42 @@ cmd_curl:
     lea rdi, [url_host]
     movzx edx, word [url_port]
     lea r8, [url_path]
+    cmp byte [url_https], 1
+    je .https
     call tcp_http_client
 .done:
+    ret
+.https:
+    call tls_https_get
+    test eax, eax
+    jnz .tls_failed
+    cmp byte [tls_verified], 1
+    jne .unverified
+    mov bl, COLOR_LIGHT_GREEN
+    lea rsi, [msg_tls_verified]
+    call con_puts_color
+    lea rsi, [url_host]
+    call con_puts_color
+    mov al, 0x0A
+    call con_putc
+    jmp .body
+.unverified:
+    mov bl, COLOR_YELLOW
+    lea rsi, [msg_tls_unverified]
+    call con_puts_color
+.body:
+    mov bl, COLOR_LIGHT_CYAN
+    lea rsi, [abs http_resp_buf]
+    call con_puts_color
+    call con_newline
+    ret
+.tls_failed:
+    mov bl, COLOR_LIGHT_RED
+    lea rsi, [msg_tls_failed]
+    call con_puts_color
+    mov rsi, [tls_error_msg]
+    call con_puts_color
+    call con_newline
     ret
 .bad_port:
     mov bl, COLOR_LIGHT_RED

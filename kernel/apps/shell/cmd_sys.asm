@@ -12,6 +12,11 @@ section .bss
 cpu_brand_buf:          resb 64
 
 section .rodata
+str_prof_on:            db "on", 0
+str_prof_off:           db "off", 0
+msg_prof_usage:         db "Usage: prof on | prof off", 10, 0
+msg_prof_samples:       db "prof samples ", 0
+msg_date_utc:           db " UTC", 0x0A, 0
 msg_about:
     db "Antigravity OS ", OS_VERSION_STR, " - a 64-bit operating system in pure x86_64 assembly", 0x0A
     db "  Boot:     MBR -> stage 2 loader -> long mode, 4-level paging (0-4 GB, 2 MB pages)", 0x0A
@@ -273,6 +278,68 @@ cmd_uptime:
     mov rax, [timer_ticks]
     call con_dec
     lea rsi, [msg_uptime_hz]
+    jmp con_puts
+
+; prof on | off: every timer tick records the interrupted RIP at PROF_ADDR
+; (tools/profile.py turns the samples into a profile); off says how many
+cmd_prof:
+    push rdi
+    lea rdi, [str_prof_on]
+    call strcmp
+    je .on
+    lea rdi, [str_prof_off]
+    call strcmp
+    je .off
+    pop rdi
+    lea rsi, [msg_prof_usage]
+    jmp con_puts
+.on:
+    pop rdi
+    mov dword [prof_count], 0
+    mov byte [prof_on], 1
+    ret
+.off:
+    pop rdi
+    mov byte [prof_on], 0
+    lea rsi, [msg_prof_samples]
+    call con_puts
+    mov eax, [prof_count]
+    call con_dec
+    mov al, 10
+    call con_putc
+    mov eax, [prof_count]
+    lea rsi, [msg_prof_samples]
+    jmp klog_dec
+
+; date: "YYYY-MM-DD HH:MM:SS UTC" from the CMOS clock
+cmd_date:
+    call rtc_read
+    lea rdi, [cpu_brand_buf]
+    movzx eax, word [rtc_year]
+    call fmt_dec
+    mov al, '-'
+    call fmt_char
+    movzx eax, byte [rtc_month]
+    call fmt_dec2
+    mov al, '-'
+    call fmt_char
+    movzx eax, byte [rtc_day]
+    call fmt_dec2
+    mov al, ' '
+    call fmt_char
+    movzx eax, byte [rtc_hour]
+    call fmt_dec2
+    mov al, ':'
+    call fmt_char
+    movzx eax, byte [rtc_minute]
+    call fmt_dec2
+    mov al, ':'
+    call fmt_char
+    movzx eax, byte [rtc_second]
+    call fmt_dec2
+    lea rsi, [msg_date_utc]
+    call fmt_str
+    lea rsi, [cpu_brand_buf]
     jmp con_puts
 
 cmd_cpu:

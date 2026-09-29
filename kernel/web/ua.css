@@ -1,0 +1,41 @@
+/* Antigravity OS browser: default styles for every page (like a browser's
+   user-agent style sheet). Page style sheets override these. Lengths are
+   CSS pixels; the browser draws them at half size to match its 8x8 font.
+   Only what kernel/web/css.asm understands has any effect. */
+
+html, body, div, p, ul, ol, dl, dt, dd, h1, h2, h3, h4, h5, h6, pre,
+blockquote, form, fieldset, legend, section, article, header, footer, nav,
+main, aside, figure, figcaption, address, center, details, summary, hr,
+menu, dir, hgroup, caption, thead, tbody, tfoot, search, xmp, listing,
+plaintext, noscript { display: block }
+li { display: list-item }
+table { display: table }
+tr { display: table-row }
+td, th { display: table-cell }
+
+head, script, style, title, meta, link, base, template, select, option,
+textarea, svg, iframe, object, embed, math, canvas, video, audio, datalist,
+noembed, noframes, param, area, map, track, source, dialog, frameset,
+frame { display: none }
+
+body { margin: 8px; color: #000; background-color: #fff }
+
+p, dl, ul, ol, blockquote, figure, pre, menu, dir, xmp, listing, plaintext,
+table, fieldset { margin-top: 1em; margin-bottom: 1em }
+ul ul, ul ol, ol ul, ol ol, li p { margin-top: 0; margin-bottom: 0 }
+h1 { margin-top: .67em; margin-bottom: .67em }
+h2 { margin-top: .83em; margin-bottom: .83em }
+h3 { margin-top: 1em; margin-bottom: 1em }
+h4, h5, h6 { margin-top: 1.33em; margin-bottom: 1.33em }
+h1, h2, h3, h4, h5, h6, b, strong, th, dt, legend, summary { font-weight: bold }
+ul, ol, menu, dir { padding-left: 40px }
+dd, blockquote, figure { margin-left: 40px }
+ol { list-style-type: decimal }
+i, em, cite, var, dfn, address { font-style: italic }
+u, ins { text-decoration: underline }
+a { color: #0000ee; text-decoration: underline }
+pre, xmp, listing, plaintext { white-space: pre }
+nobr { white-space: nowrap }
+center, th, caption { text-align: center }
+table { text-align: left }  /* old pages: <center> does not reach into tables */
+hr { margin-top: .5em; margin-bottom: .5em; color: #888 }

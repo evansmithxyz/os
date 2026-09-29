@@ -25,8 +25,10 @@ TCP_STATE_CLOSE_WAIT    equ 7
 TCP_STATE_LAST_ACK      equ 8
 TCP_STATE_TIME_WAIT     equ 9
 
-HTTP_RESP_MAX           equ 16384   ; bytes of HTTP response kept for the browser
+HTTP_RESP_MAX           equ HTTP_RESP_SIZE - 1  ; bytes of HTTP response kept (+ NUL)
+http_resp_buf           equ HTTP_RESP_ADDR      ; use as [abs http_resp_buf]
 TCP_RX_BUF_SIZE         equ 4096
+TCP_SEND_MAX            equ 1400    ; payload bytes per segment we send
 
 section .data
 tcp_active_state:       db TCP_STATE_CLOSED
@@ -47,8 +49,10 @@ tcp_reset_received:     db 0
 tcp_connection_closed:  db 0
 
 http_quiet:             db 0        ; 1 = tcp_http_client prints nothing (browser)
+tcp_rx_to_tls:          db 0        ; 1 = received data goes to tls_in_buf, not http_resp_buf
 align 4
 http_resp_len:          dd 0        ; bytes in http_resp_buf (NUL-terminated)
+tcp_last_window:        dd 0        ; receive window in the last segment we sent
 
 section .bss
 alignb 16
@@ -57,9 +61,7 @@ tcp_tx_packet:          resb 2048
 alignb 16
 tcp_rx_buf:             resb TCP_RX_BUF_SIZE + 16   ; last received segment, NUL-terminated
 alignb 16
-http_req_buf:           resb 512
-alignb 16
-http_resp_buf:          resb HTTP_RESP_MAX + 1      ; whole response of the last GET
+http_req_buf:           resb 1536
 
 section .rodata
 ; Server HTTP Response Content
@@ -181,9 +183,20 @@ tcp_send_segment:
     ; TCP Flags
     mov byte [rax + 25], r8b
 
-    ; Window Size = 16384 (0x4000 in Big Endian)
-    mov byte [rax + 26], 0x40
-    mov byte [rax + 27], 0x00
+    ; Window: 16384, or the free space in tls_in_buf while TLS is reading, so
+    ; the sender never sends more than we can keep
+    mov ebx, 0x4000
+    cmp byte [tcp_rx_to_tls], 0
+    je .window
+    mov ebx, TLS_IN_MAX
+    sub ebx, [tls_in_len]
+    cmp ebx, 0xFFFF
+    jbe .window
+    mov ebx, 0xFFFF
+.window:
+    mov [tcp_last_window], ebx
+    mov byte [rax + 26], bh
+    mov byte [rax + 27], bl
 
     ; Checksum = 0 initially
     mov word [rax + 28], 0
@@ -425,6 +438,11 @@ tcp_handle_packet:
     test edx, edx
     jz .check_fin
 
+    ; Only in-order data is kept. A retransmission or a segment after a lost
+    ; one is dropped and answered with our current ACK so the sender resends.
+    cmp r9d, [tcp_my_ack]
+    jne .out_of_order
+
     ; Copy incoming payload to tcp_rx_buf
     lea rdi, [tcp_rx_buf]
     push rsi
@@ -439,8 +457,16 @@ tcp_handle_packet:
     pop rsi
 
     mov [tcp_data_rx_len], dx
+    ; keep every segment (several can arrive per poll)
+    cmp byte [tcp_rx_to_tls], 0
+    je .to_http
+    call tls_rx_append              ; CF=1: no room, so do not ACK it (resent later)
+    jc .out_of_order
+    jmp .rx_stored
+.to_http:
+    call http_resp_append
+.rx_stored:
     mov byte [tcp_data_rx_flag], 1
-    call http_resp_append           ; keep every segment (several can arrive per poll)
 
     ; Advance ACK number by received payload length
     add [tcp_my_ack], edx
@@ -466,6 +492,12 @@ tcp_handle_packet:
 
     inc dword [tcp_my_seq]
     mov byte [tcp_active_state], TCP_STATE_LAST_ACK
+    jmp .drop
+
+.out_of_order:
+    mov al, TCP_FLAG_ACK
+    xor rcx, rcx
+    call tcp_send_segment
     jmp .drop
 
 .state_fin_wait:
@@ -505,33 +537,18 @@ tcp_handle_packet:
     ret
 
 ; ------------------------------------------------------------------------------
-; tcp_http_client: Connects to target IP on port 80 and issues HTTP GET request
-; Input:
-;   RSI = Target IP (4 bytes)
-;   RDI = Optional domain string for Host header (or target IP if null)
-;   DX  = Destination Port (e.g. 80)
-;   R8  = Request path (e.g. "/index.html"), or 0 for "/"
-; Output:
-;   RAX = 0 on Success, 1 on Error
-;   http_resp_buf / http_resp_len = the complete response (headers + body)
-; Set http_quiet = 1 to suppress all console output (used by the browser).
+; tcp_connect: open a client connection
+; Input:  RSI = target IP (4 bytes), DX = destination port
+; Output: CF=1 if the handshake timed out (3 s)
+; Prints "Connecting to ..." unless http_quiet is set.
 ; ------------------------------------------------------------------------------
-tcp_http_client:
+tcp_connect:
+    push rax
     push rbx
     push rcx
-    push rdx
     push rsi
-    push rdi
-    push r12
-    push r13
     push r14
-    push r15
 
-    mov r15, rdi                ; R15 = Hostname string pointer
-    mov r13, r8                 ; R13 = path (0 = "/")
-    xor r12d, r12d              ; R12 = bytes of the response already printed
-    mov dword [http_resp_len], 0
-    mov byte [http_resp_buf], 0
     mov eax, [rsi]
     mov [tcp_remote_ip], eax
     mov [tcp_remote_port], dx
@@ -552,6 +569,7 @@ tcp_http_client:
     mov byte [tcp_is_server], 0
     mov byte [tcp_data_rx_flag], 0
     mov byte [tcp_fin_received], 0
+    mov byte [tcp_reset_received], 0
     mov byte [tcp_connection_closed], 0
     mov byte [tcp_active_state], TCP_STATE_SYN_SENT
 
@@ -582,39 +600,91 @@ tcp_http_client:
     call net_poll
     cmp byte [tcp_active_state], TCP_STATE_ESTABLISHED
     je .connected
-
     call net_wait_step
-
     mov rax, [timer_ticks]
     cmp rax, r14
     jb .wait_connect
 
-    ; Timeout!
     mov bl, COLOR_LIGHT_RED
     lea rsi, [MSG_TCP_TIMEOUT]
     call tcp_say
     mov byte [tcp_active_state], TCP_STATE_CLOSED
-    mov rax, 1
-    jmp .exit_client
+    pop r14
+    pop rsi
+    pop rcx
+    pop rbx
+    pop rax
+    stc
+    ret
 
 .connected:
     mov bl, COLOR_LIGHT_GREEN
     lea rsi, [MSG_TCP_CONNECTED]
     call tcp_say
+    pop r14
+    pop rsi
+    pop rcx
+    pop rbx
+    pop rax
+    clc
+    ret
 
-    ; Build HTTP GET Request at http_req_buf:
-    ; "GET / HTTP/1.0\r\nHost: <domain or IP>\r\nUser-Agent: AntigravityOS/1.0 (x86_64)\r\nConnection: close\r\n\r\n"
+; ------------------------------------------------------------------------------
+; tcp_send_data: RSI = data, RCX = length. Sent as PSH|ACK segments of at most
+; TCP_SEND_MAX bytes on the open connection.
+; ------------------------------------------------------------------------------
+tcp_send_data:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    mov rdx, rcx                    ; RDX = bytes left
+.segment:
+    test rdx, rdx
+    jz .done
+    mov rcx, rdx
+    cmp rcx, TCP_SEND_MAX
+    jbe .send
+    mov ecx, TCP_SEND_MAX
+.send:
+    mov al, TCP_FLAG_PSH | TCP_FLAG_ACK
+    call tcp_send_segment
+    add [tcp_my_seq], ecx
+    add rsi, rcx
+    sub rdx, rcx
+    jmp .segment
+.done:
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; ------------------------------------------------------------------------------
+; http_build_request: GET request in http_req_buf
+; Input:  RDI = host name for the Host header (0 or "" = tcp_remote_ip),
+;         R8 = path (0 = "/")
+; Output: RCX = request length
+; "GET <path> HTTP/1.0\r\nHost: <host>\r\nUser-Agent: ...\r\nConnection: close\r\n\r\n"
+; ------------------------------------------------------------------------------
+http_build_request:
+    push rax
+    push rbx
+    push rsi
+    push rdi
+    push r15
+    mov r15, rdi                    ; R15 = host name
     lea rdi, [http_req_buf]
 
     ; 1. "GET <path> HTTP/1.0\r\nHost: "
     lea rsi, [.STR_GET]
     call .append_str
-    mov rsi, r13
+    mov rsi, r8
     test rsi, rsi
     jnz .have_path
     lea rsi, [.STR_ROOT]
 .have_path:
-    lea rax, [http_req_buf + 300]   ; leave room for the rest of the request
+    lea rax, [http_req_buf + 1200]  ; leave room for the rest of the request
 .copy_path:
     cmp rdi, rax
     jae .path_done
@@ -629,20 +699,14 @@ tcp_http_client:
     lea rsi, [.STR_GET_PREFIX]
     call .append_str
 
-    ; 2. Copy Hostname from R15 (if valid string) or IP
+    ; 2. Host name, or the IP address
     test r15, r15
     jz .use_ip_host
     cmp byte [r15], 0
     je .use_ip_host
-
     mov rsi, r15
-.copy_host:
-    lodsb
-    test al, al
-    jz .host_done
-    stosb
-    jmp .copy_host
-
+    call .append_str
+    jmp .host_done
 .use_ip_host:
     movzx eax, byte [tcp_remote_ip + 0]
     call .append_dec
@@ -658,88 +722,28 @@ tcp_http_client:
     stosb
     movzx eax, byte [tcp_remote_ip + 3]
     call .append_dec
-
 .host_done:
-    ; 3. Copy "\r\nUser-Agent: AntigravityOS/1.0 (x86_64)\r\nConnection: close\r\n\r\n"
-    lea rsi, [.STR_GET_SUFFIX]
-.copy_suffix:
-    lodsb
-    test al, al
-    jz .suffix_done
-    stosb
-    jmp .copy_suffix
-.suffix_done:
-
-    ; Calculate request length
-    lea rbx, [http_req_buf]
-    sub rdi, rbx
-    mov rcx, rdi                ; RCX = Request length
-
-    ; Send HTTP Request with PSH | ACK
-    lea rsi, [http_req_buf]
-    mov al, TCP_FLAG_PSH | TCP_FLAG_ACK
-    call tcp_send_segment
-
-    ; Advance our Seq by sent bytes
-    add [tcp_my_seq], ecx
-
-    ; Receive the response (5 second timeout)
-    mov rax, [timer_ticks]
-    add rax, TICKS(5000)
-    mov r14, rax
-.rx_loop:
-    call net_poll
-
-    ; Did we receive data?
-    cmp byte [tcp_data_rx_flag], 1
-    jne .check_term
-
-    mov byte [tcp_data_rx_flag], 0
-    ; Print whatever arrived since the last time (from the accumulated response)
+    ; 3. the browser's requests take compressed bodies (http_decode_body)
     cmp byte [http_quiet], 0
-    jne .check_term
-    mov eax, [http_resp_len]
-    cmp eax, r12d
-    jbe .check_term
-    lea rsi, [http_resp_buf]
-    add rsi, r12
-    mov r12d, eax
-    mov bl, COLOR_LIGHT_CYAN
-    call con_puts_color
+    je .fixed_headers
+    lea rsi, [.STR_ACCEPT_ENCODING]
+    call .append_str
+.fixed_headers:
+    ; 4. the fixed headers and the blank line
+    lea rsi, [.STR_GET_SUFFIX]
+    call .append_str
 
-.check_term:
-    cmp byte [tcp_fin_received], 1
-    je .done_transfer
-    cmp byte [tcp_connection_closed], 1
-    je .done_transfer
-    cmp byte [tcp_active_state], TCP_STATE_CLOSED
-    je .done_transfer
-
-    call net_wait_step
-
-    mov rax, [timer_ticks]
-    cmp rax, r14
-    jb .rx_loop
-
-.done_transfer:
-    mov bl, COLOR_LIGHT_GRAY
-    lea rsi, [MSG_TCP_CLOSED]
-    call tcp_say
-    xor rax, rax
-
-.exit_client:
+    lea rcx, [http_req_buf]
+    sub rdi, rcx
+    mov rcx, rdi
     pop r15
-    pop r14
-    pop r13
-    pop r12
     pop rdi
     pop rsi
-    pop rdx
-    pop rcx
     pop rbx
+    pop rax
     ret
 
-.append_dec:
+.append_dec:                        ; EAX = value, appended in decimal at RDI
     push rbx
     push rcx
     push rdx
@@ -763,7 +767,7 @@ tcp_http_client:
     pop rbx
     ret
 
-.append_str:                    ; append NUL-terminated RSI at RDI
+.append_str:                        ; append NUL-terminated RSI at RDI
     lodsb
     test al, al
     jz .append_done
@@ -778,10 +782,98 @@ tcp_http_client:
     db "/", 0
 .STR_GET_PREFIX:
     db " HTTP/1.0", 0x0D, 0x0A, "Host: ", 0
+.STR_ACCEPT_ENCODING:
+    db 0x0D, 0x0A, "Accept-Encoding: gzip, deflate", 0
 .STR_GET_SUFFIX:
     db 0x0D, 0x0A
     db "User-Agent: AntigravityOS/1.0 (x86_64)", 0x0D, 0x0A
     db "Connection: close", 0x0D, 0x0A, 0x0D, 0x0A, 0
+
+; ------------------------------------------------------------------------------
+; tcp_http_client: plain HTTP GET
+; Input:
+;   RSI = Target IP (4 bytes)
+;   RDI = Optional domain string for Host header (or target IP if null)
+;   DX  = Destination Port (e.g. 80)
+;   R8  = Request path (e.g. "/index.html"), or 0 for "/"
+; Output:
+;   RAX = 0 on Success, 1 on Error
+;   http_resp_buf / http_resp_len = the complete response (headers + body)
+; Set http_quiet = 1 to suppress all console output (used by the browser).
+; The response ends when the server closes, or after 5 s without new data.
+; ------------------------------------------------------------------------------
+tcp_http_client:
+    push rbx
+    push rcx
+    push rsi
+    push r12
+    push r14
+
+    xor r12d, r12d              ; R12 = bytes of the response already printed
+    mov dword [http_resp_len], 0
+    mov byte [abs http_resp_buf], 0
+    mov byte [tcp_rx_to_tls], 0
+    call tcp_connect
+    jc .error
+
+    call http_build_request
+    lea rsi, [http_req_buf]
+    call tcp_send_data
+
+.progress:
+    mov rax, [timer_ticks]
+    add rax, TICKS(5000)
+    mov r14, rax
+.rx_loop:
+    call net_poll
+
+    ; Did we receive data?
+    cmp byte [tcp_data_rx_flag], 1
+    jne .check_term
+    mov byte [tcp_data_rx_flag], 0
+    ; Print whatever arrived since the last time (from the accumulated response)
+    cmp byte [http_quiet], 0
+    jne .progress
+    mov eax, [http_resp_len]
+    cmp eax, r12d
+    jbe .progress
+    lea rsi, [abs http_resp_buf]
+    add rsi, r12
+    mov r12d, eax
+    mov bl, COLOR_LIGHT_CYAN
+    call con_puts_color
+    jmp .progress
+
+.check_term:
+    cmp byte [tcp_fin_received], 1
+    je .done_transfer
+    cmp byte [tcp_connection_closed], 1
+    je .done_transfer
+    cmp byte [tcp_active_state], TCP_STATE_CLOSED
+    je .done_transfer
+
+    call net_wait_step
+
+    mov rax, [timer_ticks]
+    cmp rax, r14
+    jb .rx_loop
+
+.done_transfer:
+    mov bl, COLOR_LIGHT_GRAY
+    lea rsi, [MSG_TCP_CLOSED]
+    call tcp_say
+    call http_decode_body           ; (a gzip body: decompressed)
+    xor eax, eax
+    jmp .exit_client
+.error:
+    mov eax, 1
+.exit_client:
+    pop r14
+    pop r12
+    pop rsi
+    pop rcx
+    pop rbx
+    ret
 
 ; ------------------------------------------------------------------------------
 ; tcp_server_start: Runs interactive bare-metal HTTP web server on port 80
@@ -890,6 +982,26 @@ tcp_server_start:
     ret
 
 ; ------------------------------------------------------------------------------
+; tcp_abort: reset the client connection if it is still open (RST), so data
+; the server is still sending is not taken for the next request
+; ------------------------------------------------------------------------------
+tcp_abort:
+    push rax
+    push rcx
+    cmp byte [tcp_active_state], TCP_STATE_CLOSED
+    je .done
+    cmp byte [tcp_is_server], 0
+    jne .done
+    mov al, TCP_FLAG_RST | TCP_FLAG_ACK
+    xor ecx, ecx
+    call tcp_send_segment
+    mov byte [tcp_active_state], TCP_STATE_CLOSED
+.done:
+    pop rcx
+    pop rax
+    ret
+
+; ------------------------------------------------------------------------------
 ; tcp_say: RSI = message, BL = colour. Prints unless http_quiet is set.
 ; ------------------------------------------------------------------------------
 tcp_say:
@@ -919,7 +1031,7 @@ http_resp_append:
     jbe .fits
     mov ecx, eax
 .fits:
-    lea rdi, [http_resp_buf]
+    lea rdi, [abs http_resp_buf]
     mov eax, [http_resp_len]
     add rdi, rax
     add [http_resp_len], ecx

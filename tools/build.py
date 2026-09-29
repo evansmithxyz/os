@@ -111,13 +111,28 @@ def read_map(path: Path = KERNEL_MAP) -> dict[str, int]:
     return symbols
 
 
+def strip_js(source: Path, output: Path) -> None:
+    """The kernel's JavaScript (incbin) without comment lines, indentation and
+    blank lines. Only whole-line // comments go: the rest of a line is kept."""
+    lines = []
+    for line in source.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("//"):
+            lines.append(line)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+
+
 def build(fresh: bool = False, image: Path = IMAGE, listing: bool = False, quiet: bool = False) -> Path:
     nasm = find_nasm()
     BUILD.mkdir(exist_ok=True)
     include = ROOT / "include"
+    for js in (ROOT / "kernel" / "js").glob("*.js"):
+        strip_js(js, BUILD / "js" / js.name)
     _nasm(nasm, ROOT / "boot" / "stage1.asm", BUILD / "stage1.bin", [include, ROOT / "boot"])
     _nasm(nasm, ROOT / "boot" / "stage2.asm", BUILD / "stage2.bin", [include, ROOT / "boot"])
-    _nasm(nasm, ROOT / "kernel" / "kernel.asm", BUILD / "kernel.bin", [include, ROOT / "kernel"],
+    # (BUILD first: incbin "js/prelude.js" is the stripped copy)
+    _nasm(nasm, ROOT / "kernel" / "kernel.asm", BUILD / "kernel.bin", [BUILD, include, ROOT / "kernel"],
           BUILD / "kernel.lst" if listing else None)
 
     symbols = read_map()
@@ -173,10 +188,14 @@ def qemu_args(image: Path = IMAGE, *, headless: bool = False, net: bool = True, 
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    build(fresh=args.fresh)
     extra = []
     if args.kvm:
+        if not os.access("/dev/kvm", os.R_OK | os.W_OK):
+            raise BuildError("--kvm needs read/write access to /dev/kvm. On Linux/WSL run\n"
+                             "  sudo usermod -aG kvm $USER\n"
+                             "then restart the shell (on WSL: `wsl --shutdown` from Windows), or drop --kvm.")
         extra += ["-accel", "kvm", "-cpu", "host"]
+    build(fresh=args.fresh)
     cmd = qemu_args(headless=args.headless, net=not args.no_net, memory=args.memory, extra=extra)
     if args.headless:
         print("Serial console below. Quit QEMU with Ctrl+A then X.")

@@ -5,3 +5,4 @@
 *.png binary
 *.img binary
 *.bin binary
+*.der binary

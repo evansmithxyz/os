@@ -21,20 +21,35 @@ windowed desktop with i3-style workspaces.
   - IDT with a real handler for every CPU exception; each one prints a full
     register dump.
   - 8259 PIC and a 1 kHz PIT timer.
+  - x87 FPU and SSE enabled (JavaScript numbers are doubles).
   - Serial console on COM1: output is mirrored there and serial input drives
     the shell.
 - **Storage:** ATA PIO driver and AntigravityFS (AFS1), with files that
   persist on disk.
 - **Network:** RTL8139 driver plus Ethernet, ARP, IPv4, ICMP (`ping`), UDP,
-  DNS, TCP, an HTTP client (`curl`) and an HTTP server (`tcplisten`).
+  DNS, TCP, an HTTP/HTTPS client (`curl`) and an HTTP server (`tcplisten`).
+- **TLS 1.3:** `https://` in `curl` and the browser, all in assembly:
+  X25519, ChaCha20-Poly1305, SHA-2, and certificate verification with RSA
+  (PKCS#1 v1.5 and PSS, up to 4096 bits) and ECDSA (P-256, P-384) against the
+  Mozilla root store, the CMOS clock and the host name.
 - **Shell:** about 30 commands, Tab completion, history (Up/Down) and Ctrl+C.
+- **JavaScript:** an engine written in assembly (`kernel/js/`): a parser,
+  a bytecode compiler, an interpreter and a garbage collector, with
+  classes, closures, exceptions, destructuring, generators, promises,
+  `async`/`await`, timers, `fetch`, regular expressions, `Map`/`Set`,
+  `Symbol`, `Date`, the everyday standard library and correctly rounded
+  number formatting. Run it with `js`; web pages run it too.
 - **Desktop:**
   - 1024×768×32 graphics through the Bochs/QEMU display adapter.
   - Movable and resizable windows with minimize and maximize, and 4
     workspaces.
   - Apps:
     - a terminal that runs the same shell as the text console
-    - the CyberSurf web browser (built-in pages, `afs://` files and real HTTP)
+    - the CyberSurf web browser: built-in pages, `afs://` files, real HTTP
+      and HTTPS with redirects; an HTML parser, a CSS engine (style sheets,
+      selectors, the cascade, `@media`), a layout engine drawing with the
+      8x8 font, and page scripts with the DOM and click events; scrolling
+      and relative links
     - a paint canvas
     - a live system monitor
 
@@ -82,6 +97,7 @@ and `... cat build/os.img welcome.txt` read its files from the host.
 ls  cat  touch  write  rm  df                     files
 ifconfig  arp  ping  dns  curl  tcplisten         network
 sysinfo  about  cpu  mem  regs  uptime  clear     system
+js [-p | -d | -c] <code | file.js>  prof on|off   JavaScript, profiling
 gui  browser [url]  ws  exit                      desktop
 ```
 
@@ -101,9 +117,273 @@ into the browser.
 The terminal window runs the real shell, so every command works there too.
 `ws [n]` and `ws move n` control workspaces from inside it.
 
-**Web.** `curl example.com/`, or type a URL into the browser.
-`tcplisten` serves a page that your host can open at
+**Web.** `curl example.com/` or `curl https://www.google.com/`, or type a
+URL into the browser. `tcplisten` serves a page that your host can open at
 <http://localhost:8888>.
+
+A page goes through the same stages as in a big browser, all in
+`kernel/web/`, and then its scripts run (`kernel/js/`, see JavaScript
+below):
+
+1. `dom.asm` parses the HTML into a DOM tree, with the HTML rules that
+   matter for display (void elements, `<p>`/`<li>`/`<td>` closing each other,
+   raw `<script>`/`<style>` text, a missing `</head>`).
+2. `css.asm` reads style sheets: the browser's defaults (`web/ua.css`), the
+   dark look of its own pages (`web/builtin.css`), the page's `<style>`
+   blocks and `<link rel=stylesheet>` files (fetched over HTTP/HTTPS), and
+   `style=""`. Selectors: type, `.class`, `#id`, `*`, descendant and child
+   combinators, `:root`, `:first-child`, `:last-child`, `:not(.class)`,
+   `:not(:hover)`-style states; `@media` (width, screen/print,
+   color scheme), `@supports`, `@layer`. The cascade does specificity,
+   source order, `!important` and inheritance. Properties: `display`,
+   `visibility`, `color`, `background(-color)`, `font-weight`,
+   `text-decoration`, `text-align`, `white-space`, `list-style`,
+   `text-transform`, margins and padding, plus the tricks sites use to
+   hide things (`position:absolute` with 1px size or `clip`, `height:0` with
+   `overflow:hidden`, `opacity:0`, far-off `left`/`top`). Old HTML
+   attributes (`bgcolor`, `<font color>`, `align`) count too.
+3. `layout.asm` lays the styled tree out into a display list: block boxes
+   with collapsing margins, line boxes wrapped at words and aligned,
+   lists with bullets or numbers, table rows with cells side by side,
+   background colours. It is redone only when the page or the window width
+   changes; scrolling just repaints.
+
+Everything is drawn with the 8x8 font, so there are no font sizes, and CSS
+lengths are halved to match it. Not supported: `var()`, attribute
+selectors, `+`/`~`, pseudo-elements, floats, flexbox and grid as layouts
+(they become plain blocks), positioning, images. Scroll with Up/Down,
+PgUp/PgDn, Home/End or the mouse wheel. Pages up to 1 MB are kept.
+
+| Keys / mouse (browser) | Action |
+|---|---|
+| Type, Enter | Edit the address, go |
+| Up / Down, mouse wheel | Scroll a few lines |
+| PgUp / PgDn, Home / End | Scroll a screen, to the top / bottom |
+| Click a link | Follow it (relative links resolve against the page) |
+| Click anything else | The page's `click` handlers run |
+
+HTTPS speaks TLS 1.3 with one cipher suite, `TLS_CHACHA20_POLY1305_SHA256`,
+and one key exchange, X25519. Servers that only offer AES-GCM (rare, since
+TLS 1.3 servers normally support ChaCha20) fail with a handshake alert.
+
+The server must prove who it is: its certificate chain has to lead to a
+trusted root, every certificate has to be within its validity period (`date`
+shows the clock it is checked against), intermediates have to be CAs, the
+server certificate has to name the host (subjectAltName, `*.` wildcards,
+IP addresses), and its CertificateVerify signature has to check out. If not,
+the browser shows *Secure Connection Failed* with the reason and `curl`
+prints it; `curl -k` skips the checks and says so. Not checked: revocation
+(OCSP/CRL), name constraints and path length limits.
+
+Trusted roots:
+
+- the Mozilla set, compiled into the kernel from `kernel/data/roots.der`
+  (regenerate with `python tools/mkroots.py`, which reads the host's
+  `/etc/ssl/certs/ca-certificates.crt`; `kernel/data/roots.txt` lists them)
+- your own: DER certificates back to back in the AFS file `localca.der`,
+  e.g. `python tools/mkimage.py add build/os.img myca.der --name localca.der`
+
+`cryptotest` runs the crypto on the RFC test vectors and fixed RSA and ECDSA
+signatures (`tools/gen_cryptotest.py`).
+
+**JavaScript.** `js` runs a line of code, or a script file from the disk,
+and prints the result the way Node.js does:
+
+```
+antigravity64> js 0.1 + 0.2
+0.30000000000000004
+antigravity64> js function fib(n) { return n < 2 ? n : fib(n-1) + fib(n-2) } fib(20)
+6765
+antigravity64> js console.log('sum', [1, 2, 3], {a: 'x'})
+sum [ 1, 2, 3 ] { a: 'x' }
+antigravity64> js nope()
+Uncaught ReferenceError: nope is not defined (line 1)
+antigravity64> js script.js
+```
+
+Each run starts from a fresh engine. Like Node.js, `js` then runs the
+promise jobs the script queued and waits for its timers until none are
+left, so `js setTimeout(() => console.log('later'), 500)` prints `later`
+half a second on. Esc or Ctrl+C stops a script that doesn't end, or the
+waiting.
+
+`js -p ...` runs the same way under the profiler, `js -d ...` prints each
+compiled function's bytecode in hex instead of running it, and `js -c ...`
+only compiles (it says `ok`, or shows the syntax error). An error's `stack`
+names the functions it happened in (`at name (line N)`).
+`python tools/profile.py bench/core.js` boots a copy of the image, runs
+the benchmarks in `bench/` and prints where the time went (see
+Debugging).
+
+In the browser, every HTML page gets its own engine with `window` and
+`document`. Its `<script>`s run in order (inline or `src=`, which is
+fetched), then `DOMContentLoaded` and `load` fire; scripts that scripts add
+to the document run too (`src=` ones fetched as a task, then their `load`
+or `error` event), which is how bundlers load their chunks. `type="module"`
+scripts are skipped, so the `nomodule` fallbacks run. `console.log` output
+and errors (with their stack) go to the serial log as `[klog] js: ...`; an
+error ends only the script it happened in, and a script that runs for more
+than 15 seconds is stopped. Pages that send gzip or deflate bodies, chunked
+or not, are decompressed (`kernel/net/inflate.asm`). Clicks run the page's handlers (`onclick=""`,
+`onclick` properties and `addEventListener`), which bubble up the tree;
+`preventDefault()` stops a link from being followed. The page's timers,
+animation frames and `fetch` / `XMLHttpRequest` requests run from the
+desktop loop while it is open. After scripts change the DOM, the page is
+styled and laid out again. The DOM API (`kernel/js/jsdom.asm`):
+
+- `document`: `getElementById`, `querySelector(All)` (the CSS engine's
+  selectors), `getElementsByTagName` / `ClassName`, `createElement`,
+  `createTextNode`, `write` / `writeln`, `body`, `head`,
+  `documentElement`, `title`, `readyState`, `URL`
+- elements: `textContent`, `innerHTML`, `outerHTML`, `id`, `className`,
+  `classList`, `style` (with `cssText`), `get/set/remove/hasAttribute`,
+  reflected attributes (`href`, `src`, `value`, `checked`, `hidden`, ...),
+  `appendChild`, `insertBefore`, `replaceChild`, `removeChild`, `remove`,
+  `append`, `cloneNode`, `contains`, `matches`, `closest`, `click()`, and
+  the tree (`parentNode`, `children`, `childNodes`, `firstChild`,
+  `nextElementSibling`, ...)
+- events: `addEventListener` / `removeEventListener`, `event.target`,
+  `currentTarget`, `preventDefault()`, `stopPropagation()`
+- `window`: `alert` (status bar and log), `location` (`href`, `pathname`,
+  ...; setting `href` loads the page), `navigator.userAgent`,
+  `innerWidth` / `innerHeight`
+
+The rest of the web platform a page expects is written in JavaScript
+(`kernel/js/dom.js`, run before the page's scripts): the classes (`Node`,
+`Element`, `HTMLElement`, `HTMLDivElement`, ... `Text`, `Document`, each
+node an instance of the right one), `DocumentFragment`, `insertAdjacentHTML`,
+`before` / `after` / `replaceWith`, `dataset`, `attributes`, selectors the
+native engine does not know (attributes, `+`, `~`, `:not`, `:is`, `:has`,
+`:nth-child`, ...; the native one does the common ones first),
+`dispatchEvent` with `Event` / `CustomEvent` / `MouseEvent` ...,
+listener options (`once`, `signal`), `localStorage`, `matchMedia`,
+`getComputedStyle`, `history`, `requestIdleCallback`, the observers
+(`MutationObserver`, `IntersectionObserver`, `ResizeObserver`),
+`TreeWalker`, `DOMParser`, `FormData`, `Blob`, `MessageChannel`,
+`performance.timing`, `crypto.getRandomValues` and more. Comments in the
+page are nodes too (server-rendered React pages mark their parts with
+them). Layout is not visible to scripts: shown elements report a nominal
+size.
+Lists from `querySelectorAll` and friends are plain arrays, not live
+collections. The engine (`kernel/js/`) works like the big ones, minus the
+optimising compilers:
+
+1. `lexer.asm` turns the text into tokens; names and strings become atoms
+   (one shared copy per text, so property names compare as pointers).
+2. `parser.asm` builds a syntax tree and records every declaration in its
+   scope. It notes the names each function uses; when a function ends, the
+   names it does not declare pass to its parent, which marks its own
+   variables of those names as captured (hash tables keep this linear, so
+   big bundles such as React compile in a few tens of milliseconds).
+3. `compiler.asm` turns the tree into bytecode. Variables no inner function
+   uses live in stack slots; captured ones live in heap environments that
+   closures keep (`let` in a `for` loop gets a fresh one each time round).
+   Common shapes get their own opcodes: `i < n` in a condition compiles to
+   one compare-and-jump, `i++` on a local to `INCLOC`.
+4. `vm.asm` runs the bytecode on a value stack. Calls between JavaScript
+   functions don't use the kernel stack, so deep recursion ends with
+   `RangeError: Maximum call stack size exceeded` instead of a crash.
+5. Values are NaN-boxed doubles; `number.asm` converts between text and
+   doubles with exact big-integer arithmetic where needed, so numbers print
+   exactly as in a browser (`1e+21`, `5e-324`, `(1.005).toFixed(2)` is
+   `1.00`).
+6. `gc.asm` collects garbage: a mark-sweep collector that never moves
+   anything. It marks conservatively (any word on the stacks, in the
+   kernel's variables, in DOM nodes or inside a live block that points at a
+   heap block keeps it), so the rest of the engine needs no bookkeeping.
+   Freed blocks are joined and reused; each collection logs
+   `[klog] js gc: live bytes ...`.
+7. `async.asm` has promises, the microtask queue, timers and the event
+   loop. An `await` copies the function's part of the value stack, its
+   `try` handlers and its registers into a heap object and returns the
+   function's promise; a promise job copies it all back and carries on
+   after the `await`. `jsnet.asm` has `fetch` and `XMLHttpRequest`, whose
+   requests run as tasks on the event loop (GET only, for now).
+8. `iter.asm` has symbols (a value tag of their own; a symbol works as a
+   property key), the iteration protocol that `for-of`, spread and
+   destructuring use, and generators (on the same coroutines as `await`).
+   `collections.asm` has `Map` and `Set` (insertion-ordered entries and a
+   hash table). `regexp.asm` compiles regular expressions into a small
+   program and matches with backtracking on its own stack; `regexp2.asm`
+   has `RegExp` and the string methods that take one. `date.asm` has
+   `Date`.
+9. `typed.asm` has `ArrayBuffer`, the typed arrays and `DataView`;
+   `proxy.asm` has `Proxy` (the `get`, `set`, `has`, `deleteProperty` and
+   `ownKeys` traps); `text.asm` has the URI functions and `atob` / `btoa`.
+10. `prelude.js` is the part of the library written in JavaScript, run in
+   every realm: `Reflect`, `URL`, `URLSearchParams`, `TextEncoder` /
+   `TextDecoder`, `structuredClone`, `EventTarget`, `AbortController`,
+   `Intl` (English, UTC), the typed arrays' methods, and the newer `Object`,
+   `Array`, `String` and `Number` methods. Array methods called on
+   array-likes (`Array.prototype.slice.call(arguments)`, jQuery objects)
+   come here too.
+
+The language: `var`/`let`/`const`, functions, arrow functions, closures,
+default and rest parameters, `arguments`, `this`, `new`, prototypes,
+`class` (fields, `static`, getters and setters, `extends`, `super`, also
+`extends Error`), object literals with methods, getters, setters, computed
+keys and spread, destructuring (declarations, parameters, `for-of`,
+`catch`, assignments), spread in arrays and calls, template literals,
+optional chaining, every operator including `**`, `??` and the logical
+assignments, `if`/`for`/`for-in`/`for-of`/`while`/`do`/`switch`, labels,
+`try`/`catch`/`finally` with `Error`, `TypeError`, `RangeError`,
+`SyntaxError`, `ReferenceError`, `URIError` and `EvalError`, tagged
+templates, private class members (`#x`, `#m()`, `static #y`, `#x in obj`),
+class `static { }` blocks, `new.target`, `for await`, `with`, `eval` (in
+the global scope) and `new Function(...)`. Regular expressions know the
+common `\p{...}` properties (letters, numbers, punctuation, scripts such as
+Latin or Han; close to Unicode's lists, not exact).
+
+The library: `console.log`, `Math` (all functions), `JSON.stringify` (with
+a replacer function, indent and `toJSON`) and `JSON.parse`, `parseInt`,
+`parseFloat`, `isNaN`, `isFinite`, `String`, `Number` (`isInteger`,
+`isSafeInteger`, ...), `Boolean`; `Object.keys`/`values`/`entries`/
+`assign`/`create`/`getPrototypeOf`/`setPrototypeOf`/`defineProperty`/
+`defineProperties`/`getOwnPropertyNames`/`getOwnPropertyDescriptor`/
+`fromEntries`/`freeze`/`is`; `call`/`apply`/`bind`; arrays: `push`,
+`pop`, `shift`, `unshift`, `splice`, `slice`, `concat`, `join`,
+`reverse`, `sort` (stable), `indexOf`, `lastIndexOf`, `includes`, `find`,
+`findIndex`, `findLast`, `findLastIndex`, `forEach`, `map`, `filter`,
+`reduce`, `reduceRight`, `some`, `every`, `fill`, `flat`, `flatMap`,
+`at`, `Array.from`, `Array.of`, `Array.isArray`; strings: `split`,
+`replace`/`replaceAll` (string patterns, `$&` and friends, or a
+function), `includes`, `startsWith`, `endsWith`, `indexOf`,
+`lastIndexOf`, `slice`, `substring`, `padStart`, `padEnd`, `repeat`,
+`trim`/`trimStart`/`trimEnd`, `at`, `charAt`, `charCodeAt`, `concat`,
+`toUpperCase`, `toLowerCase`, `localeCompare`; `toFixed` and
+`toString(radix)`.
+
+Async: `Promise` (`then`, `catch`, `finally`, `resolve`, `reject`, `all`,
+`allSettled`, `race`, `any`; "Uncaught (in promise)" for rejections nobody
+handles), `async` functions, arrows and methods with `await`,
+`queueMicrotask`, `setTimeout` / `setInterval` (and their `clear`s),
+`requestAnimationFrame`, `performance.now()`, `fetch` (a `Response` with
+`status`, `ok`, `headers.get()`, `text()`, `json()`) and
+`XMLHttpRequest` (asynchronous or not, `onload` and friends,
+`addEventListener`, `responseType = 'json'`).
+
+And: `Symbol` (with `Symbol.for`, `description` and the well-known
+symbols), iterators (`[Symbol.iterator]`, `entries()` / `keys()` /
+`values()`), generators (`function*`, generator methods, `yield`,
+`yield*`, `next` / `return` / `throw`), `Map`, `Set`, `WeakMap`,
+`WeakSet`, regular expressions (literals and `RegExp`: classes, groups,
+named groups, backreferences, lookahead and lookbehind, lazy and counted
+quantifiers, the `g i m s u y` flags; `exec`, `test`, `match`,
+`matchAll`, `search`, `replace` / `replaceAll` with `$1` / `$<name>` or a
+function, `split`) and `Date` (parsing ISO and the usual English forms;
+the local time zone is UTC).
+
+Not yet: modules (`import` / `export`; `import()` gives a rejected
+promise), async generators, real `BigInt` (`10n` is read as the number 10
+so scripts that use it still load), callable proxies; in the browser,
+layout information, canvas drawing, workers, WebSockets, keeping
+`localStorage` across pages and typing into form fields. Strings are
+UTF-8 bytes, so `length` and `charCodeAt` count bytes. A response of more
+than 1 MB is cut off.
+
+The libraries tried so far all load and run in pages: jQuery, lodash,
+underscore, React, Vue 3 (with its template compiler), Preact, d3, axios,
+moment, dayjs, handlebars and marked.
 
 ## Project layout
 
@@ -121,13 +401,30 @@ kernel/
   drivers/              serial, vga_text, keyboard, mouse, pci, ata, rtl8139, bga
   console/console.asm   output routing (VGA / GUI terminal / serial) and the key queue
   fs/afs.asm            AntigravityFS
-  net/                  eth (ARP), ipv4 (ICMP), udp (DNS), tcp (HTTP), url
+  net/                  eth (ARP), ipv4 (ICMP), udp (DNS), tcp (HTTP), url,
+                        tls (TLS 1.3 client), x509 (certificates and chains)
+  crypto/               sha256 + HMAC, sha512/384, chacha20poly1305, x25519,
+                        bignum (Montgomery), rsa, ecc (ECDSA P-256/P-384), random
+  data/roots.der        trusted root certificates (tools/mkroots.py)
+  web/                  dom (HTML parser), css (style sheets, cascade), layout (display list),
+                        ua.css / builtin.css (the browser's own style sheets)
+  js/                   JavaScript engine: lexer, parser, compiler (bytecode), vm,
+                        heap (strings, atoms), gc (allocator, collector), object, number,
+                        builtins + stdlib (the standard library), async (promises,
+                        async functions, timers, event loop), jsnet (fetch, XHR),
+                        iter (symbols, iterators, generators), collections (Map, Set),
+                        regexp + regexp2 (regular expressions), date (Date),
+                        typed (typed arrays), proxy (Proxy), text (URI, base64),
+                        jsdom (the DOM API), js (API, printing),
+                        prelude.js / dom.js (the library parts written in JavaScript)
   gfx/                  clipped 2D drawing, font, back buffer, mouse pointer
   gui/                  window manager + event loop, taskbar/footer, theme colours
   apps/                 terminal, browser, canvas, sysmon windows
   apps/shell/           line editor + command table + command handlers
 rootfs/                 files copied onto a freshly formatted disk
-tools/                  build.py, mkimage.py (disk images), ppm.py (screenshots)
+tools/                  build.py, mkimage.py (disk images), ppm.py (screenshots),
+                        profile.py (profiles the kernel)
+bench/                  JavaScript benchmarks (core.js)
 tests/                  harness.py + test_*.py (QEMU-driven, stdlib unittest)
 docs/                   CONVENTIONS.md, screenshots
 ```
@@ -156,7 +453,7 @@ docs/                   CONVENTIONS.md, screenshots
 |---|---|
 | 0 | stage 1 (MBR) |
 | 1–31 | stage 2 |
-| 32–1055 | kernel slot (512 KB; the kernel uses about 50 KB today) |
+| 32–1055 | kernel slot (512 KB; the kernel uses about 465 KB today) |
 | 1056 | AFS superblock `"AFS1"` |
 | 1057–1058 | inode table (32 × 32 bytes) |
 | 1059–4095 | file data (2 MB image) |
@@ -172,7 +469,14 @@ docs/                   CONVENTIONS.md, screenshots
 | `0x100000` | kernel `.bss` (zeroed at boot) |
 | `0x200000–0x2FFFFF` | kernel stack |
 | `0x300000` | RTL8139 RX ring and TX buffers |
+| `0x400000` / `0x500000` | last HTTP(S) response / the browser's page (1 MB each) |
+| `0x600000` / `0xA00000` / `0xC00000` | DOM nodes / CSS rules / layout display list |
 | `0x1000000` | GUI back buffer, wallpaper, canvas (3 MB each) |
+| `0x1C00000` | profiler samples (1 MB) |
+| `0x1D00000` | a compressed HTTP body, decompressed (1 MB) |
+| `0x2000000` | JavaScript: value stack, call frames, source, compiler scratch, syntax tree, name tables, regular expression matching |
+| `0x3000000` | JavaScript heap (62 MB) |
+| `0x6E00000` / `0x6F00000` | the garbage collector's start bitmap / mark stack |
 | `0xFD000000` | framebuffer (from the display adapter's PCI BAR0) |
 
 ### Console and input
@@ -181,7 +485,9 @@ docs/                   CONVENTIONS.md, screenshots
   desktop runs, it also appends to the terminal window instead of VGA text
   memory, which is why every shell command works in both places.
 - The keyboard IRQ and incoming serial bytes both push key events into one
-  queue. The text console and the desktop both drain it.
+  queue. The text console and the desktop both drain it. Serial bytes stay
+  in the UART while the queue is nearly full, so pasting a long line loses
+  nothing.
 
 ### Desktop
 
@@ -210,8 +516,9 @@ class MyTest(OSTestCase):
 ```
 
 The suite covers boot, the shell, the filesystem (including persistence and
-reading the image from the host), the network, the desktop, and the panic
-handler. The network tests use a web server on the host; set
+reading the image from the host), the network, TLS, the desktop and the
+browser, the JavaScript engine (`test_js.py` compares its output with what
+Node.js prints), and the panic handler. The network tests use a web server on the host; set
 `AGOS_TEST_INTERNET=1` to also test DNS against the real internet.
 
 ## Debugging
@@ -226,6 +533,18 @@ handler. The network tests use a web server on the host; set
 - **`python tools/build.py debug` + gdb:** kernel symbols are in
   `build/kernel.map`.
 - **Deliberate crashes:** `crash ud|gp|pf|de` exercises the exception path.
+- **Profiling:** while sampling is on, the timer records the interrupted
+  RIP every millisecond at `0x1C00000`. `js -p` samples one script; `prof
+  on` / `prof off` sample anything in between. `tools/profile.py` does it
+  all from the host and counts the samples per routine:
+
+  ```bash
+  python tools/profile.py bench/core.js
+  ```
+
+  ```bash
+  python tools/profile.py --cmd "browser https://example.com/" --until "browser text:"
+  ```
 
 ## Contributing
 

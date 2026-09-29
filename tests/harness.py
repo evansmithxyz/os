@@ -250,11 +250,15 @@ class Machine:
         time.sleep(0.1)
 
     def mouse_home(self) -> None:
-        """Pin the pointer against the top-left corner so its position is known."""
+        """Pin the pointer against the top-left corner so its position is known.
+        Paced: QEMU queues only a few PS/2 packets and holds back the rest of
+        the motion, which the desktop reads between frames; unpaced, leftover
+        motion would cancel the next mouse_to."""
         for _ in range(12):
             self.hmp("mouse_move -120 -120")
+            time.sleep(0.03)
         self.mouse = (0, 0)
-        time.sleep(0.1)
+        time.sleep(0.4)
 
     def _press_at(self, x: int, y: int) -> bool:
         """Press the left button; True if the kernel logged the press at (x, y)."""
@@ -282,6 +286,15 @@ class Machine:
         self.mouse_down(x, y)
         self.hmp("mouse_button 0")
         time.sleep(0.25)
+
+    def wheel(self, notches: int) -> None:
+        """Turn the mouse wheel where the pointer is (positive = down, towards
+        the user). HMP's dz is the other way round: +1 is wheel up."""
+        step = -1 if notches > 0 else 1
+        for _ in range(abs(notches)):
+            self.hmp(f"mouse_move 0 0 {step}")
+            time.sleep(0.05)
+        time.sleep(0.2)
 
     def drag(self, x1: int, y1: int, x2: int, y2: int, steps: int = 6) -> None:
         self.mouse_down(x1, y1)
@@ -324,12 +337,27 @@ class OSTestCase(unittest.TestCase):
     """
 
     shared_vm = False
+    disk_files: dict[str, bytes] = {}   # extra AFS files on the test's disk
     _class_vm: Machine | None = None
 
     @classmethod
+    def _image(cls) -> Path | None:
+        if not cls.disk_files:
+            return None
+        import mkimage  # noqa: E402 (tools/ is on sys.path)
+        image = bytearray(agbuild.IMAGE.read_bytes())
+        for name, data in cls.disk_files.items():
+            mkimage.add_file(image, name, data)
+        OUTPUT.mkdir(parents=True, exist_ok=True)
+        path = OUTPUT / f"{cls.__name__}.base.img"
+        path.write_bytes(image)
+        return path
+
+    @classmethod
     def setUpClass(cls) -> None:
+        cls._base_image = cls._image()
         if cls.shared_vm:
-            cls._class_vm = Machine(cls.__name__).start()
+            cls._class_vm = Machine(cls.__name__, image=cls._base_image).start()
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -341,7 +369,7 @@ class OSTestCase(unittest.TestCase):
         if self.shared_vm:
             self.vm = self._class_vm
         else:
-            self.vm = Machine(self.id().split(".", 1)[-1]).start()
+            self.vm = Machine(self.id().split(".", 1)[-1], image=self._base_image).start()
             self.addCleanup(self.vm.stop)
 
     def start_gui(self) -> Machine:

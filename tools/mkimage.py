@@ -263,7 +263,12 @@ def build_image(
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(out.suffix + ".tmp")
     tmp.write_bytes(image)
-    os.replace(tmp, out)
+    try:
+        os.replace(tmp, out)
+    except PermissionError as exc:
+        tmp.unlink(missing_ok=True)
+        raise ImageError(f"cannot replace {out}: it is in use. Is QEMU still running with this image? "
+                         "(A QEMU started from Windows locks the file for WSL too.)") from exc
 
     names = [i.name for i in fs_read_inodes(image, layout) if i.flags & AFS_FLAG_ALLOC]
     return BuildResult(out, len(k), k_sectors, layout.kernel_max_sectors, preserved, names)
@@ -276,6 +281,31 @@ def read_file(image: bytes, name: str, layout: Layout | None = None) -> bytes:
             off = inode.lba * SECTOR
             return image[off : off + inode.size]
     raise FileNotFoundError(name)
+
+
+def add_file(image: bytearray, name: str, data: bytes, layout: Layout | None = None) -> None:
+    """Store `data` as file `name` on the image's AFS volume (binary-safe),
+    replacing a file of that name. It goes after the last used sector."""
+    layout = layout or Layout.load()
+    if not fs_is_compatible(image, layout):
+        raise ImageError("no AFS volume with the current layout in this image")
+    if not name or len(name) > AFS_NAME_MAX or not name.isascii():
+        raise ImageError(f"invalid AFS file name {name!r} (1-{AFS_NAME_MAX} ASCII chars)")
+    inodes = fs_read_inodes(image, layout)
+    slot = next((i for i, n in enumerate(inodes) if n.flags & AFS_FLAG_ALLOC and n.name == name), None)
+    if slot is not None:
+        inodes[slot].flags = 0
+    if slot is None:
+        slot = next((i for i, n in enumerate(inodes) if not n.flags & AFS_FLAG_ALLOC), None)
+        if slot is None:
+            raise ImageError(f"no free inode for {name!r}")
+    lba = max([layout.data_lba] + [n.lba + n.sectors for n in inodes if n.flags & AFS_FLAG_ALLOC])
+    sectors = max(1, -(-len(data) // SECTOR))
+    if sectors > 0xFFFF or lba + sectors > layout.disk_sectors:
+        raise ImageError(f"not enough space on the AFS volume for {name!r}")
+    image[lba * SECTOR : (lba + sectors) * SECTOR] = data + bytes(sectors * SECTOR - len(data))
+    base = layout.inode_lba * SECTOR + slot * AFS_INODE_SIZE
+    image[base : base + AFS_INODE_SIZE] = Inode(name, len(data), lba, sectors, AFS_FLAG_ALLOC).pack()
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +341,16 @@ def _cmd_cat(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_add(args: argparse.Namespace) -> int:
+    path = Path(args.image)
+    image = bytearray(path.read_bytes())
+    source = Path(args.file)
+    add_file(image, args.name or source.name, source.read_bytes())
+    path.write_bytes(image)
+    print(f"added {args.name or source.name} ({source.stat().st_size} bytes) to {path}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -332,6 +372,12 @@ def main(argv: list[str] | None = None) -> int:
     cat.add_argument("image")
     cat.add_argument("name")
     cat.set_defaults(func=_cmd_cat)
+
+    add = sub.add_parser("add", help="copy a host file (any bytes) onto an image's AFS volume")
+    add.add_argument("image")
+    add.add_argument("file")
+    add.add_argument("--name", help="AFS file name (default: the host file's name)")
+    add.set_defaults(func=_cmd_add)
 
     args = parser.parse_args(argv)
     try:

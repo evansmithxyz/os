@@ -17,7 +17,7 @@
 
 [bits 64]
 
-KEYQ_SIZE               equ 64      ; power of two
+KEYQ_SIZE               equ 256     ; power of two
 
 section .data
 con_attr:               db COLOR_LIGHT_GRAY
@@ -340,6 +340,13 @@ key_get:
 key_poll_serial:
     push rax
 .next:
+    ; leave bytes in the UART while the queue is (nearly) full: QEMU and real
+    ; terminals hold the rest back instead of losing it
+    mov eax, [keyq_head]
+    sub eax, [keyq_tail]
+    and eax, KEYQ_SIZE - 1
+    cmp eax, KEYQ_SIZE - 8
+    jae .done
     call serial_getc
     jnc .done
     cmp al, 0x0A

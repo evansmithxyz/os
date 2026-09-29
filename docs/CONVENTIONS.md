@@ -21,6 +21,43 @@ suite and the reviewers (human or not) assume them.
     `WIN_TICK` (called through the `wm_call_*` trampolines in `gui/wm.asm`)
 - Every routine starts with a comment block saying what it does, its inputs
   and its outputs.
+- **XMM registers and the x87 stack are scratch** everywhere: nothing keeps
+  a value in them across a call, and interrupt handlers never touch them
+  (`fpu_init` turns them on; the JavaScript engine uses them for doubles).
+- **JavaScript** (`kernel/js/`) has seven more rules:
+  - opcode handlers in `vm.asm` keep the interpreter's registers (RSI = pc,
+    R12 = value stack, R13 = frame base, R14 = environment, R15 = function,
+    RBP = opcode table) and store R12 in `vm_sp` before calling anything
+    that can run JavaScript (`VMCALL`);
+  - native functions take RDI = arguments, ECX = count, RDX = `this`,
+    R8D = 1 under `new`, R10 = the function object itself (a bound
+    function finds its target there) and return the result in RAX,
+    preserving everything else. Errors call `js_throw`, which does not
+    return;
+  - heap blocks come from `js_alloc` and are never freed by hand: the
+    collector (`gc.asm`) frees what nothing points to. Keep heap pointers
+    in registers, on the stacks, in `.bss` qwords, in heap blocks or in the
+    DOM node fields it scans; a pointer kept anywhere else (a dword, another
+    memory region) does not keep its block alive. Mark blocks that hold no
+    pointers `GCF_LEAF`, and allocate what must live forever with
+    `js_alloc_perm`;
+  - host code that runs JavaScript (a script, an event handler) calls
+    `jsev_drain` afterwards, so promise jobs run before anything else
+    happens; work that waits (a network request) goes on the event loop as
+    a task (`jsev_add_timer`) instead of inside the native that asked for
+    it (a synchronous XMLHttpRequest is the exception, as in browsers);
+  - a property key is an atom or a symbol (both are permanent heap blocks,
+    compared as pointers): check `JH_KIND` for `JK_SYMBOL` before treating
+    a key as a string;
+  - the parser decides which variables closures capture from the names
+    each function uses: new syntax that reads or writes a variable by name
+    calls `jsp_note_use` for it. A missed name stops the compiler with
+    "internal: 'x' is used by an inner function but was not captured";
+  - library code that needs nothing native is JavaScript: `prelude.js`
+    (every realm) or `dom.js` (pages). The build strips their comment lines
+    and indentation, so only whole-line `//` comments, and no multi-line
+    strings or template literals. Natives meant only for them start with
+    `__` and are deleted from the global object once the prelude has them.
 
 ## Sections and memory
 
@@ -64,7 +101,16 @@ suite and the reviewers (human or not) assume them.
 
 Routines are prefixed with their module: `con_`, `key_`, `serial_`, `vga_`,
 `kbd_`, `mouse_`, `ata_`, `pci_`, `net_`/`rtl_`, `bga_`, `fs_`, `eth_`/`arp_`,
-`ipv4_`/`icmp_`, `udp_`/`dns_`, `tcp_`/`http_`, `url_`, `gfx_`, `wm_`, `gui_`,
+`ipv4_`/`icmp_`, `udp_`/`dns_`, `tcp_`/`http_`, `url_`, `tls_`, `x509_`/`der_`,
+`sha256_`/`sha512_`/`hmac_`/`hash_`, `chacha20_`/`poly1305_`/`aead_`,
+`fe_`/`x25519_`, `bn_`/`mont_`, `rsa_`/`sig_`, `ec_`/`ecdsa_`, `rand_`, `rtc_`,
+`dom_`, `css_`, `lay_`/`layout_`/`paint_`,
+`js_` (engine API and runtime helpers), `jsnum_`/`jsbig_` (numbers),
+`jsstr_` (strings, atoms), `jsobj_`/`jsarr_`/`jsfn_` (objects), `jslex_`,
+`jsp_` (parser), `jsc_` (compiler), `vm_`/`vmop_` (interpreter), `jsb_`
+(built-ins), `jsi_`/`jsout_` (printing values), `jsd_` (the DOM in
+JavaScript),
+`gfx_`, `wm_`, `gui_`,
 `desktop_`, `term_`, `canvas_`, `sysmon_`, `browser_`, `shell_`, `cmd_`,
 `fmt_`, and plain names (`strlen`, `memcpy`) for `lib/string.asm`. Local
 labels use NASM's `.name` form.

@@ -1,6 +1,8 @@
 ; ==============================================================================
 ; Antigravity OS - 64-bit PS/2 Mouse Controller Driver
 ; 8042 Auxiliary Device Communication, 3-Byte Packet Decoder & Position Clamping
+; With an IntelliMouse (wheel) the packets are 4 bytes; the 4th is the wheel,
+; added up in mouse_wheel (positive = towards the user = scroll down).
 ; ==============================================================================
 
 [bits 64]
@@ -16,6 +18,14 @@ mouse_byte0:        db 0                ; Flags / Buttons
 mouse_byte1:        db 0                ; Delta X
 mouse_byte2:        db 0                ; Delta Y
 mouse_active:       db 0
+mouse_has_wheel:    db 0                ; 1 = 4-byte IntelliMouse packets
+align 4
+mouse_wheel:        dd 0                ; wheel notches not yet handled
+align 8
+mouse_last_byte:    dq 0                ; timer tick of the last packet byte
+
+section .rodata
+klog_mouse_id:      db "mouse: id ", 0
 
 section .text
 
@@ -123,6 +133,26 @@ mouse_init:
     call mouse_write_cmd
     call mouse_read_data        ; Read 0xFA ACK
 
+    ; IntelliMouse: sample rates 200, 100, 80 switch on the wheel; the ID
+    ; then reads 3 instead of 0
+    mov bl, 200
+    call mouse_set_rate
+    mov bl, 100
+    call mouse_set_rate
+    mov bl, 80
+    call mouse_set_rate
+    mov al, 0xF2                ; get device ID
+    call mouse_write_cmd
+    call mouse_read_data        ; ACK
+    call mouse_read_data        ; ID
+    cmp al, 3
+    sete byte [mouse_has_wheel]
+    push rsi
+    movzx eax, al
+    lea rsi, [klog_mouse_id]    ; "[klog] mouse: id N" (3 = wheel)
+    call klog_dec
+    pop rsi
+
     ; 4. Enable Mouse Data Reporting (Command 0xF4)
     mov al, 0xF4
     call mouse_write_cmd
@@ -138,12 +168,25 @@ mouse_init:
     mov dword [mouse_y], GFX_HEIGHT / 2
     mov byte [mouse_buttons], 0
     mov byte [mouse_cycle], 0
+    mov dword [mouse_wheel], 0
     mov byte [mouse_active], 1
 
     popfq                       ; Restore previous interrupt flag
     pop rdx
     pop rcx
     pop rbx
+    pop rax
+    ret
+
+; mouse_set_rate: BL = samples per second (command 0xF3 + value, both ACKed)
+mouse_set_rate:
+    push rax
+    mov al, 0xF3
+    call mouse_write_cmd
+    call mouse_read_data
+    mov al, bl
+    call mouse_write_cmd
+    call mouse_read_data
     pop rax
     ret
 
@@ -196,6 +239,18 @@ mouse_poll:
     in al, 0x60
     mov bl, al                  ; BL = raw byte
 
+    ; A packet's bytes come together: after a long pause, this is a new
+    ; packet (gets back in step if a byte was ever lost). Long, because the
+    ; desktop only polls between frames, and a frame can take a while.
+    mov rax, [timer_ticks]
+    mov rdx, rax
+    sub rax, [mouse_last_byte]
+    mov [mouse_last_byte], rdx
+    cmp rax, TICKS(300)
+    jb .in_packet
+    mov byte [mouse_cycle], 0
+.in_packet:
+
     ; State machine based on mouse_cycle
     movzx ecx, byte [mouse_cycle]
     cmp ecx, 0
@@ -204,6 +259,8 @@ mouse_poll:
     je .handle_byte1
     cmp ecx, 2
     je .handle_byte2
+    cmp ecx, 3
+    je .handle_byte3
     mov byte [mouse_cycle], 0
     jmp .done
 
@@ -211,6 +268,8 @@ mouse_poll:
     ; Byte 0: Bit 3 must ALWAYS be 1 in standard PS/2 packet!
     test bl, 0x08
     jz .sync_error              ; If bit 3 == 0, packet is out of sync!
+    test bl, 0xC0               ; overflow bits: QEMU never sets them, so a
+    jnz .sync_error             ; byte with them is not a first byte
     mov [mouse_byte0], bl
     mov byte [mouse_cycle], 1
     jmp .poll_again
@@ -223,7 +282,21 @@ mouse_poll:
 .handle_byte2:
     mov [mouse_byte2], bl
     mov byte [mouse_cycle], 0   ; Reset cycle for next packet
+    cmp byte [mouse_has_wheel], 0
+    je .packet
+    mov byte [mouse_cycle], 3   ; the wheel byte follows
+    jmp .poll_again
 
+.handle_byte3:
+    mov byte [mouse_cycle], 0
+    movsx eax, bl
+    cmp eax, -8                 ; the wheel byte is -8..7: anything else
+    jl .sync_error              ; means we are out of step
+    cmp eax, 7
+    jg .sync_error
+    add [mouse_wheel], eax
+
+.packet:
     ; --------------------------------------------------------------------------
     ; Process Complete 3-Byte Packet
     ; --------------------------------------------------------------------------

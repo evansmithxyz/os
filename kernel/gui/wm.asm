@@ -11,6 +11,8 @@
 ;   WIN_MOUSE  mouse in the client area. In: RBX = window, AL = WM_MOUSE_PRESS /
 ;              WM_MOUSE_DRAG / WM_MOUSE_RELEASE, ECX,EDX = position relative
 ;              to the client area (can be outside it while dragging).
+;              AL = WM_MOUSE_WHEEL: ECX = wheel notches (positive = down), to
+;              the window under the pointer.
 ;   WIN_OPEN   called when the window is opened from the closed state (or 0).
 ;   WIN_TICK   called ~4x per second while visible. Out: CF=1 = redraw needed.
 ; Callbacks may clobber every register except RSP; the WM saves them.
@@ -93,6 +95,7 @@ HIT_WS_BADGE            equ 7
 WM_MOUSE_PRESS          equ 1
 WM_MOUSE_DRAG           equ 2
 WM_MOUSE_RELEASE        equ 3
+WM_MOUSE_WHEEL          equ 4
 
 DRAG_NONE               equ 0
 DRAG_MOVE               equ 1
@@ -223,6 +226,7 @@ gui_run:
     cmp byte [gui_exit_request], 0
     jne .exit
     call gui_ticks
+    call browser_js_tick            ; page timers (setTimeout, animation frames)
     cmp byte [gui_dirty], 0
     je .no_redraw
     call gui_redraw
@@ -485,6 +489,12 @@ gui_handle_mouse:
     call mouse_poll
     mov ecx, [mouse_x]
     mov edx, [mouse_y]
+    xor eax, eax
+    xchg eax, [mouse_wheel]
+    test eax, eax
+    jz .no_wheel
+    call gui_mouse_wheel
+.no_wheel:
     mov al, [mouse_buttons]
     and al, 1
     mov ah, [gui_prev_buttons]
@@ -517,6 +527,40 @@ gui_handle_mouse:
     call gui_send_mouse
     mov byte [gui_capture], WIN_NONE
 .done:
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; gui_mouse_wheel: EAX = notches, ECX,EDX = pointer -> WM_MOUSE_WHEEL to the
+; client area under the pointer
+gui_mouse_wheel:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push r8
+    mov r8d, eax
+    cmp edx, TASKBAR_H
+    jb .done
+    cmp edx, FOOTER_Y
+    jae .done
+    call wm_hit_test                ; AL = window, AH = hit code
+    cmp al, WIN_NONE
+    je .done
+    cmp ah, HIT_CLIENT
+    jne .done
+    movzx eax, al
+    call wm_window_ptr
+    cmp qword [rbx + WIN_MOUSE], 0
+    je .done
+    mov al, WM_MOUSE_WHEEL
+    mov ecx, r8d
+    call wm_call_mouse
+    mov byte [gui_dirty], 1
+.done:
+    pop r8
     pop rdx
     pop rcx
     pop rbx
