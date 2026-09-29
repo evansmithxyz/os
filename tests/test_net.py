@@ -241,6 +241,27 @@ x.send();
 </body></html>"""
 DATA_JSON = '{"name": "ag", "list": [1, 2, 3]}'
 
+# Form controls (kernel/web/forms.asm): line 1 two text fields, line 2 a check
+# box, line 3 a textarea, a <select> and the buttons
+FORM_HTML = """<html><head><title>Form</title></head><body>
+<form id="f" action="formdone.html"><input id="q" name="q" size="12"> <input name="q2" placeholder="HINT"><br>
+<input id="c" type="checkbox" name="c" value="yes"> tick<br>
+<input type="hidden" name="h" value="x&amp;y"><textarea id="t" name="t" rows="1">old</textarea>
+<select id="s" name="s"><option value="1">one</option><option value="2" selected>two</option><option>three</option></select>
+<input type="submit" name="go" value="Go!"> <input type="submit" name="other" value="Other">
+<input type="checkbox" name="d" checked disabled></form>
+<script>
+var q = document.getElementById('q'), c = document.getElementById('c');
+document.getElementById('t').value = 'a b\\nc';
+q.addEventListener('input', function () { console.log('input', q.value) });
+c.addEventListener('change', function () { console.log('change', c.checked) });
+document.getElementById('f').addEventListener('submit', function (e) {
+    console.log('submit', JSON.stringify(q.value), JSON.stringify(document.getElementById('t').value), document.getElementById('s').value);
+});
+console.log('form ready', JSON.stringify(document.getElementById('t').value), c.checked);
+</script>
+</body></html>"""
+
 
 class HostWebServer:
     """http.server on 127.0.0.1 (reachable from the guest as 10.0.2.2:<port>)."""
@@ -264,6 +285,8 @@ class HostWebServer:
         (self.root / "data.json").write_text(DATA_JSON)
         (self.root / "modern.html").write_text(MODERN_HTML)
         (self.root / "modern-extra.js").write_text(MODERN_EXTRA_JS)
+        (self.root / "form.html").write_text(FORM_HTML)
+        (self.root / "formdone.html").write_text("<html><body><p>Form sent</p></body></html>")
         # GET /sub answers "301 Location: /sub/" (http.server adds the slash)
         (self.root / "sub").mkdir(exist_ok=True)
         (self.root / "sub" / "index.html").write_text("<html><body><p>Sub page</p></body></html>")

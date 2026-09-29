@@ -112,6 +112,11 @@ browser_mouse:
 
 ; browser_key: WIN_KEY callback - typing edits the address bar
 browser_key:
+    cmp byte [browser_url_focused], 0
+    jne .url
+    call form_key                   ; a focused field on the page
+    jc .used
+.url:
     test al, al
     jz .scroll_key
     cmp al, 0x0D
@@ -633,6 +638,7 @@ browser_navigate:
     push r8
 
     mov byte [browser_pending_nav], 0
+    call form_reset                 ; no field of the old page keeps the keyboard
     mov byte [browser_page_tls], 0
     mov byte [browser_page_builtin], 1  ; until a fetched page replaces it
     mov byte [browser_page_plain], 0
@@ -805,6 +811,7 @@ browser_prepare_page:
     mov byte [dom_ready], 1
 .ready:
     call dom_build
+    call form_reset
     call css_reset
     ; @media sees our viewport in CSS pixels (twice ours)
     mov eax, [browser_vp_w]
@@ -2015,6 +2022,8 @@ browser_handle_click:
     cmp eax, ebx
     jge .chk_go_btn
     mov byte [browser_url_focused], 1
+    xor eax, eax
+    call form_focus_on              ; the page's field lets go of the keyboard
     jmp .browser_click_done
 .chk_go_btn:
     add ebx, 8
@@ -2067,6 +2076,8 @@ browser_handle_click:
     ; 5. The page: first its scripts' click handlers, then links
     call browser_page_click
     jc .body_handled                ; a handler cancelled it (or navigated)
+    call form_click
+    jc .body_handled                ; a field, check box or button took it
     mov ebx, [browser_link_count]
     test ebx, ebx
     jz .body_handled

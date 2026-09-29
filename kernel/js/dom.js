@@ -8,6 +8,8 @@ var setProtos = global.__domProtos;
 delete global.__domProtos;
 var pageScript = global.__currentScript;
 delete global.__currentScript;
+var formSubmit = global.__formSubmit;
+delete global.__formSubmit;
 var natives = setProtos();
 var nodeProto = natives[0], nativeEventProto = natives[1];
 var document = global.document;
@@ -715,8 +717,10 @@ getter(HTMLFormElement.prototype, 'elements', function () { return this.querySel
 getter(HTMLFormElement.prototype, 'action', function () { return this.getAttribute('action') || location.href });
 getter(HTMLFormElement.prototype, 'method', function () { return (this.getAttribute('method') || 'get').toLowerCase() });
 defAll(HTMLFormElement.prototype, {
-    submit: function submit() { }, reset: function reset() { },
-    requestSubmit: function requestSubmit() { this.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })) },
+    submit: function submit() { formSubmit(this) }, reset: function reset() { },
+    requestSubmit: function requestSubmit(button) {
+        if (this.dispatchEvent(new SubmitEvent('submit', { bubbles: true, cancelable: true, submitter: button || null }))) formSubmit(this, button);
+    },
     checkValidity: function checkValidity() { return true }, reportValidity: function reportValidity() { return true },
 });
 getter(HTMLAnchorElement.prototype, 'pathname', function () { return new URL(this.href || '', location.href).pathname });

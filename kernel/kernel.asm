@@ -216,6 +216,7 @@ kernel_report_boot:
 %include "web/dom.asm"
 %include "web/css.asm"
 %include "web/layout.asm"
+%include "web/forms.asm"
 %include "js/js.inc"
 %include "js/number.asm"
 %include "js/heap.asm"

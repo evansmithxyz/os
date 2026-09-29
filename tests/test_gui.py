@@ -28,6 +28,7 @@ WS_BUTTON_X = (144, 172, 200, 228)      # top bar workspace buttons 1-4, y 14
 BOOKMARK_Y = 134
 BOOKMARK_DEMO_X, BOOKMARK_AFS_X = 180, 362
 PAGE_LINE_1, PAGE_LINE_2 = 178, 200     # first two lines of a page (default margins)
+FORM_LINE_1, FORM_LINE_2, FORM_LINE_3 = 175, 192, 210  # form.html's rows of controls
 
 
 class DesktopTest(OSTestCase):
@@ -311,6 +312,30 @@ class DesktopTest(OSTestCase):
             self.vm.expect("js: link cancelled")
             time.sleep(1.5)
         self.assertNotIn("Hello from the host", self.vm.output)
+
+    def test_browser_form_fields(self):
+        """form.html (tests/test_net.py): tick, pick, type, submit with Enter."""
+        with HostWebServer() as web:
+            line = self.open_page(web, "form.html")
+            self.assertIn("HINT", line, "placeholder of an empty field")
+            self.assertIn("a b c", line, "textarea value set by the page's script")
+            self.assertIn("two", line, "the selected option")
+            self.assertIn('js: form ready "a b\\nc" false', self.vm.output)
+            self.vm.mouse_home()
+            self.vm.click(88, FORM_LINE_2)          # the check box
+            self.vm.expect("js: change true")
+            self.vm.click(280, FORM_LINE_3)         # the <select>: the next option
+            self.vm.click(100, FORM_LINE_1)         # the first text field
+            self.vm.expect("browser: field focused")
+            self.vm.type("hi there&x")
+            self.vm.expect("js: input hi there&x")
+            self.vm.key("backspace")
+            self.vm.expect(r"js: input hi there&\r?\n", regex=True)
+            self.vm.key("ret")                      # submits, with the first button
+            self.vm.expect('js: submit "hi there&" "a b\\nc" three')
+            self.vm.expect(f"browser: form -> http://10.0.2.2:{web.port}/formdone.html"
+                           "?q=hi+there%26&q2=&c=yes&h=x%26y&t=a+b%0D%0Ac&s=three&go=Go%21\n")
+            self.vm.expect("browser text: Form sent", timeout=20)
 
     def test_browser_scrolls_with_keys_and_wheel(self):
         with HostWebServer() as web:

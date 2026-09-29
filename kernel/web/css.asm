@@ -18,8 +18,9 @@
 ; selectors, +, ~, most pseudo-classes, pseudo-elements) never match.
 ; Properties: display, visibility, color, background(-color), font-weight,
 ; font-style, text-decoration, text-align, white-space, list-style(-type),
-; text-transform, margin(-left/-top/-bottom), padding(-left). Lengths are
-; halved (the 8-pixel font is half the size a style sheet expects).
+; text-transform, margin(-left/-right/-top/-bottom), padding(-left/-right).
+; Lengths are halved (the 8-pixel font is half the size a style sheet
+; expects).
 ; var(), inherit and friends are ignored.
 ; ==============================================================================
 
@@ -47,6 +48,8 @@ S_TINY                  equ 114     ; db width or height of at most 1px, or clip
 S_H0                    equ 115     ; db height: 0
 S_OVH                   equ 116     ; db overflow: hidden / clip
 S_OFF                   equ 117     ; db left or top far off screen
+S_MR                    equ 118     ; db margin-right (pixels, signed, clamped)
+S_PR                    equ 119     ; db padding-right
 
 DISP_INLINE             equ 0
 DISP_BLOCK              equ 1
@@ -91,6 +94,8 @@ P_TINY                  equ 17
 P_H0                    equ 18
 P_OVH                   equ 19
 P_OFF                   equ 20
+P_MR                    equ 21
+P_PR                    equ 22
 
 ; CSS region
 CSS_TEXT                equ CSS_ADDR                ; copied style sheets
@@ -1320,6 +1325,12 @@ css_box:
     jb .emit
     mov esi, [css_values + 12]
 .emit:
+    ; right = v1|v0
+    mov edi, eax
+    cmp ecx, 2
+    jb .right
+    mov edi, [css_values + 4]
+.right:
     cmp ebx, P_PL
     je .padding
     mov ecx, eax
@@ -1331,10 +1342,16 @@ css_box:
     mov ecx, esi
     mov eax, P_ML
     call css_emit
+    mov ecx, edi
+    mov eax, P_MR
+    call css_emit
     jmp .done
 .padding:
     mov ecx, esi
     mov eax, P_PL
+    call css_emit
+    mov ecx, edi
+    mov eax, P_PR
     call css_emit
 .done:
     pop rdi
@@ -1975,6 +1992,7 @@ css_compute:
     mov dword [r13 + S_MB], 0
     mov dword [r13 + S_POS], 0      ; S_POS, S_TINY, S_H0, S_OVH
     mov byte [r13 + S_OFF], 0
+    mov word [r13 + S_MR], 0        ; S_MR, S_PR
     ; a display:none parent hides everything inside
     cmp byte [rbx + S_DISPLAY], DISP_NONE
     je .none
@@ -2593,6 +2611,10 @@ css_apply_decl:
     je .mb
     cmp eax, P_PL
     je .pl
+    cmp eax, P_MR
+    je .mr
+    cmp eax, P_PR
+    je .pr
     cmp eax, P_POS
     jb .done
     cmp eax, P_OFF
@@ -2646,9 +2668,28 @@ css_apply_decl:
     jmp .done
 .pl:
     mov [r13 + S_PL], cx
+    jmp .done
+.mr:
+    call .clamp
+    mov [r13 + S_MR], cl
+    jmp .done
+.pr:
+    call .clamp
+    mov [r13 + S_PR], cl
 .done:
     pop rcx
     pop rax
+    ret
+; .clamp: ECX = pixels -> -128 .. 127
+.clamp:
+    cmp ecx, 127
+    jle .clamp_low
+    mov ecx, 127
+.clamp_low:
+    cmp ecx, -128
+    jge .clamp_ret
+    mov ecx, -128
+.clamp_ret:
     ret
 
 ; ==============================================================================
@@ -2917,6 +2958,10 @@ css_props:
     CPROP "padding", K_BOX, P_PL
     CPROP "padding-left", K_LENGTH, P_PL
     CPROP "padding-inline-start", K_LENGTH, P_PL
+    CPROP "margin-right", K_LENGTH, P_MR
+    CPROP "margin-inline-end", K_LENGTH, P_MR
+    CPROP "padding-right", K_LENGTH, P_PR
+    CPROP "padding-inline-end", K_LENGTH, P_PR
     CPROP "position", K_KEYWORD, P_POS
     CPROP "width", K_SIZE, P_TINY
     CPROP "height", K_SIZE, P_H0
