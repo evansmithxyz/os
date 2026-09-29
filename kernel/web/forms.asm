@@ -11,14 +11,15 @@
 ;                radio button, show the next <select> option, press a button
 ;   form_key     typing into the focused field; Enter submits its form, Tab
 ;                moves to the next field, Esc leaves it
-;   form_submit  the form's fields as name=value&... after its action URL,
-;                then the browser goes there (GET; POST is not supported yet)
+;   form_submit  the form's fields as name=value&... after its action URL
+;                (GET), or as the body the browser POSTs there
 ; ==============================================================================
 
 [bits 64]
 
 FORM_MAX_FIELDS         equ 64
 FORM_VALUE_MAX          equ 1000
+FORM_QUERY_MAX          equ 16384
 
 ; field entry
 FE_NODE                 equ 0       ; dd the control
@@ -53,8 +54,11 @@ section .bss
 alignb 16
 form_fields:            resb FORM_MAX_FIELDS * FORM_ENTRY_SIZE
 form_url:               resb BROWSER_URL_MAX
-form_url_len:           resd 1
+form_query:             resb FORM_QUERY_MAX     ; name=value&... (a POST's body)
+form_query_len:         resd 1
 form_first:             resb 1      ; building the query: no '&' yet
+form_post:              resb 1      ; form_build_url: the form is method=post
+form_post_pending:      resb 1      ; the next navigation POSTs form_query
 
 section .rodata
 form_str_type:          db "type", 0
@@ -71,10 +75,12 @@ form_str_submit_event:  db "submit", 0
 form_str_on:            db "on", 0
 form_str_button:        db "button", 0
 form_str_reset:         db "reset", 0
-form_str_post_status:   db "Forms that send POST are not supported yet", 0
+form_type_urlencoded:   db "application/x-www-form-urlencoded", 0
+form_method_post:       db "POST", 0
 klog_form_submit:       db "browser: form -> ", 0
+klog_form_body:         db "browser: form body ", 0
 klog_form_focus:        db "browser: field focused ", 0
-klog_form_post:         db "browser: form POST not supported", 0
+klog_form_post:         db "browser: form POST -> ", 0
 ; input types, then their kinds
 form_types:
     db "hidden", 0, FK_HIDDEN
@@ -667,6 +673,28 @@ form_disabled:
     pop rcx
     ret
 
+; ------------------------------------------------------------------------------
+; form_take_post: (browser_navigate) a form asked for a POST -> the request
+; carries form_query as its body (http_req_*), until browser_fetch_http
+; has its answer
+; ------------------------------------------------------------------------------
+form_take_post:
+    cmp byte [form_post_pending], 0
+    je .ret
+    mov byte [form_post_pending], 0
+    push rax
+    lea rax, [form_method_post]
+    mov [http_req_method], rax
+    lea rax, [form_query]
+    mov [http_req_body], rax
+    mov eax, [form_query_len]
+    mov [http_req_body_len], eax
+    lea rax, [form_type_urlencoded]
+    mov [http_req_type], rax
+    pop rax
+.ret:
+    ret
+
 ; form_event: EAX = control, RSI = event type -> the page's handlers ran; a
 ; navigation they asked for happens
 form_event:
@@ -1007,7 +1035,8 @@ form_submit:
     jmp .done
 .ours:
     call form_build_url
-    jc .post
+    mov al, [form_post]
+    mov [form_post_pending], al     ; browser_navigate sends the body
     lea rsi, [form_url]
     lea rdi, [browser_url_buf]
     mov ecx, BROWSER_URL_MAX
@@ -1015,10 +1044,6 @@ form_submit:
     xor eax, eax
     call form_focus_on
     call browser_navigate
-    jmp .done
-.post:
-    lea rsi, [form_str_post_status]
-    call browser_show_status
 .done:
     pop rdi
     pop rsi
@@ -1028,10 +1053,11 @@ form_submit:
 
 ; ------------------------------------------------------------------------------
 ; form_build_url: EAX = <form>, EDX = the button that sent it (0: its first
-; submit button) -> form_url = its action URL (the page if it has none) with
-; the form's fields as the query: name=value&... of every named, enabled
-; control (check boxes and radio buttons only when ticked, only the button
-; that sent it). CF=1 for method="post", which is not supported yet.
+; submit button) -> form_query = the form's fields: name=value&... of every
+; named, enabled control (check boxes and radio buttons only when ticked,
+; only the button that sent it); form_url = its action URL (the page if it
+; has none) with them as the query, or for method="post" (form_post = 1)
+; without them: they are the body
 ; ------------------------------------------------------------------------------
 form_build_url:
     push rax
@@ -1044,7 +1070,7 @@ form_build_url:
     push r9
     mov r8d, eax                    ; R8 = the form
     mov r9d, edx                    ; R9 = the submitter
-    ; method="post": not yet
+    mov byte [form_post], 0
     lea rdi, [form_str_method]
     call dom_attr
     jc .get
@@ -1052,10 +1078,7 @@ form_build_url:
     lea rdi, [form_str_post]
     call form_attr_is
     jne .get
-    lea rsi, [klog_form_post]
-    call klog
-    stc
-    jmp .out
+    mov byte [form_post], 1
 .get:
     ; the default button, if none sent it
     test r9d, r9d
@@ -1099,9 +1122,8 @@ form_build_url:
     inc ecx
     jmp .cut
 .cut_here:
-    mov byte [rdi + rcx], '?'
-    inc ecx
-    mov [form_url_len], ecx
+    mov byte [rdi + rcx], 0
+    mov dword [form_query_len], 0
     mov byte [form_first], 1
     ; every named control in the form, in order
     mov eax, r8d
@@ -1135,21 +1157,48 @@ form_build_url:
     call form_add_field
     jmp .field
 .built:
-    ; no fields: no '?'
-    mov ecx, [form_url_len]
+    cmp byte [form_post], 0
+    jne .post
+    ; GET: "?" and the fields after the URL (none: no '?')
+    cmp dword [form_query_len], 0
+    je .log
     lea rdi, [form_url]
-    cmp byte [form_first], 0
-    je .terminate
-    dec ecx
-.terminate:
+    mov rsi, rdi
+    call strlen
+    mov ecx, eax
+    mov byte [rdi + rcx], '?'
+    inc ecx
+    lea rsi, [form_query]
+    mov edx, [form_query_len]
+.append:
+    test edx, edx
+    jz .appended
     cmp ecx, BROWSER_URL_MAX - 1
-    jbe .terminate_at
-    mov ecx, BROWSER_URL_MAX - 1
-.terminate_at:
+    jae .appended
+    mov al, [rsi]
+    mov [rdi + rcx], al
+    inc rsi
+    inc ecx
+    dec edx
+    jmp .append
+.appended:
     mov byte [rdi + rcx], 0
+.log:
     lea rsi, [klog_form_submit]     ; "[klog] browser: form -> URL"
+    lea rdi, [form_url]
     call klog2
-    clc
+    jmp .out
+.post:
+    ; "[klog] browser: form POST -> URL <body>"
+    lea rdi, [form_query]
+    mov ecx, [form_query_len]
+    mov byte [rdi + rcx], 0
+    lea rsi, [klog_form_post]
+    lea rdi, [form_url]
+    call klog2
+    lea rsi, [klog_form_body]
+    lea rdi, [form_query]
+    call klog2
 .out:
     pop r9
     pop r8
@@ -1162,7 +1211,7 @@ form_build_url:
     ret
 
 ; form_add_field: EAX = control, ECX = its kind -> "&name=value" added to
-; form_url (nothing if it has no name)
+; form_query (nothing if it has no name)
 form_add_field:
     push rax
     push rbx
@@ -1231,22 +1280,22 @@ form_add_field:
     pop rax
     ret
 
-; form_url_byte: AL -> appended to form_url (if it fits)
+; form_url_byte: AL -> appended to form_query (if it fits)
 form_url_byte:
     push rcx
     push rdi
-    mov ecx, [form_url_len]
-    cmp ecx, BROWSER_URL_MAX - 1
+    mov ecx, [form_query_len]
+    cmp ecx, FORM_QUERY_MAX - 1
     jae .full
-    lea rdi, [form_url]
+    lea rdi, [form_query]
     mov [rdi + rcx], al
-    inc dword [form_url_len]
+    inc dword [form_query_len]
 .full:
     pop rdi
     pop rcx
     ret
 
-; form_url_encode: RSI/ECX = text -> appended to form_url as
+; form_url_encode: RSI/ECX = text -> appended to form_query as
 ; application/x-www-form-urlencoded (space = '+', newline = %0D%0A)
 form_url_encode:
     push rax

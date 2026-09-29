@@ -262,6 +262,34 @@ console.log('form ready', JSON.stringify(document.getElementById('t').value), c.
 </script>
 </body></html>"""
 
+# Cookies (kernel/net/cookie.asm) and POST: GET /setcookie answers with this page
+# and Set-Cookie headers; /echo answers with what it was sent (_QuietHandler)
+COOKIE_HTML = """<html><body><p>COOKIES</p><script>
+console.log('cookie', document.cookie);
+document.cookie = 'c=3; path=/';
+document.cookie = 'd=4';
+document.cookie = 'd=; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+document.cookie = 'h=5; HttpOnly';
+console.log('after', document.cookie);
+fetch('/echo').then(r => r.text()).then(t => {
+    console.log('fetch', t);
+    return fetch('/echo', {method: 'post', body: JSON.stringify({k: 1}), headers: {'Content-Type': 'application/json'}});
+}).then(r => r.text()).then(t => {
+    console.log('post', t);
+    var x = new XMLHttpRequest();
+    x.open('POST', '/echo', false);
+    x.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+    x.send('q=1&r=2');
+    console.log('xhr', x.status, x.responseText);
+    location.href = '/postform.html';
+});
+</script></body></html>"""
+
+# A form that POSTs itself when the page loads
+POST_FORM_HTML = """<html><body><form id="f" method="post" action="/echo">
+<input name="x" value="1 2"><input name="y" value="&amp;"><input type="submit" name="s" value="Send"></form>
+<script>document.getElementById('f').requestSubmit()</script></body></html>"""
+
 
 class HostWebServer:
     """http.server on 127.0.0.1 (reachable from the guest as 10.0.2.2:<port>)."""
@@ -287,6 +315,7 @@ class HostWebServer:
         (self.root / "modern-extra.js").write_text(MODERN_EXTRA_JS)
         (self.root / "form.html").write_text(FORM_HTML)
         (self.root / "formdone.html").write_text("<html><body><p>Form sent</p></body></html>")
+        (self.root / "postform.html").write_text(POST_FORM_HTML)
         # GET /sub answers "301 Location: /sub/" (http.server adds the slash)
         (self.root / "sub").mkdir(exist_ok=True)
         (self.root / "sub" / "index.html").write_text("<html><body><p>Sub page</p></body></html>")
@@ -313,7 +342,42 @@ class _QuietHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def _send_text(self, text: str, headers=()):
+        body = text.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        for name, value in headers:
+            self.send_header(name, value)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _echo(self, body: str = ""):
+        """/echo: what the browser sent - method, Content-Type, cookies, body."""
+        self._send_text(f"{self.command} {self.headers.get('Content-Type', '-')} "
+                        f"[{self.headers.get('Cookie', '')}] {body}")
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length).decode(errors="replace")
+        if self.path.startswith("/echo"):
+            return self._echo(body)
+        self.send_error(404)
+
     def do_GET(self):
+        if self.path.startswith("/echo"):
+            return self._echo()
+        if self.path.startswith("/setcookie"):
+            body = COOKIE_HTML.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            for cookie in ("a=1; Path=/", "b=2; HttpOnly", "gone=x; Max-Age=0", "sub=3; Path=/sub",
+                           "sec=4; Secure", "far=5; Domain=example.com"):
+                self.send_header("Set-Cookie", cookie)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if not self.path.startswith("/enc/"):
             return super().do_GET()
         kind = self.path[5:]

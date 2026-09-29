@@ -337,6 +337,31 @@ class DesktopTest(OSTestCase):
                            "?q=hi+there%26&q2=&c=yes&h=x%26y&t=a+b%0D%0Ac&s=three&go=Go%21\n")
             self.vm.expect("browser text: Form sent", timeout=20)
 
+    def test_browser_cookies_and_post(self):
+        """/setcookie and /echo (tests/test_net.py): Set-Cookie, document.cookie,
+        cookies on later requests, fetch and XMLHttpRequest POSTs, a form's POST."""
+        with HostWebServer() as web:
+            self.open_page(web, "setcookie")
+            self.vm.expect("js: xhr 200", timeout=20)
+            out = self.vm.output
+            self.assertRegex(out, r"js: cookie a=1\r?\n", "HttpOnly, other paths, Secure: not for scripts")
+            self.assertRegex(out, r"js: after a=1; c=3\r?\n", "d was set and deleted, h (HttpOnly) refused")
+            for expected in (
+                "[klog] cookie: set a",
+                "[klog] cookie: deleted d",
+                "js: fetch GET - [a=1; b=2; c=3] ",
+                'js: post POST application/json [a=1; b=2; c=3] {"k":1}',
+                "js: xhr 200 POST application/x-www-form-urlencoded [a=1; b=2; c=3] q=1&r=2",
+            ):
+                self.assertIn(expected, out)
+            for never in ("sub=3", "sec=4", "far=5", "gone", "h=5"):
+                self.assertNotIn(never, out[out.index("js: fetch"):])
+            # then the page goes to a form with method="post" (sent by its script)
+            self.vm.expect(f"browser: form POST -> http://10.0.2.2:{web.port}/echo", timeout=20)
+            self.vm.expect("browser: form body x=1+2&y=%26&s=Send")
+            self.vm.expect("browser text: POST application/x-www-form-urlencoded [a=1; b=2; c=3] "
+                           "x=1+2&y=%26&s=Send", timeout=20)
+
     def test_browser_scrolls_with_keys_and_wheel(self):
         with HostWebServer() as web:
             self.open_page(web, "features.html")

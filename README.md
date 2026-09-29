@@ -157,8 +157,16 @@ below):
    window width or a field's value changes; scrolling just repaints.
 4. `forms.asm` keeps what you type into a field (a page's scripts see it as
    `element.value`, and get `input`, `change` and `submit` events) and
-   sends a form as a GET request: `action?name=value&...`, the way a
-   browser encodes it.
+   sends a form the way a browser encodes it: `action?name=value&...` for
+   GET, or the same text as the body of a `method="post"` form
+   (`application/x-www-form-urlencoded`).
+
+The browser keeps cookies (`net/cookie.asm`) until the machine is turned
+off: `Set-Cookie` from any response (pages, style sheets, scripts, `fetch`)
+is stored, and every request to a matching domain and path carries them
+(Secure ones only over HTTPS). Scripts read and set them with
+`document.cookie`, without seeing HttpOnly ones. `Max-Age=0` or a past
+`Expires` deletes one.
 
 Everything is drawn with the 8x16 font, so there are no font sizes, and CSS
 lengths are halved to match its 8-pixel width. Not supported: `var()`, attribute
@@ -372,9 +380,11 @@ Async: `Promise` (`then`, `catch`, `finally`, `resolve`, `reject`, `all`,
 `allSettled`, `race`, `any`; "Uncaught (in promise)" for rejections nobody
 handles), `async` functions, arrows and methods with `await`,
 `queueMicrotask`, `setTimeout` / `setInterval` (and their `clear`s),
-`requestAnimationFrame`, `performance.now()`, `fetch` (a `Response` with
+`requestAnimationFrame`, `performance.now()`, `fetch` (any `method`, a
+string `body` and its `Content-Type` in `headers`; a `Response` with
 `status`, `ok`, `headers.get()`, `text()`, `json()`) and
-`XMLHttpRequest` (asynchronous or not, `onload` and friends,
+`XMLHttpRequest` (any method, `send(body)`, `setRequestHeader` for the
+`Content-Type`; asynchronous or not, `onload` and friends,
 `addEventListener`, `responseType = 'json'`).
 
 And: `Symbol` (with `Symbol.for`, `description` and the well-known
@@ -392,7 +402,8 @@ Not yet: modules (`import` / `export`; `import()` gives a rejected
 promise), async generators, real `BigInt` (`10n` is read as the number 10
 so scripts that use it still load), callable proxies; in the browser,
 layout information, canvas drawing, workers, WebSockets, keeping
-`localStorage` across pages, forms that POST and cookies. Strings are
+`localStorage` across pages, file uploads and `multipart/form-data`,
+request headers other than `Content-Type`. Strings are
 UTF-8 bytes, so `length` and `charCodeAt` count bytes. A response of more
 than 1 MB is cut off.
 
@@ -417,7 +428,8 @@ kernel/
   console/console.asm   output routing (VGA / GUI terminal / serial) and the key queue
   fs/afs.asm            AntigravityFS
   net/                  eth (ARP), ipv4 (ICMP), udp (DNS), tcp (HTTP), url,
-                        tls (TLS 1.3 client), x509 (certificates and chains)
+                        tls (TLS 1.3 client), x509 (certificates and chains),
+                        inflate (gzip), cookie (the browser's cookie jar)
   crypto/               sha256 + HMAC, sha512/384, chacha20poly1305, x25519,
                         bignum (Montgomery), rsa, ecc (ECDSA P-256/P-384), random
   data/roots.der        trusted root certificates (tools/mkroots.py)

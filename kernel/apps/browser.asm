@@ -639,6 +639,7 @@ browser_navigate:
 
     mov byte [browser_pending_nav], 0
     call form_reset                 ; no field of the old page keeps the keyboard
+    call form_take_post             ; a form's POST: its body goes with the request
     mov byte [browser_page_tls], 0
     mov byte [browser_page_builtin], 1  ; until a fetched page replaces it
     mov byte [browser_page_plain], 0
@@ -745,6 +746,7 @@ browser_navigate:
     lea rdx, [STR_STATUS_404]
     call browser_set_page
 .done:
+    call http_req_clear             ; (not a POST, or it is done)
     call browser_prepare_page       ; DOM, style sheets, styles
     call jsd_page_load              ; its scripts
     mov byte [gui_dirty], 1
@@ -1120,6 +1122,7 @@ browser_fetch_http:
     test rax, rax
     jnz .tls_fail
 .fetched:
+    call http_req_clear             ; a redirect is followed with a GET
     cmp dword [http_resp_len], 0
     je .fail
 

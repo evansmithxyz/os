@@ -205,6 +205,7 @@ kernel_report_boot:
 %include "net/url.asm"
 %include "net/tls.asm"
 %include "net/inflate.asm"
+%include "net/cookie.asm"
 %include "net/x509.asm"
 %include "gfx/gfx.asm"
 %include "gui/wm.asm"

@@ -191,7 +191,7 @@ JSDPROP atom_d_body, jsd_g_body, 0
 JSDPROP atom_d_head, jsd_g_head, 0
 JSDPROP atom_d_documentElement, jsd_g_document_element, 0
 JSDPROP atom_d_readyState, jsd_g_ready_state, 0
-JSDPROP atom_d_cookie, jsd_g_cookie, jsd_s_ignore
+JSDPROP atom_d_cookie, jsd_g_cookie, jsd_s_cookie
 JSDPROP atom_d_URL, jsd_g_url, 0
 JSDPROP atom_d_location, jsd_g_location, jsd_s_location
     dq 0
@@ -2222,9 +2222,30 @@ jsd_g_ready_state:
 .str:
     jmp jsb_cstr
 
+; document.cookie: the page's cookies (cookie.asm), not the HttpOnly ones
 jsd_g_cookie:
-    mov rax, [atom_empty]
+    push rcx
+    push rsi
+    call cookie_page_get
+    call jsstr_new
+    pop rsi
+    pop rcx
     jmp jsb_box_string
+
+; document.cookie = "name=value; path=/": one cookie set (or deleted)
+jsd_s_cookie:
+    push rax
+    push rcx
+    push rsi
+    mov rax, rcx
+    call js_to_string
+    lea rsi, [rax + JSTR_DATA]
+    mov ecx, [rax + JSTR_LEN]
+    call cookie_page_set
+    pop rsi
+    pop rcx
+    pop rax
+    ret
 
 jsd_g_url:
     lea rsi, [browser_page_url]
@@ -3231,6 +3252,7 @@ jsd_navigate:
     mov ecx, BROWSER_URL_MAX
     call strlcpy
     mov byte [jsd_nav_pending], 1
+    mov byte [form_post_pending], 0 ; (after form.submit(): this one wins)
     push rsi
     lea rsi, [jsd_klog_nav]
     lea rdi, [browser_url_buf]
@@ -4400,7 +4422,8 @@ jsd_form_submit:
 .build:
     mov eax, ebx
     call form_build_url
-    jc .done                        ; (POST)
+    mov al, [form_post]
+    mov [form_post_pending], al     ; (a POST: its body goes with it)
     lea rsi, [form_url]
     lea rdi, [browser_url_buf]
     mov ecx, BROWSER_URL_MAX
