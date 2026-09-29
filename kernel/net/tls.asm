@@ -1619,10 +1619,24 @@ tls_https_get:
     mov r8, r13
     call http_build_request
     lea rsi, [http_req_buf]
+    mov rdx, rcx                    ; RDX = bytes left (a POST may need records)
+.request_record:
+    mov rcx, rdx
+    cmp rcx, TLS_OUT_MAX - 64
+    jbe .last_record
+    mov ecx, TLS_OUT_MAX - 64
+.last_record:
     mov al, TLS_CT_APPDATA
     call tls_send_record
+    add rsi, rcx
+    sub rdx, rcx
+    jnz .request_record
     call tls_read_response
     call http_decode_body           ; (a gzip body: decompressed)
+    cmp byte [http_quiet], 0
+    je .no_cookies
+    call cookie_response            ; the browser keeps its Set-Cookies
+.no_cookies:
     mov eax, [http_resp_len]
     lea rsi, [klog_tls_bytes]
     call klog_dec

@@ -13,8 +13,8 @@ table { display: table }
 tr { display: table-row }
 td, th { display: table-cell }
 
-head, script, style, title, meta, link, base, template, select, option,
-textarea, svg, iframe, object, embed, math, canvas, video, audio, datalist,
+head, script, style, title, meta, link, base, template, option,
+svg, iframe, object, embed, math, canvas, video, audio, datalist,
 noembed, noframes, param, area, map, track, source, dialog, frameset,
 frame { display: none }
 
@@ -39,3 +39,4 @@ nobr { white-space: nowrap }
 center, th, caption { text-align: center }
 table { text-align: left }  /* old pages: <center> does not reach into tables */
 hr { margin-top: .5em; margin-bottom: .5em; color: #888 }
+button { background-color: #efefef }  /* drawn as a box; transparent: none */

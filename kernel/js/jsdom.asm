@@ -118,8 +118,8 @@ JSDNATIVE jsd_node_proto, "hasChildNodes", jsd_has_child_nodes, 0
 JSDNATIVE jsd_node_proto, "addEventListener", jsd_add_listener, 2
 JSDNATIVE jsd_node_proto, "removeEventListener", jsd_remove_listener, 2
 JSDNATIVE jsd_node_proto, "click", jsd_click, 0
-JSDNATIVE jsd_node_proto, "focus", jsd_nothing, 0
-JSDNATIVE jsd_node_proto, "blur", jsd_nothing, 0
+JSDNATIVE jsd_node_proto, "focus", jsd_focus, 0
+JSDNATIVE jsd_node_proto, "blur", jsd_blur, 0
 JSDNATIVE jsd_classlist_proto, "add", jsd_classlist_add, 1
 JSDNATIVE jsd_classlist_proto, "remove", jsd_classlist_remove, 1
 JSDNATIVE jsd_classlist_proto, "toggle", jsd_classlist_toggle, 1
@@ -141,6 +141,7 @@ JSDNATIVE js_global, "addEventListener", jsd_add_listener, 2
 JSDNATIVE js_global, "removeEventListener", jsd_remove_listener, 2
 JSDNATIVE js_global, "__domProtos", jsd_set_protos, 6
 JSDNATIVE js_global, "__currentScript", jsd_current_script, 0
+JSDNATIVE js_global, "__formSubmit", jsd_form_submit, 2
 JSDNATIVE js_global, "dispatchEvent", jsd_dispatch_event, 1
     dq 0
 
@@ -166,7 +167,7 @@ JSDPROP atom_d_rel, jsd_g_attr, jsd_s_attr
 JSDPROP atom_d_target, jsd_g_attr, jsd_s_attr
 JSDPROP atom_d_title, jsd_g_title, jsd_s_title
 JSDPROP atom_d_value, jsd_g_value, jsd_s_value
-JSDPROP atom_d_checked, jsd_g_bool_attr, jsd_s_bool_attr
+JSDPROP atom_d_checked, jsd_g_checked, jsd_s_checked
 JSDPROP atom_d_disabled, jsd_g_bool_attr, jsd_s_bool_attr
 JSDPROP atom_d_hidden, jsd_g_bool_attr, jsd_s_bool_attr
 JSDPROP atom_d_parentNode, jsd_g_parent_node, 0
@@ -190,7 +191,7 @@ JSDPROP atom_d_body, jsd_g_body, 0
 JSDPROP atom_d_head, jsd_g_head, 0
 JSDPROP atom_d_documentElement, jsd_g_document_element, 0
 JSDPROP atom_d_readyState, jsd_g_ready_state, 0
-JSDPROP atom_d_cookie, jsd_g_cookie, jsd_s_ignore
+JSDPROP atom_d_cookie, jsd_g_cookie, jsd_s_cookie
 JSDPROP atom_d_URL, jsd_g_url, 0
 JSDPROP atom_d_location, jsd_g_location, jsd_s_location
     dq 0
@@ -237,6 +238,7 @@ jsmsg_not_child:        db "Failed to execute '%': the node is not a child of th
 jsmsg_illegal:          db "Illegal invocation", 0
 jsmsg_bad_selector:     db "'%' is not a valid selector", 0
 jsd_name_append:        db "appendChild", 0
+jsd_name_submit:        db "submit", 0
 jsd_name_insert:        db "insertBefore", 0
 jsd_name_remove:        db "removeChild", 0
 jsd_name_replace:       db "replaceChild", 0
@@ -1896,8 +1898,34 @@ jsd_g_title:
     jmp jsb_cstr
 
 jsd_g_value:
-    cmp byte [rbx + N_TAG], TAGID_TEXTAREA
-    je jsd_g_text_content
+    ; a form control: what the user typed (forms.asm)
+    push rcx
+    push rdx
+    push rsi
+    call form_kind
+    test ecx, ecx
+    jz .attr
+    cmp ecx, FK_SELECT
+    jne .control
+    call form_option
+    xor ecx, ecx
+    test edx, edx
+    jz .string
+    mov eax, edx
+    call form_option_value
+    jmp .string
+.control:
+    call form_value
+.string:
+    call jsstr_new
+    pop rsi
+    pop rdx
+    pop rcx
+    jmp jsb_box_string
+.attr:
+    pop rsi
+    pop rdx
+    pop rcx
     lea rsi, [jsd_str_value]
     call jsd_get_attr
     jnc .ret
@@ -1905,6 +1933,21 @@ jsd_g_value:
     jmp jsb_box_string
 .ret:
     ret
+
+; checked: ticked by the user or a script (forms.asm), else checked=""
+jsd_g_checked:
+    push rcx
+    call form_kind
+    cmp ecx, FK_CHECKBOX
+    je .control
+    cmp ecx, FK_RADIO
+    pop rcx
+    jne jsd_g_bool_attr
+    push rcx
+.control:
+    pop rcx
+    call form_checked
+    jmp js_bool
 
 jsd_g_bool_attr:
     lea rsi, [rdx + JSTR_DATA]
@@ -2179,9 +2222,30 @@ jsd_g_ready_state:
 .str:
     jmp jsb_cstr
 
+; document.cookie: the page's cookies (cookie.asm), not the HttpOnly ones
 jsd_g_cookie:
-    mov rax, [atom_empty]
+    push rcx
+    push rsi
+    call cookie_page_get
+    call jsstr_new
+    pop rsi
+    pop rcx
     jmp jsb_box_string
+
+; document.cookie = "name=value; path=/": one cookie set (or deleted)
+jsd_s_cookie:
+    push rax
+    push rcx
+    push rsi
+    mov rax, rcx
+    call js_to_string
+    lea rsi, [rax + JSTR_DATA]
+    mov ecx, [rax + JSTR_LEN]
+    call cookie_page_set
+    pop rsi
+    pop rcx
+    pop rax
+    ret
 
 jsd_g_url:
     lea rsi, [browser_page_url]
@@ -2251,10 +2315,73 @@ jsd_s_title:
     ret
 
 jsd_s_value:
+    ; a field you type into keeps it like typed text (forms.asm)
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    mov rdx, rcx                    ; RDX = the value
+    call form_kind
+    call form_is_text
+    jne .attr
+    push rax
+    mov rax, rdx
+    call js_to_string
+    lea rsi, [rax + JSTR_DATA]
+    mov ecx, [rax + JSTR_LEN]
+    pop rax
+    call form_set_value
+    jc .attr
+    mov byte [jsd_dirty], 1
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+.attr:
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
     cmp byte [rbx + N_TAG], TAGID_TEXTAREA
     je jsd_set_text
     lea rsi, [jsd_str_value]
     jmp jsd_set_attr_value
+
+jsd_s_checked:
+    push rcx
+    push rdx
+    push rcx
+    call form_kind
+    mov edx, ecx                    ; EDX = kind
+    pop rcx                         ; RCX = the value
+    cmp edx, FK_CHECKBOX
+    je .control
+    cmp edx, FK_RADIO
+    je .control
+    pop rdx
+    pop rcx
+    jmp jsd_s_bool_attr
+.control:
+    push rax
+    mov rax, rcx
+    call js_truthy
+    pop rax
+    setc cl                         ; CL = ticked
+    cmp edx, FK_RADIO
+    jne .set
+    test cl, cl
+    jz .set                         ; unticking a radio button touches no other
+    call form_radio_pick
+    jmp .done
+.set:
+    mov dl, cl
+    call form_set_checked
+.done:
+    mov byte [jsd_dirty], 1
+    pop rdx
+    pop rcx
+    ret
 
 jsd_s_bool_attr:
     lea rsi, [rdx + JSTR_DATA]
@@ -3125,6 +3252,7 @@ jsd_navigate:
     mov ecx, BROWSER_URL_MAX
     call strlcpy
     mov byte [jsd_nav_pending], 1
+    mov byte [form_post_pending], 0 ; (after form.submit(): this one wins)
     push rsi
     lea rsi, [jsd_klog_nav]
     lea rdi, [browser_url_buf]
@@ -4245,6 +4373,71 @@ jsd_nothing:
     mov rax, JS_UNDEF
     ret
 
+; focus(): a field you type into gets the keyboard (forms.asm)
+jsd_focus:
+    push rbx
+    push rcx
+    call jsd_this_node
+    call form_kind
+    call form_is_text
+    jne .done
+    call form_focus_on
+.done:
+    mov rax, JS_UNDEF
+    pop rcx
+    pop rbx
+    ret
+
+; blur(): the focused field lets go of it
+jsd_blur:
+    push rbx
+    call jsd_this_node
+    cmp eax, [form_focus]
+    jne .done
+    xor eax, eax
+    call form_focus_on
+.done:
+    mov rax, JS_UNDEF
+    pop rbx
+    ret
+
+; __formSubmit(form, submitter): form.submit() (dom.js): no submit event;
+; the browser goes to the form's URL once the script is done
+jsd_form_submit:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    xor eax, eax
+    lea rsi, [jsd_name_submit]
+    call jsd_arg_node
+    mov ebx, eax                    ; EBX = the form
+    mov eax, 1
+    call jsb_arg
+    call jsd_node_of
+    mov edx, eax                    ; EDX = the button, 0 = none
+    jnc .build
+    xor edx, edx
+.build:
+    mov eax, ebx
+    call form_build_url
+    mov al, [form_post]
+    mov [form_post_pending], al     ; (a POST: its body goes with it)
+    lea rsi, [form_url]
+    lea rdi, [browser_url_buf]
+    mov ecx, BROWSER_URL_MAX
+    call strlcpy
+    mov byte [jsd_nav_pending], 1
+.done:
+    mov rax, JS_UNDEF
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
 ; click(): a click event on it
 jsd_click:
     push rbx
@@ -5062,6 +5255,24 @@ jsd_page_click:
     pop rsi
     pop rbx
     pop rax
+    ret
+
+; ------------------------------------------------------------------------------
+; jsd_page_event: EAX = element, RSI = event type (NUL-terminated) -> the
+; event for the page's scripts (if it has any); CF=1 if a handler prevented
+; the default action
+; ------------------------------------------------------------------------------
+jsd_page_event:
+    call jsd_live
+    jnc .ret
+    call jsd_enter
+    call jsd_fire
+    pushf
+    call jsev_drain
+    call jsd_leave
+    call jsd_after
+    popf
+.ret:
     ret
 
 ; ------------------------------------------------------------------------------

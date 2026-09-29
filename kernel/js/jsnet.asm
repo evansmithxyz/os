@@ -29,6 +29,10 @@ jsn_atom_async:         resq 1
 jsn_atom_headers:       resq 1
 jsn_atom_listeners:     resq 1
 jsn_atom_aborted:       resq 1
+jsn_atom_req_body:      resq 1
+jsn_atom_req_type:      resq 1
+jsn_method_buf:         resb 16         ; the request's method, upper case
+jsn_type_buf:           resb 128        ; its body's Content-Type
 
 section .rodata
 jsn_ctors:
@@ -46,7 +50,7 @@ JSNATIVE jsn_headers_proto, "has", jsn_headers_has, 1
 JSNATIVE jsn_xhr_proto, "open", jsn_xhr_open, 2
 JSNATIVE jsn_xhr_proto, "send", jsn_xhr_send, 0
 JSNATIVE jsn_xhr_proto, "abort", jsn_xhr_abort, 0
-JSNATIVE jsn_xhr_proto, "setRequestHeader", jsn_nothing, 2
+JSNATIVE jsn_xhr_proto, "setRequestHeader", jsn_xhr_set_header, 2
 JSNATIVE jsn_xhr_proto, "getResponseHeader", jsn_xhr_header, 1
 JSNATIVE jsn_xhr_proto, "getAllResponseHeaders", jsn_xhr_all_headers, 0
 JSNATIVE jsn_xhr_proto, "addEventListener", jsn_xhr_listen, 2
@@ -70,6 +74,13 @@ jsn_str_async_h:        db " async", 0
 jsn_str_headers_h:      db " headers", 0
 jsn_str_listeners_h:    db " listeners", 0
 jsn_str_aborted_h:      db " aborted", 0
+jsn_str_req_body_h:     db " reqbody", 0
+jsn_str_req_type_h:     db " reqtype", 0
+jsn_str_init_body:      db "body", 0
+jsn_str_init_headers:   db "headers", 0
+jsn_str_content_type:   db "Content-Type", 0
+jsn_str_content_type_lc: db "content-type", 0
+jsn_type_text:          db "text/plain;charset=UTF-8", 0
 jsn_str_status:         db "status", 0
 jsn_str_status_text:    db "statusText", 0
 jsn_str_headers:        db "headers", 0
@@ -97,7 +108,6 @@ jsn_on_load:            db "onload", 0
 jsn_on_error:           db "onerror", 0
 jsn_on_loadend:         db "onloadend", 0
 jsmsg_fetch_failed:     db "Failed to fetch", 0
-jsmsg_only_get:         db "only GET requests are supported yet", 0
 jsmsg_illegal_ctor:     db "Illegal constructor", 0
 
 section .text
@@ -140,6 +150,8 @@ jsn_init:
     JSN_ATOM jsn_atom_headers, jsn_str_headers_h
     JSN_ATOM jsn_atom_listeners, jsn_str_listeners_h
     JSN_ATOM jsn_atom_aborted, jsn_str_aborted_h
+    JSN_ATOM jsn_atom_req_body, jsn_str_req_body_h
+    JSN_ATOM jsn_atom_req_type, jsn_str_req_type_h
     ; XMLHttpRequest.UNSENT = 0 ... DONE = 4
     lea rbx, [jsn_states]
     xor r8d, r8d
@@ -190,16 +202,12 @@ jsn_hide:
 jsn_hidden:
     jmp js_get
 
-; jsn_nothing: setRequestHeader and the like
-jsn_nothing:
-    mov rax, JS_UNDEF
-    ret
-
 ; ==============================================================================
 ; fetch
 ; ==============================================================================
 
-; fetch(url, init) -> a promise of a Response
+; fetch(url, init) -> a promise of a Response (init: method, body, and a
+; Content-Type in headers)
 jsn_fetch:
     push rbx
     push rcx
@@ -207,32 +215,23 @@ jsn_fetch:
     push rsi
     push rdi
     push r8
+    push r9
     xor eax, eax
     call jsb_arg
     call js_to_string
     mov rbx, rax                    ; the URL
+    mov rdx, JS_UNDEF               ; RDX = init
+    cmp ecx, 2
+    jb .no_init
+    mov eax, 1
+    call jsb_arg
+    mov rdx, rax
+.no_init:
     call jsprom_new
     mov r8, rax
-    ; init.method: GET only
-    cmp ecx, 2
-    jb .get
-    mov eax, 1
-    call jsb_arg
-    mov rdx, rax
-    shr rdx, 48
-    cmp edx, JS_TAG_OBJECT
-    jne .get
-    lea rsi, [jsn_str_method]
-    call jsstr_from_cstr
-    mov rdx, rax
-    mov eax, 1
-    call jsb_arg
-    call js_get
-    call jsn_is_get
-    jnc .not_get
-.get:
-    ; the request is a task: the page goes on meanwhile
-    mov ecx, 2
+    ; the request is a task (the page goes on meanwhile):
+    ; [promise, url, method, body, content type]
+    mov ecx, 5
     call jsarr_new
     mov rsi, rax
     mov rcx, r8
@@ -241,6 +240,34 @@ jsn_fetch:
     call jsarr_push
     mov rcx, rbx
     BOX rcx, rax, JS_STR_BITS
+    mov rax, rsi
+    call jsarr_push
+    lea r9, [jsn_str_method]
+    mov rax, rdx
+    call jsn_field
+    mov rcx, rax
+    mov rax, rsi
+    call jsarr_push
+    lea r9, [jsn_str_init_body]
+    mov rax, rdx
+    call jsn_field
+    mov rcx, rax
+    mov rax, rsi
+    call jsarr_push
+    lea r9, [jsn_str_init_headers]
+    mov rax, rdx
+    call jsn_field
+    mov rdx, rax                    ; RDX = init.headers
+    lea r9, [jsn_str_content_type]
+    call jsn_field
+    mov rcx, JS_UNDEF
+    cmp rax, rcx
+    jne .have_type
+    mov rax, rdx
+    lea r9, [jsn_str_content_type_lc]
+    call jsn_field
+.have_type:
+    mov rcx, rax
     mov rax, rsi
     call jsarr_push
     mov rdx, rsi
@@ -252,24 +279,40 @@ jsn_fetch:
     mov rsi, JS_UNDEF
     call jsev_add_timer
     pop rbx
-    jmp .out
-.not_get:
-    lea rsi, [jsmsg_only_get]
-    call jsstr_from_cstr
-    mov edx, JE_TYPE
-    call js_make_error
-    mov rdx, rax
-    mov rax, r8
-    call jsprom_reject
-.out:
     mov rax, r8
     BOX rax, rcx, JS_OBJ_BITS
+    pop r9
     pop r8
     pop rdi
     pop rsi
     pop rdx
     pop rcx
     pop rbx
+    ret
+
+; jsn_field: RAX = a value, R9 = a property name -> RAX = that property if
+; the value is an object, else undefined
+jsn_field:
+    push rcx
+    push rdx
+    push rsi
+    mov rcx, rax
+    shr rcx, 48
+    cmp ecx, JS_TAG_OBJECT
+    jne .none
+    push rax
+    mov rsi, r9
+    call jsstr_from_cstr
+    mov rdx, rax
+    pop rax
+    call js_get
+    jmp .out
+.none:
+    mov rax, JS_UNDEF
+.out:
+    pop rsi
+    pop rdx
+    pop rcx
     ret
 
 ; jsn_is_get: RAX = a method (value) -> CF=1 if undefined or "GET" (any case)
@@ -297,14 +340,24 @@ jsn_is_get:
     clc
     ret
 
-; jsn_fetch_task: R10 data [promise, url] -> the GET done, the promise settled
+; jsn_fetch_task: R10 data [promise, url, method, body, type] -> the request
+; done, the promise settled
 jsn_fetch_task:
     push rdx
     push rsi
     mov rsi, [r10 + JFN_DATA]
     mov rsi, [rsi + JARR_ELEMS]
+    push r8
+    push r9
+    push r10
+    mov r8, [rsi + 16]
+    mov r9, [rsi + 24]
+    mov r10, [rsi + 32]
     mov eax, [rsi + 8]
     call jsn_request
+    pop r10
+    pop r9
+    pop r8
     jc .failed
     mov rdx, rax
     mov eax, [rsi]
@@ -327,8 +380,10 @@ jsn_fetch_task:
     ret
 
 ; ------------------------------------------------------------------------------
-; jsn_request: RAX = URL (heap string) -> RAX = a Response for its GET; CF=1
-; if nothing came back
+; jsn_request: RAX = URL (heap string), R8 = method, R9 = body, R10 = the
+; body's Content-Type (values; undefined: GET, no body, text/plain) ->
+; RAX = a Response; CF=1 if nothing came back. Cookies go along and come
+; back as for pages (cookie.asm).
 ; ------------------------------------------------------------------------------
 jsn_request:
     push rcx
@@ -337,19 +392,103 @@ jsn_request:
     push rdi
     push r8
     push r9
+    push r11
+    mov r11, rax                    ; R11 = the URL
+    mov rax, r8
+    call jsn_is_get
+    jc .fetch
+    ; the method, upper case
+    mov rax, r8
+    call js_to_string
+    lea rsi, [rax + JSTR_DATA]
+    mov ecx, [rax + JSTR_LEN]
+    cmp ecx, 15
+    jbe .method_len
+    mov ecx, 15
+.method_len:
+    lea rdi, [jsn_method_buf]
+    mov [http_req_method], rdi
+.method_byte:
+    test ecx, ecx
+    jz .method_done
+    lodsb
+    cmp al, 'a'
+    jb .method_put
+    cmp al, 'z'
+    ja .method_put
+    sub al, 32
+.method_put:
+    stosb
+    dec ecx
+    jmp .method_byte
+.method_done:
+    mov byte [rdi], 0
+    ; the body's type
+    mov rax, r10
+    call jsn_is_nothing
+    jc .body
+    call js_to_string
+    lea rsi, [rax + JSTR_DATA]
+    mov ecx, [rax + JSTR_LEN]
+    cmp ecx, 127
+    jbe .type_len
+    mov ecx, 127
+.type_len:
+    lea rdi, [jsn_type_buf]
+    mov [http_req_type], rdi
+    rep movsb
+    mov byte [rdi], 0
+.body:
+    ; the body (last: nothing is allocated after it until it is sent)
+    mov rax, r9
+    call jsn_is_nothing
+    jc .fetch
+    call js_to_string
+    mov r9, rax                     ; (kept in a register while it is sent)
+    lea rsi, [rax + JSTR_DATA]
+    mov [http_req_body], rsi
+    mov ecx, [rax + JSTR_LEN]
+    mov [http_req_body_len], ecx
+    cmp qword [http_req_type], 0
+    jne .fetch
+    lea rsi, [jsn_type_text]
+    mov [http_req_type], rsi
+.fetch:
+    mov rax, r11
     lea rsi, [rax + JSTR_DATA]
     mov ecx, [rax + JSTR_LEN]
     call browser_fetch_any
+    pushf
+    call http_req_clear
+    popf
     jc .out
     call jsn_make_response
     clc
 .out:
+    pop r11
     pop r9
     pop r8
     pop rdi
     pop rsi
     pop rdx
     pop rcx
+    ret
+
+; jsn_is_nothing: RAX = a value -> CF=1 if it is undefined or null
+jsn_is_nothing:
+    push rcx
+    mov rcx, JS_UNDEF
+    cmp rax, rcx
+    je .yes
+    mov rcx, JS_NULL
+    cmp rax, rcx
+    je .yes
+    pop rcx
+    clc
+    ret
+.yes:
+    pop rcx
+    stc
     ret
 
 ; jsn_make_response: browser_fetch_any's results (EAX status, R8/R9 its
@@ -839,6 +978,9 @@ jsn_xhr_open:
     mov rax, rbx
     mov rdx, [jsn_atom_aborted]
     call jsn_hide
+    mov rcx, JS_UNDEF               ; no Content-Type from an earlier request
+    mov rdx, [jsn_atom_req_type]
+    call jsn_hide
     mov eax, 1
     call jsb_from_int
     mov rcx, rax
@@ -866,6 +1008,16 @@ jsn_xhr_send:
     push rdx
     push rsi
     call jsn_this_xhr
+    xor eax, eax                    ; the body (undefined if none)
+    call jsb_arg
+    push rcx
+    push rdx
+    mov rcx, rax
+    mov rax, rbx
+    mov rdx, [jsn_atom_req_body]
+    call jsn_hide
+    pop rdx
+    pop rcx
     mov rax, rdx
     mov rdx, [jsn_atom_async]
     call js_get
@@ -888,6 +1040,55 @@ jsn_xhr_send:
     call jsn_xhr_run
 .out:
     mov rax, JS_UNDEF
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; xhr.setRequestHeader(name, value): only Content-Type is sent
+jsn_xhr_set_header:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    call jsn_this_xhr
+    xor eax, eax
+    call jsb_arg
+    call js_to_string
+    cmp dword [rax + JSTR_LEN], 12
+    jne .done
+    lea rsi, [rax + JSTR_DATA]
+    lea rdx, [jsn_str_content_type_lc]  ; (RDI is the arguments)
+    push rcx
+    mov ecx, 12
+.byte:
+    mov al, [rsi]
+    cmp al, 'A'
+    jb .cmp
+    cmp al, 'Z'
+    ja .cmp
+    or al, 0x20
+.cmp:
+    cmp al, [rdx]
+    jne .differs
+    inc rsi
+    inc rdx
+    dec ecx
+    jnz .byte
+.differs:
+    pop rcx
+    jne .done
+    mov eax, 1
+    call jsb_arg
+    mov rcx, rax
+    mov rax, rbx
+    mov rdx, [jsn_atom_req_type]
+    call jsn_hide
+.done:
+    mov rax, JS_UNDEF
+    pop rdi
     pop rsi
     pop rdx
     pop rcx
@@ -939,16 +1140,32 @@ jsn_xhr_run:
     mov rcx, JS_TRUE
     cmp rax, rcx
     je .out
+    ; its method, body (send()) and Content-Type (setRequestHeader())
+    push r9
+    push r10
+    push r8
     mov rax, r8
-    mov rdx, [jsn_atom_method]
+    mov rdx, [jsn_atom_req_body]
     call js_get
-    call jsn_is_get
-    jnc .failed
+    mov r9, rax
+    mov rax, r8
+    mov rdx, [jsn_atom_req_type]
+    call js_get
+    mov r10, rax
     mov rax, r8
     mov rdx, [jsn_atom_url]
     call js_get
+    push rax
+    mov rax, r8
+    mov rdx, [jsn_atom_method]
+    call js_get
+    mov r8, rax
+    pop rax
     mov eax, eax
     call jsn_request
+    pop r8
+    pop r10
+    pop r9
     jc .failed
     ; the response's fields onto the request
     mov rdi, rax                    ; the Response

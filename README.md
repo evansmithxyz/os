@@ -151,8 +151,22 @@ below):
 3. `layout.asm` lays the styled tree out into a display list: block boxes
    with collapsing margins, line boxes wrapped at words and aligned,
    lists with bullets or numbers, table rows with cells side by side,
-   background colours. It is redone only when the page or the window width
-   changes; scrolling just repaints.
+   background colours, and form controls as boxes: text fields and
+   textareas (`size`, `rows`, `cols`, placeholders), check boxes, radio
+   buttons, `<select>` and buttons. It is redone only when the page, the
+   window width or a field's value changes; scrolling just repaints.
+4. `forms.asm` keeps what you type into a field (a page's scripts see it as
+   `element.value`, and get `input`, `change` and `submit` events) and
+   sends a form the way a browser encodes it: `action?name=value&...` for
+   GET, or the same text as the body of a `method="post"` form
+   (`application/x-www-form-urlencoded`).
+
+The browser keeps cookies (`net/cookie.asm`) until the machine is turned
+off: `Set-Cookie` from any response (pages, style sheets, scripts, `fetch`)
+is stored, and every request to a matching domain and path carries them
+(Secure ones only over HTTPS). Scripts read and set them with
+`document.cookie`, without seeing HttpOnly ones. `Max-Age=0` or a past
+`Expires` deletes one.
 
 Everything is drawn with the 8x16 font, so there are no font sizes, and CSS
 lengths are halved to match its 8-pixel width. Not supported: `var()`, attribute
@@ -166,6 +180,9 @@ PgUp/PgDn, Home/End or the mouse wheel. Pages up to 1 MB are kept.
 | Up / Down, mouse wheel | Scroll a few lines |
 | PgUp / PgDn, Home / End | Scroll a screen, to the top / bottom |
 | Click a link | Follow it (relative links resolve against the page) |
+| Click a text field, then type | Edit it; Backspace, Tab (next field), Esc (leave it) |
+| Enter in a field / click a submit button | Send its form |
+| Click a check box, radio button, `<select>` | Tick it / pick it / show the next option |
 | Click anything else | The page's `click` handlers run |
 
 HTTPS speaks TLS 1.3 with one cipher suite, `TLS_CHACHA20_POLY1305_SHA256`,
@@ -363,9 +380,11 @@ Async: `Promise` (`then`, `catch`, `finally`, `resolve`, `reject`, `all`,
 `allSettled`, `race`, `any`; "Uncaught (in promise)" for rejections nobody
 handles), `async` functions, arrows and methods with `await`,
 `queueMicrotask`, `setTimeout` / `setInterval` (and their `clear`s),
-`requestAnimationFrame`, `performance.now()`, `fetch` (a `Response` with
+`requestAnimationFrame`, `performance.now()`, `fetch` (any `method`, a
+string `body` and its `Content-Type` in `headers`; a `Response` with
 `status`, `ok`, `headers.get()`, `text()`, `json()`) and
-`XMLHttpRequest` (asynchronous or not, `onload` and friends,
+`XMLHttpRequest` (any method, `send(body)`, `setRequestHeader` for the
+`Content-Type`; asynchronous or not, `onload` and friends,
 `addEventListener`, `responseType = 'json'`).
 
 And: `Symbol` (with `Symbol.for`, `description` and the well-known
@@ -383,7 +402,8 @@ Not yet: modules (`import` / `export`; `import()` gives a rejected
 promise), async generators, real `BigInt` (`10n` is read as the number 10
 so scripts that use it still load), callable proxies; in the browser,
 layout information, canvas drawing, workers, WebSockets, keeping
-`localStorage` across pages and typing into form fields. Strings are
+`localStorage` across pages, file uploads and `multipart/form-data`,
+request headers other than `Content-Type`. Strings are
 UTF-8 bytes, so `length` and `charCodeAt` count bytes. A response of more
 than 1 MB is cut off.
 
@@ -408,12 +428,14 @@ kernel/
   console/console.asm   output routing (VGA / GUI terminal / serial) and the key queue
   fs/afs.asm            AntigravityFS
   net/                  eth (ARP), ipv4 (ICMP), udp (DNS), tcp (HTTP), url,
-                        tls (TLS 1.3 client), x509 (certificates and chains)
+                        tls (TLS 1.3 client), x509 (certificates and chains),
+                        inflate (gzip), cookie (the browser's cookie jar)
   crypto/               sha256 + HMAC, sha512/384, chacha20poly1305, x25519,
                         bignum (Montgomery), rsa, ecc (ECDSA P-256/P-384), random
   data/roots.der        trusted root certificates (tools/mkroots.py)
   web/                  dom (HTML parser), css (style sheets, cascade), layout (display list),
-                        ua.css / builtin.css (the browser's own style sheets)
+                        forms (typing into fields, submitting), ua.css / builtin.css
+                        (the browser's own style sheets)
   js/                   JavaScript engine: lexer, parser, compiler (bytecode), vm,
                         heap (strings, atoms), gc (allocator, collector), object, number,
                         builtins + stdlib (the standard library), async (promises,

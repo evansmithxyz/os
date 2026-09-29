@@ -104,10 +104,10 @@ suite and the reviewers (human or not) assume them.
 
 Routines are prefixed with their module: `con_`, `key_`, `serial_`, `vga_`,
 `kbd_`, `mouse_`, `ata_`, `pci_`, `net_`/`rtl_`, `bga_`, `fs_`, `eth_`/`arp_`,
-`ipv4_`/`icmp_`, `udp_`/`dns_`, `tcp_`/`http_`, `url_`, `tls_`, `x509_`/`der_`,
+`ipv4_`/`icmp_`, `udp_`/`dns_`, `tcp_`/`http_`, `cookie_`, `url_`, `tls_`, `x509_`/`der_`,
 `sha256_`/`sha512_`/`hmac_`/`hash_`, `chacha20_`/`poly1305_`/`aead_`,
 `fe_`/`x25519_`, `bn_`/`mont_`, `rsa_`/`sig_`, `ec_`/`ecdsa_`, `rand_`, `rtc_`,
-`dom_`, `css_`, `lay_`/`layout_`/`paint_`,
+`dom_`, `css_`, `lay_`/`layout_`/`paint_`, `form_`,
 `js_` (engine API and runtime helpers), `jsnum_`/`jsbig_` (numbers),
 `jsstr_` (strings, atoms), `jsobj_`/`jsarr_`/`jsfn_` (objects), `jslex_`,
 `jsp_` (parser), `jsc_` (compiler), `vm_`/`vmop_` (interpreter), `jsb_`

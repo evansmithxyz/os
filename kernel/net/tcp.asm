@@ -29,6 +29,9 @@ HTTP_RESP_MAX           equ HTTP_RESP_SIZE - 1  ; bytes of HTTP response kept (+
 http_resp_buf           equ HTTP_RESP_ADDR      ; use as [abs http_resp_buf]
 TCP_RX_BUF_SIZE         equ 4096
 TCP_SEND_MAX            equ 1400    ; payload bytes per segment we send
+HTTP_REQ_MAX            equ 32768   ; a request: headers and body
+HTTP_REQ_HEAD_MAX       equ 8192    ; its headers (the path is cut at 1200 bytes)
+HTTP_REQ_BODY_MAX       equ HTTP_REQ_MAX - HTTP_REQ_HEAD_MAX
 
 section .data
 tcp_active_state:       db TCP_STATE_CLOSED
@@ -61,7 +64,13 @@ tcp_tx_packet:          resb 2048
 alignb 16
 tcp_rx_buf:             resb TCP_RX_BUF_SIZE + 16   ; last received segment, NUL-terminated
 alignb 16
-http_req_buf:           resb 1536
+http_req_buf:           resb HTTP_REQ_MAX
+; what the next request sends besides a GET (set by the caller, cleared by it)
+alignb 8
+http_req_method:        resq 1      ; "POST" etc. (NUL-terminated), 0 = GET
+http_req_body:          resq 1      ; the body's bytes
+http_req_type:          resq 1      ; its Content-Type (NUL-terminated), 0 = none
+http_req_body_len:      resd 1
 
 section .rodata
 ; Server HTTP Response Content
@@ -661,24 +670,34 @@ tcp_send_data:
     ret
 
 ; ------------------------------------------------------------------------------
-; http_build_request: GET request in http_req_buf
+; http_build_request: the request in http_req_buf
 ; Input:  RDI = host name for the Host header (0 or "" = tcp_remote_ip),
-;         R8 = path (0 = "/")
+;         R8 = path (0 = "/"); http_req_method / http_req_body / http_req_type
+;         for anything but a GET
 ; Output: RCX = request length
-; "GET <path> HTTP/1.0\r\nHost: <host>\r\nUser-Agent: ...\r\nConnection: close\r\n\r\n"
+; "<method> <path> HTTP/1.0\r\nHost: <host>\r\n...\r\nConnection: close\r\n\r\n<body>"
+; The browser's requests (http_quiet) also take compressed bodies and carry
+; the cookie jar's cookies for the host and path (cookie.asm).
 ; ------------------------------------------------------------------------------
 http_build_request:
     push rax
     push rbx
+    push rdx
     push rsi
     push rdi
     push r15
     mov r15, rdi                    ; R15 = host name
     lea rdi, [http_req_buf]
 
-    ; 1. "GET <path> HTTP/1.0\r\nHost: "
+    ; 1. "<method> <path> HTTP/1.0\r\nHost: "
+    mov rsi, [http_req_method]
+    test rsi, rsi
+    jnz .method
     lea rsi, [.STR_GET]
+.method:
     call .append_str
+    mov al, ' '
+    stosb
     mov rsi, r8
     test rsi, rsi
     jnz .have_path
@@ -700,6 +719,7 @@ http_build_request:
     call .append_str
 
     ; 2. Host name, or the IP address
+    mov rbx, rdi                    ; RBX = the host as written
     test r15, r15
     jz .use_ip_host
     cmp byte [r15], 0
@@ -723,15 +743,53 @@ http_build_request:
     movzx eax, byte [tcp_remote_ip + 3]
     call .append_dec
 .host_done:
-    ; 3. the browser's requests take compressed bodies (http_decode_body)
+    ; 3. the browser's requests take compressed bodies (http_decode_body) and
+    ; carry cookies
     cmp byte [http_quiet], 0
-    je .fixed_headers
+    je .body_headers
+    mov rcx, rdi
+    sub rcx, rbx
+    mov rsi, rbx
+    push rdi
+    mov rdi, r8
+    mov al, [tcp_rx_to_tls]
+    call cookie_request
+    pop rdi
     lea rsi, [.STR_ACCEPT_ENCODING]
     call .append_str
+    lea rdx, [http_req_buf + HTTP_REQ_HEAD_MAX - 256]
+    call cookie_header
+.body_headers:
+    ; 4. a body (or any method but GET): its type and length
+    mov eax, [http_req_body_len]
+    cmp eax, HTTP_REQ_BODY_MAX
+    jbe .body_len
+    mov eax, HTTP_REQ_BODY_MAX
+    mov [http_req_body_len], eax
+.body_len:
+    test eax, eax
+    jnz .content
+    cmp qword [http_req_method], 0
+    je .fixed_headers
+.content:
+    cmp qword [http_req_type], 0
+    je .length
+    lea rsi, [.STR_CONTENT_TYPE]
+    call .append_str
+    mov rsi, [http_req_type]
+    call .append_str
+.length:
+    lea rsi, [.STR_CONTENT_LENGTH]
+    call .append_str
+    mov eax, [http_req_body_len]
+    call .append_dec
 .fixed_headers:
-    ; 4. the fixed headers and the blank line
+    ; 5. the fixed headers, the blank line and the body
     lea rsi, [.STR_GET_SUFFIX]
     call .append_str
+    mov ecx, [http_req_body_len]
+    mov rsi, [http_req_body]
+    rep movsb
 
     lea rcx, [http_req_buf]
     sub rdi, rcx
@@ -739,6 +797,7 @@ http_build_request:
     pop r15
     pop rdi
     pop rsi
+    pop rdx
     pop rbx
     pop rax
     ret
@@ -777,17 +836,29 @@ http_build_request:
     ret
 
 .STR_GET:
-    db "GET ", 0
+    db "GET", 0
 .STR_ROOT:
     db "/", 0
 .STR_GET_PREFIX:
     db " HTTP/1.0", 0x0D, 0x0A, "Host: ", 0
 .STR_ACCEPT_ENCODING:
     db 0x0D, 0x0A, "Accept-Encoding: gzip, deflate", 0
+.STR_CONTENT_TYPE:
+    db 0x0D, 0x0A, "Content-Type: ", 0
+.STR_CONTENT_LENGTH:
+    db 0x0D, 0x0A, "Content-Length: ", 0
 .STR_GET_SUFFIX:
     db 0x0D, 0x0A
     db "User-Agent: AntigravityOS/1.0 (x86_64)", 0x0D, 0x0A
     db "Connection: close", 0x0D, 0x0A, 0x0D, 0x0A, 0
+
+; http_req_clear: the next request is a plain GET again
+http_req_clear:
+    mov qword [http_req_method], 0
+    mov qword [http_req_body], 0
+    mov qword [http_req_type], 0
+    mov dword [http_req_body_len], 0
+    ret
 
 ; ------------------------------------------------------------------------------
 ; tcp_http_client: plain HTTP GET
@@ -863,6 +934,10 @@ tcp_http_client:
     lea rsi, [MSG_TCP_CLOSED]
     call tcp_say
     call http_decode_body           ; (a gzip body: decompressed)
+    cmp byte [http_quiet], 0
+    je .no_cookies
+    call cookie_response            ; the browser keeps its Set-Cookies
+.no_cookies:
     xor eax, eax
     jmp .exit_client
 .error:

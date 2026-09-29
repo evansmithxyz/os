@@ -15,6 +15,9 @@
 ;     cells spaced apart (block boxes inside a cell flow inline)
 ;   - background colours of blocks become rectangles behind their content
 ;   - text inside <a href> becomes link runs; clicking uses layout_links
+;   - <input>, <textarea>, <select> and <button> become boxes (lay_field,
+;     lay_button) with the value forms.asm keeps; inline elements get their
+;     left and right margin and padding as space
 ;
 ; browser_render_html_page paints the display list into the viewport.
 ; ==============================================================================
@@ -80,6 +83,13 @@ lay_ws:                 resb 1
 lay_align:              resb 1
 lay_transform:          resb 1
 lay_cell:               resb 1      ; inside a table cell
+alignb 4
+lay_field_x:            resd 1      ; the form field being laid out: its box
+lay_field_y:            resd 1
+lay_field_w:            resd 1
+lay_field_cols:         resd 1      ; characters per line
+lay_field_color:        resd 1      ; of its text
+lay_caret_y:            resd 1      ; top of its last line drawn
 lay_latin1:             resb 1
 
 section .text
@@ -218,6 +228,10 @@ lay_node:
     je .img
     cmp ecx, TAGID_INPUT
     je .input
+    cmp ecx, TAGID_TEXTAREA
+    je .input
+    cmp ecx, TAGID_SELECT
+    je .input
     cmp ecx, TAGID_HR
     je .hr
 
@@ -288,18 +302,18 @@ lay_node:
 .inline:
     cmp byte [r13 + N_TAG], TAGID_BUTTON
     je .button
+    ; margin and padding at each end
+    movsx eax, word [r13 + S_ML]
+    movsx ecx, word [r13 + S_PL]
+    call lay_inline_space
     mov eax, r12d
     call lay_node_children
+    movsx eax, byte [r13 + S_MR]
+    movsx ecx, byte [r13 + S_PR]
+    call lay_inline_space
     jmp .restore
 .button:
-    call lay_style_from
-    mov al, '['
-    call lay_add_char
-    mov eax, r12d
-    call lay_node_children
-    call lay_style_from
-    mov al, ']'
-    call lay_add_char
+    call lay_button
     jmp .restore
 
 .br:
@@ -348,7 +362,7 @@ lay_node:
     mov byte [lay_space], 1
     jmp .restore
 .input:
-    call lay_input
+    call lay_field
     jmp .restore
 
 .restore:
@@ -553,111 +567,750 @@ lay_new_link:
     pop rax
     ret
 
-; lay_input: R12/R13 = <input> -> a text picture of it
-lay_input:
+; ------------------------------------------------------------------------------
+; lay_field: R12/R13 = <input>, <textarea> or <select> -> a box on the line
+; with its value (forms.asm keeps what the user typed), a check box, or a
+; button
+; ------------------------------------------------------------------------------
+LAY_FIELD_BORDER        equ 0x767676
+LAY_FIELD_FOCUS         equ 0x1A73E8
+LAY_FIELD_HINT          equ 0x757575    ; placeholder text
+LAY_BUTTON_FACE         equ 0xEFEFEF
+
+lay_field:
     push rax
+    push rbx
     push rcx
+    push rdx
     push rsi
     push rdi
+    push r8
+    push r9
+    push r10
+    push r11
     call lay_style_from
     mov eax, r12d
+    call form_kind
+    cmp ecx, FK_HIDDEN
+    je .done
+    cmp ecx, FK_CHECKBOX
+    je .check
+    cmp ecx, FK_RADIO
+    je .check
+    cmp ecx, FK_SELECT
+    je .select
+    cmp ecx, FK_TEXTAREA
+    je .textarea
+    cmp ecx, FK_TEXT
+    je .text_field
+    cmp ecx, FK_PASSWORD
+    je .text_field
+    ; --- a button: its label in a grey box ---------------------------------------
+    mov r10d, ecx                   ; R10 = kind
+    lea rdi, [lay_attr_value]
+    call form_attr_decoded
+    test ecx, ecx
+    jnz .label
+    lea rsi, [lay_str_submit]
+    cmp r10d, FK_SUBMIT
+    je .default_label
+    lea rsi, [lay_str_reset]
+    push rsi
+    push rcx
     lea rdi, [lay_attr_type]
     call dom_attr
-    jc .text_field
-    ; hidden: nothing
-    cmp ecx, 6
-    jne .not_hidden
-    mov eax, [rsi]
-    or eax, 0x20202020
-    cmp eax, 'hidd'
-    je .done
-.not_hidden:
-    cmp ecx, 8
-    je .checkbox
-    cmp ecx, 5
-    je .radio_or_reset
-    cmp ecx, 6
-    je .submit_or_button
-    jmp .text_field
-.checkbox:
-    mov al, [rsi]
-    or al, 0x20
-    cmp al, 'c'
-    jne .text_field
-    lea rsi, [lay_pic_checkbox]
-    jmp .picture
-.radio_or_reset:
-    mov al, [rsi]
-    or al, 0x20
-    cmp al, 'r'
-    jne .text_field
-    mov al, [rsi + 1]
-    or al, 0x20
-    cmp al, 'a'
-    jne .button                     ; reset
-    lea rsi, [lay_pic_radio]
-    jmp .picture
-.submit_or_button:
-    mov al, [rsi]
-    or al, 0x20
-    cmp al, 's'
-    je .button
-    cmp al, 'b'
-    jne .text_field
-.button:
-    ; [value]
-    mov al, '['
-    call lay_add_char
-    mov eax, r12d
-    lea rdi, [lay_attr_value]
-    call dom_attr
-    jc .close_button
-    call lay_add_attr_text
-.close_button:
-    mov al, ']'
-    call lay_add_char
+    mov ebx, ecx
+    pop rcx
+    lea rdi, [form_str_reset]
+    call form_attr_is
+    pop rsi
+    je .default_label
+    lea rsi, [lay_str_file]
+    cmp r10d, FK_FILE
+    je .default_label
+    xor ecx, ecx
+    jmp .label
+.default_label:
+    call strlen
+    mov ecx, eax
+.label:
+    cmp ecx, 40
+    jbe .label_len
+    mov ecx, 40
+.label_len:
+    mov r11d, ecx                   ; R11 = label length
+    push rsi
+    lea ecx, [r11d * 8 + 16]
+    call lay_place                  ; EAX = x
+    pop rsi
+    mov edx, [lay_y]
+    test byte [lay_flags], IF_HIDDEN
+    jnz .done
+    mov r8d, [r13 + S_BG]
+    cmp r8d, CSS_TRANSPARENT
+    jne .face
+    mov r8d, LAY_BUTTON_FACE
+.face:
+    push rsi
+    mov esi, LAY_LINE_H
+    mov edi, LAY_FIELD_BORDER
+    mov r9d, 1
+    call lay_box
+    pop rsi
+    add eax, 8
+    inc edx
+    mov ecx, r11d
+    mov edi, [r13 + S_COLOR]
+    xor r8d, r8d
+    call lay_put_text
     jmp .spaced
-.text_field:
-    ; [value or placeholder___]
-    mov al, '['
-    call lay_add_char
+
+    ; --- check box / radio button ------------------------------------------------
+.check:
+    mov ecx, 14
+    call lay_place
+    mov edx, [lay_y]
+    test byte [lay_flags], IF_HIDDEN
+    jnz .done
+    inc eax
+    add edx, 3
+    mov ecx, 12
+    mov esi, 12
+    mov edi, LAY_FIELD_BORDER
+    mov r8d, 0xFFFFFF
+    mov r9d, 1
+    call lay_box
+    push rax
     mov eax, r12d
-    lea rdi, [lay_attr_value]
-    call dom_attr
-    jnc .field_text
-    mov eax, r12d
-    lea rdi, [lay_attr_placeholder]
-    call dom_attr
-    jc .field_blank
-.field_text:
-    cmp ecx, 20
-    jbe .field_put
-    mov ecx, 20
-.field_put:
-    call lay_add_attr_text
-    jmp .field_end
-.field_blank:
-    lea rsi, [lay_pic_field]
-    jmp .put_picture
-.field_end:
-    mov al, ']'
-    call lay_add_char
+    call form_checked
+    pop rax
+    jnc .spaced
+    add eax, 3
+    add edx, 3
+    mov ecx, 6
+    mov esi, 6
+    mov edi, LAY_FIELD_FOCUS
+    call lay_rect
     jmp .spaced
-.picture:
-.put_picture:
-    mov al, [rsi]
-    test al, al
-    jz .spaced
-    call lay_add_char
-    inc rsi
-    jmp .put_picture
-.spaced:
-    call lay_flush_word
-    mov byte [lay_space], 1
-.done:
-    pop rdi
+
+    ; --- <select>: the chosen option, as wide as the widest -----------------------
+.select:
+    xor r11d, r11d                  ; R11 = widest label
+    mov eax, r12d
+.option:
+    mov edx, r12d
+    call jsd_next
+    test eax, eax
+    jz .widest
+    call dom_node
+    cmp byte [rbx + N_TAG], TAGID_OPTION
+    jne .option
+    call form_option_text
+    cmp ecx, r11d
+    jbe .option
+    mov r11d, ecx
+    jmp .option
+.widest:
+    cmp r11d, 40
+    jbe .select_width
+    mov r11d, 40
+.select_width:
+    lea ecx, [r11d * 8 + 24]
+    mov r10d, ecx                   ; R10 = width
+    call lay_place
+    mov r9d, eax                    ; R9 = x
+    test byte [lay_flags], IF_HIDDEN
+    jnz .done
+    mov eax, r12d
+    call form_option
+    xor ecx, ecx
+    test edx, edx
+    jz .select_box
+    mov eax, edx
+    call form_option_text
+.select_box:
+    cmp ecx, r11d
+    jbe .select_text
+    mov ecx, r11d
+.select_text:
+    push rcx
+    push rsi
+    mov eax, r9d
+    mov edx, [lay_y]
+    mov ecx, r10d
+    mov esi, LAY_LINE_H
+    mov edi, LAY_FIELD_BORDER
+    mov r8d, [r13 + S_BG]
+    cmp r8d, CSS_TRANSPARENT
+    jne .select_fill
+    mov r8d, 0xFFFFFF
+.select_fill:
+    push r9
+    mov r9d, 1
+    call lay_box
+    pop r9
     pop rsi
     pop rcx
+    lea eax, [r9d + 4]
+    inc edx
+    mov edi, [r13 + S_COLOR]
+    xor r8d, r8d
+    call lay_put_text
+    ; the arrow
+    lea eax, [r9d + r10d - 12]
+    lea rsi, [lay_str_arrow]
+    mov ecx, 1
+    mov edi, LAY_FIELD_BORDER
+    call lay_put_text
+    jmp .spaced
+
+    ; --- a text field: size="" characters wide ----------------------------------
+.text_field:
+    mov r10d, ecx                   ; R10 = kind
+    lea rdi, [lay_attr_size]
+    mov ebx, 20
+    call lay_attr_number
+    mov ecx, ebx
+    mov r11d, 1                     ; R11 = rows
+    jmp .field_box
+.textarea:
+    mov r10d, ecx
+    lea rdi, [lay_attr_rows]
+    mov ebx, 2
+    call lay_attr_number
+    cmp ebx, 20
+    jbe .rows
+    mov ebx, 20
+.rows:
+    mov r11d, ebx
+    lea rdi, [lay_attr_cols]
+    mov ebx, 20
+    call lay_attr_number
+    mov ecx, ebx
+.field_box:
+    ; ECX = columns: at least 2, and the box must fit on a line
+    mov eax, [lay_right]
+    sub eax, [lay_left]
+    sub eax, 8
+    sar eax, 3
+    cmp ecx, eax
+    jle .cols_fit
+    mov ecx, eax
+.cols_fit:
+    cmp ecx, 2
+    jge .cols_ok
+    mov ecx, 2
+.cols_ok:
+    mov [lay_field_cols], ecx
+    lea ecx, [ecx * 8 + 8]
+    mov [lay_field_w], ecx
+    call lay_place
+    mov [lay_field_x], eax
+    mov edx, [lay_y]
+    mov [lay_field_y], edx
+    ; taller than a line: the rest of the line goes along its bottom
+    lea eax, [r11d - 1]
+    imul eax, eax, LAY_LINE_H
+    add [lay_y], eax
+    test byte [lay_flags], IF_HIDDEN
+    jnz .done
+    ; the box: blue and thicker while it has the keyboard
+    mov eax, [lay_field_x]
+    mov ecx, [lay_field_w]
+    imul esi, r11d, LAY_LINE_H
+    mov edi, LAY_FIELD_BORDER
+    mov r9d, 1
+    cmp r12d, [form_focus]
+    jne .unfocused
+    mov edi, LAY_FIELD_FOCUS
+    mov r9d, 2
+.unfocused:
+    mov r8d, [r13 + S_BG]
+    cmp r8d, CSS_TRANSPARENT
+    jne .fill
+    mov r8d, 0xFFFFFF
+.fill:
+    call lay_box
+    ; its value, else the placeholder (in grey, when it is not focused)
+    mov eax, r12d
+    call form_value
+    mov edi, [r13 + S_COLOR]
+    test ecx, ecx
+    jnz .have_text
+    cmp r12d, [form_focus]
+    je .have_text
+    lea rdi, [lay_attr_placeholder]
+    call form_attr_decoded
+    mov edi, LAY_FIELD_HINT
+.have_text:
+    mov [lay_field_color], edi
+    xor r8d, r8d
+    cmp r10d, FK_PASSWORD
+    jne .lines
+    mov r8d, 1
+.lines:
+    call lay_field_lines
+.spaced:
+    mov byte [lay_space], 1
+.done:
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; ------------------------------------------------------------------------------
+; lay_field_lines: RSI/ECX = a field's text, R11D = its rows, R8D = 1 for
+; '*'s, lay_field_* = its box -> the text in lines of lay_field_cols (at a
+; newline or when full): the first rows, or while it has the keyboard the
+; last ones and the caret after the text
+; ------------------------------------------------------------------------------
+lay_field_lines:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r9
+    push r10
+    ; one row: the start, or the end while typing (with room for the caret)
+    cmp r11d, 1
+    jne .count
+    mov eax, [lay_field_cols]
+    cmp r12d, [form_focus]
+    jne .one_row
+    dec eax
+    cmp ecx, eax
+    jbe .one_row
+    sub ecx, eax
+    add rsi, rcx
+    mov ecx, eax
+.one_row:
+    cmp ecx, eax
+    jbe .one_row_len
+    mov ecx, eax
+.one_row_len:
+    mov eax, [lay_field_x]
+    add eax, 4
+    mov edx, [lay_field_y]
+    inc edx
+    mov edi, [lay_field_color]
+    call lay_put_text
+    shl ecx, 3
+    add eax, ecx
+    jmp .caret
+.count:
+    ; pass 1: how many lines; pass 2: draw the ones that show
+    mov r9d, -1                     ; R9 = first line drawn (-1: none, counting)
+    call .split
+    xor r9d, r9d
+    cmp r12d, [form_focus]
+    jne .draw
+    mov r9d, r10d
+    sub r9d, r11d
+    jge .draw
+    xor r9d, r9d
+.draw:
+    call .split
+    ; EAX = x after the last line drawn, EDX = its y
+.caret:
+    cmp r12d, [form_focus]
+    jne .ret
+    mov edx, [lay_field_y]
+    cmp r11d, 1
+    je .caret_y
+    mov edx, [lay_caret_y]
+.caret_y:
+    add edx, 2
+    mov ecx, [lay_field_x]
+    add ecx, [lay_field_w]
+    sub ecx, 4
+    cmp eax, ecx
+    jle .caret_x
+    mov eax, ecx
+.caret_x:
+    mov ecx, 1
+    push rsi
+    mov esi, FONT_H - 2
+    mov edi, [r13 + S_COLOR]
+    call lay_rect
+    pop rsi
+.ret:
+    pop r10
+    pop r9
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; .split: RSI/ECX = text -> R10D = its lines; lines R9 .. R9 + R11 - 1 drawn
+; (R9 = -1: none), EAX = x after the last one drawn
+.split:
+    push rcx
+    push rsi
+    xor r10d, r10d                  ; R10 = line number
+    mov rbx, rsi                    ; RBX = start of the line
+    xor edx, edx                    ; EDX = its length so far
+    mov eax, [lay_field_x]
+    add eax, 4
+.byte:
+    test ecx, ecx
+    jz .last
+    cmp byte [rsi], 10
+    je .newline
+    cmp edx, [lay_field_cols]
+    jb .take
+    call .line                      ; full: wrap
+    mov rbx, rsi
+    xor edx, edx
+.take:
+    inc rsi
+    dec ecx
+    inc edx
+    jmp .byte
+.newline:
+    call .line
+    inc rsi
+    dec ecx
+    mov rbx, rsi
+    xor edx, edx
+    jmp .byte
+.last:
+    call .line
+    pop rsi
+    pop rcx
+    ret
+; .line: RBX/EDX = a line, R10 = its number -> drawn if it shows; next number
+.line:
+    cmp r9d, -1
+    je .line_done
+    cmp r10d, r9d
+    jl .line_done
+    push rcx
+    mov ecx, r10d
+    sub ecx, r9d
+    cmp ecx, r11d
+    pop rcx
+    jge .line_done
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    mov ecx, edx
+    mov rsi, rbx
+    mov edx, r10d
+    sub edx, r9d
+    imul edx, edx, LAY_LINE_H
+    add edx, [lay_field_y]
+    mov [lay_caret_y], edx
+    inc edx
+    mov eax, [lay_field_x]
+    add eax, 4
+    mov edi, [lay_field_color]
+    call lay_put_text
+    shl ecx, 3
+    add eax, ecx
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+.line_done:
+    inc r10d
+    ret
+
+; ------------------------------------------------------------------------------
+; lay_place: ECX = width -> EAX = x of a box that wide on the current line
+; (after a pending space; on a new line if it does not fit and may wrap);
+; the pen moves past it
+; ------------------------------------------------------------------------------
+lay_place:
+    push rdx
+    call lay_flush_word
+    mov eax, [lay_x]
+    cmp byte [lay_space], 0
+    je .no_space
+    cmp eax, [lay_left]
+    jle .no_space
+    add eax, 8
+.no_space:
+    lea edx, [eax + ecx]
+    cmp edx, [lay_right]
+    jle .fits
+    cmp byte [lay_ws], WS_NORMAL
+    jne .fits
+    mov edx, [lay_x]
+    cmp edx, [lay_left]
+    jle .fits                       ; nothing on the line: it overflows
+    call lay_end_line
+    mov eax, [lay_x]
+.fits:
+    mov byte [lay_space], 0
+    call lay_use_margin
+    lea edx, [eax + ecx]
+    mov [lay_x], edx
+    pop rdx
+    ret
+
+; lay_attr_number: EAX = element, RDI = attribute name, EBX = default ->
+; EBX = its value if it is a number from 1 to 200
+lay_attr_number:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    call dom_attr
+    jc .ret
+    xor eax, eax
+.digit:
+    test ecx, ecx
+    jz .end
+    movzx edx, byte [rsi]
+    sub edx, '0'
+    cmp edx, 9
+    ja .end
+    imul eax, eax, 10
+    add eax, edx
+    cmp eax, 1000
+    ja .ret
+    inc rsi
+    dec ecx
+    jmp .digit
+.end:
+    test eax, eax
+    jz .ret
+    cmp eax, 200
+    ja .ret
+    mov ebx, eax
+.ret:
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; lay_rect: EAX, EDX = x, y  ECX, ESI = width, height  EDI = colour -> a
+; rectangle item (of node R12, so pressing it finds the control)
+lay_rect:
+    push rbx
+    push rax
+    call lay_new_item
+    pop rax
+    jc .ret
+    mov byte [rbx + I_KIND], IK_RECT
+    mov [rbx + I_X], eax
+    mov [rbx + I_Y], edx
+    mov [rbx + I_TEXT], ecx
+    mov [rbx + I_LINK], esi
+    mov [rbx + I_COLOR], edi
+    mov [rbx + I_NODE], r12d
+.ret:
+    pop rbx
+    ret
+
+; lay_box: EAX, EDX, ECX, ESI = x, y, width, height  EDI = border colour,
+; R8D = fill colour, R9D = border width -> two rectangles
+lay_box:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    call lay_rect
+    add eax, r9d
+    add edx, r9d
+    sub ecx, r9d
+    sub ecx, r9d
+    sub esi, r9d
+    sub esi, r9d
+    mov edi, r8d
+    call lay_rect
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; ------------------------------------------------------------------------------
+; lay_put_text: EAX, EDX = x, y  RSI/ECX = text  EDI = colour  R8D = 1 to
+; show '*'s -> a text item of node R12 (a UTF-8 character is one '?')
+; ------------------------------------------------------------------------------
+lay_put_text:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r9
+    push r10
+    test ecx, ecx
+    jz .ret
+    push rax
+    call lay_new_item
+    pop rax
+    jc .ret
+    mov byte [rbx + I_KIND], IK_TEXT
+    mov [rbx + I_X], eax
+    mov [rbx + I_Y], edx
+    mov [rbx + I_COLOR], edi
+    mov r9d, [lay_text_used]
+    mov [rbx + I_TEXT], r9d
+    mov [rbx + I_NODE], r12d
+    lea rdi, [abs LAY_TEXT]
+    add rdi, r9
+    xor edx, edx                    ; EDX = characters
+.char:
+    test ecx, ecx
+    jz .end
+    lodsb
+    dec ecx
+    cmp al, 0x80
+    jb .ascii
+    cmp al, 0xC0
+    jb .char                        ; the rest of a UTF-8 character
+    mov al, '?'
+.ascii:
+    cmp al, ' '
+    jae .shown
+    mov al, ' '
+.shown:
+    cmp al, 0x7E
+    jbe .star
+    mov al, '?'
+.star:
+    test r8d, r8d
+    jz .put
+    mov al, '*'
+.put:
+    lea r10d, [r9d + edx]
+    cmp r10d, LAY_TEXT_SIZE
+    jae .end
+    mov [rdi + rdx], al
+    inc edx
+    jmp .char
+.end:
+    mov [rbx + I_LEN], dx
+    add [lay_text_used], edx
+.ret:
+    pop r10
+    pop r9
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; ------------------------------------------------------------------------------
+; lay_button: R12/R13 = <button> -> its content in a box of its background
+; (the browser's style sheet makes it grey); no box if nothing in it shows
+; or it runs over a line
+; ------------------------------------------------------------------------------
+lay_button:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    call lay_style_from
+    mov r9d, CSS_TRANSPARENT
+    test byte [lay_flags], IF_HIDDEN
+    jnz .no_face
+    mov r9d, [r13 + S_BG]           ; R9 = its face
+.no_face:
+    xor ecx, ecx
+    call lay_place                  ; EAX = its left
+    mov r8d, eax                    ; R8 = x
+    mov edx, [lay_y]
+    mov r10d, [lay_count]           ; R10 = its first item
+    cmp r9d, CSS_TRANSPARENT
+    je .content
+    xor ecx, ecx                    ; (sizes come at the end)
+    xor esi, esi
+    mov edi, LAY_FIELD_BORDER
+    push r9
+    mov r9d, 1
+    push r8
+    mov r8d, [rsp + 8]
+    call lay_box
+    pop r8
+    pop r9
+    add dword [lay_x], 6
+.content:
+    mov eax, r12d
+    call lay_node_children
+    call lay_flush_word
+    cmp r9d, CSS_TRANSPARENT
+    je .done
+    add dword [lay_x], 6
+    ; the box, if its content is on this line and something showed
+    mov eax, r10d
+    call lay_item
+    mov eax, [lay_count]
+    sub eax, r10d
+    cmp eax, 2
+    jbe .empty
+    cmp edx, [lay_y]
+    jne .done                       ; it wrapped: no box
+    mov ecx, [lay_x]
+    sub ecx, r8d
+    mov [rbx + I_TEXT], ecx
+    mov dword [rbx + I_LINK], LAY_LINE_H
+    sub ecx, 2
+    mov [rbx + LAY_ITEM_SIZE + I_TEXT], ecx
+    mov dword [rbx + LAY_ITEM_SIZE + I_LINK], LAY_LINE_H - 2
+    jmp .done
+.empty:
+    mov [lay_x], r8d                ; an icon we cannot draw: no room either
+.done:
+    mov byte [lay_space], 1
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; lay_inline_space: EAX + ECX = margin and padding at one end of an inline
+; element -> the pen moves on (0 .. 64 pixels, within the line)
+lay_inline_space:
+    push rax
+    call lay_flush_word
+    add eax, ecx
+    jle .ret
+    cmp eax, 64
+    jbe .add
+    mov eax, 64
+.add:
+    add eax, [lay_x]
+    cmp eax, [lay_right]
+    jle .set
+    mov eax, [lay_right]
+.set:
+    cmp eax, [lay_x]
+    jle .ret
+    mov [lay_x], eax
+.ret:
     pop rax
     ret
 
@@ -1713,9 +2366,13 @@ lay_attr_alt:           db "alt", 0
 lay_attr_type:          db "type", 0
 lay_attr_value:         db "value", 0
 lay_attr_placeholder:   db "placeholder", 0
-lay_pic_checkbox:       db "[ ]", 0
-lay_pic_radio:          db "( )", 0
-lay_pic_field:          db "__________]", 0
+lay_attr_size:          db "size", 0
+lay_attr_rows:          db "rows", 0
+lay_attr_cols:          db "cols", 0
+lay_str_submit:         db "Submit", 0
+lay_str_reset:          db "Reset", 0
+lay_str_file:           db "Choose file", 0
+lay_str_arrow:          db "v", 0
 section .text
 
 ; ------------------------------------------------------------------------------
