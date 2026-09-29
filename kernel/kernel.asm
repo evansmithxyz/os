@@ -20,6 +20,13 @@
 %include "layout.inc"
 %include "memmap.inc"
 
+%if KERNEL_ADDR + KERNEL_MAX_SECTORS * SECTOR_SIZE > KERNEL_BSS_ADDR
+    %error "the kernel slot (KERNEL_MAX_SECTORS) runs into KERNEL_BSS_ADDR"
+%endif
+%if KERNEL_BSS_ADDR + KERNEL_BSS_MAX > KERNEL_STACK_BOTTOM
+    %error ".bss (KERNEL_BSS_MAX) runs into the kernel stack"
+%endif
+
 [map symbols build/kernel.map]
 
 [org KERNEL_ADDR]

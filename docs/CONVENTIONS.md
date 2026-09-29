@@ -125,8 +125,10 @@ labels use NASM's `.name` form.
   `kernel/gui/desktop.asm` if it should have one.
 - **A file on the default disk:** drop it in `rootfs/` and build with `--fresh`.
 - **More kernel space:** raise `KERNEL_MAX_SECTORS` in `include/layout.inc`
-  and move the `FS_*` numbers up by the same amount (the kernel is loaded
-  below 640 KB, so the hard limit is about 512 KB).
+  and move the `FS_*` numbers (and `DISK_SECTORS`) up by the same amount.
+  The kernel is loaded at 1 MB and its slot ends at `KERNEL_BSS_ADDR`, so
+  past 1 MB also move `.bss`, the stack and what follows up in
+  `include/memmap.inc` (the build stops with an error if they overlap).
 
 ## Tests
 

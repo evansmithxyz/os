@@ -27,13 +27,16 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 
 from build import read_map  # noqa: E402
+from mkimage import parse_inc  # noqa: E402
 from tests.harness import Machine, OUTPUT  # noqa: E402
 
 PROF_ADDR = 0x01C00000
+MEMMAP = parse_inc(ROOT / "include" / "memmap.inc")
 
 
 def symbolize(samples, labels):
-    symbols = sorted((addr, name) for name, addr in read_map().items() if 0x10000 <= addr < 0x100000)
+    code = range(MEMMAP["KERNEL_ADDR"], MEMMAP["KERNEL_BSS_ADDR"])
+    symbols = sorted((addr, name) for name, addr in read_map().items() if addr in code)
     addrs = [a for a, _ in symbols]
     counts = Counter()
     for rip in samples:

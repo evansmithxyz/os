@@ -208,7 +208,8 @@ def cmd_debug(args: argparse.Namespace) -> int:
     cmd = qemu_args(headless=args.headless, extra=["-s", "-S"])
     print("QEMU is paused and waiting for a debugger:")
     print("  gdb -ex 'target remote localhost:1234' -ex 'set architecture i386:x86-64'")
-    print("  (break *0x10000 for kernel_entry; symbols are in build/kernel.map)")
+    kernel_addr = mkimage.parse_inc(ROOT / "include" / "memmap.inc")["KERNEL_ADDR"]
+    print(f"  (break *{kernel_addr:#x} for kernel_entry; symbols are in build/kernel.map)")
     return subprocess.call(cmd)
 
 

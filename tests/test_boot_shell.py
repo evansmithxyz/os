@@ -15,7 +15,7 @@ class BootTest(OSTestCase):
         self.assertIn("AGOS stage2: loading kernel", out)
         self.assertIn("AGOS stage2: entering long mode", out)
         self.assertRegex(out, r"\[BOOT\] Memory: \d+ MB usable")
-        self.assertRegex(out, r"\[BOOT\] Kernel: \d+ KB of 512 KB slot")
+        self.assertRegex(out, r"\[BOOT\] Kernel: \d+ KB of 1024 KB slot")
         self.assertIn("[FS] AntigravityFS mounted.", out)
         self.assertIn("[NET] RTL8139 NIC", out)
 
@@ -25,6 +25,13 @@ class BootTest(OSTestCase):
         self.assertIn("usable", out)
         # QEMU was started with -m 256M
         self.assertRegex(out, r"Usable total:\s+25\d MB")
+
+    def test_kernel_loaded_above_1mb(self):
+        """Stage 2 copies the kernel past real mode's 1 MB limit (unreal mode)."""
+        out = self.vm.run("mem")
+        self.assertRegex(out, r"Kernel image:\s+0x0+100000 - 0x0+1[0-9A-Fa-f]{5}\s+\(\d+ KB of 1024 KB\)")
+        self.assertRegex(out, r"Kernel \.bss:\s+0x0+200000 - ")
+        self.assertRegex(out, r"Stack top:\s+0x0+400000")
 
     def test_sysinfo(self):
         out = self.vm.run("sysinfo")

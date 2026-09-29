@@ -437,9 +437,10 @@ docs/                   CONVENTIONS.md, screenshots
    stage 2 to `0x7E00`.
 2. **Stage 2.**
    - Prints its progress to COM1.
-   - Loads the kernel to `0x10000` in 32 KB chunks. `mkimage.py` patches the
-     kernel's sector count into the stage 2 header.
-   - Enables A20, stores the E820 map at `0x600`, switches to protected mode,
+   - Enables A20 and loads the kernel to `0x100000` in 32 KB chunks: each is
+     read into a buffer at `0x10000` and copied above 1 MB in unreal mode.
+     `mkimage.py` patches the kernel's sector count into the stage 2 header.
+   - Stores the E820 map at `0x600`, switches to protected mode,
      builds the page tables at `0x1000`, and jumps to 64-bit `kernel_entry`.
 3. **Kernel.**
    - Zeroes `.bss` (1 MB) and loads its own GDT.
@@ -453,10 +454,10 @@ docs/                   CONVENTIONS.md, screenshots
 |---|---|
 | 0 | stage 1 (MBR) |
 | 1–31 | stage 2 |
-| 32–1055 | kernel slot (512 KB; the kernel uses about 465 KB today) |
-| 1056 | AFS superblock `"AFS1"` |
-| 1057–1058 | inode table (32 × 32 bytes) |
-| 1059–4095 | file data (2 MB image) |
+| 32–2079 | kernel slot (1 MB; the kernel uses about 465 KB today) |
+| 2080 | AFS superblock `"AFS1"` |
+| 2081–2082 | inode table (32 × 32 bytes) |
+| 2083–8191 | file data (4 MB image) |
 
 ### Memory map (`include/memmap.inc`)
 
@@ -465,10 +466,11 @@ docs/                   CONVENTIONS.md, screenshots
 | `0x500` / `0x600` | boot info / E820 map from stage 2 |
 | `0x1000–0x6FFF` | page tables (PML4, PDPT, 4 × PD) |
 | `0x7C00` / `0x7E00` | stage 1 / stage 2 |
-| `0x10000` | kernel image (`.text`, `.rodata`, `.cmdtab`, `.data`) |
-| `0x100000` | kernel `.bss` (zeroed at boot) |
-| `0x200000–0x2FFFFF` | kernel stack |
-| `0x300000` | RTL8139 RX ring and TX buffers |
+| `0x10000` | stage 2's kernel load buffer (32 KB, boot only) |
+| `0x20000` | RTL8139 RX ring and TX buffers |
+| `0x100000` | kernel image (`.text`, `.rodata`, `.cmdtab`, `.data`) |
+| `0x200000` | kernel `.bss` (zeroed at boot) |
+| `0x300000–0x3FFFFF` | kernel stack |
 | `0x400000` / `0x500000` | last HTTP(S) response / the browser's page (1 MB each) |
 | `0x600000` / `0xA00000` / `0xC00000` | DOM nodes / CSS rules / layout display list |
 | `0x1000000` | GUI back buffer, wallpaper, canvas (3 MB each) |
