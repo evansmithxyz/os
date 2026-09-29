@@ -70,17 +70,22 @@ WIN_TICK                equ 104
 WIN_SIZE                equ 128
 
 ; --- layout ------------------------------------------------------------------------
-TASKBAR_H               equ 36
-FOOTER_Y                equ 742
-FOOTER_H                equ GFX_HEIGHT - FOOTER_Y
-TITLE_H                 equ 28
-WIN_BORDER              equ 2
+TASKBAR_H               equ 28
+TITLE_H                 equ 32      ; title bar, including its bottom rule
+WIN_BORDER              equ 1
+WIN_RADIUS              equ 10      ; rounded window corners
 WIN_MIN_W               equ 240
 WIN_MIN_H               equ 140
-WM_MAX_X                equ 20
-WM_MAX_Y                equ 45
-WM_MAX_W                equ 984
-WM_MAX_H                equ 690
+WM_MAX_X                equ 8       ; maximized: below the top bar, above the dock
+WM_MAX_Y                equ TASKBAR_H + 8
+WM_MAX_W                equ GFX_WIDTH - 2 * WM_MAX_X
+WM_MAX_H                equ DOCK_Y - 8 - WM_MAX_Y
+WM_BTN_Y                equ 10      ; close / minimize / maximize: 12 px circles
+WM_BTN_X                equ 14      ; x of the first, then every WM_BTN_STEP
+WM_BTN_STEP             equ 20
+WM_BTN_SIZE             equ 12
+WM_BADGE_W              equ 40      ; workspace badge at the right of the title
+WM_BADGE_RIGHT          equ 12
 
 ; --- hit test results ------------------------------------------------------------
 HIT_NONE                equ 0
@@ -118,10 +123,10 @@ GUI_IDLE_REDRAW_MS      equ 40
 section .data
 align 16
 wm_windows:
-    WINDOW 4, 60, 52, 904, 670, sysmon_title,   sysmon_label,   sysmon_draw,   sysmon_key,   0,              0,            sysmon_tick
-    WINDOW 1, 60, 52, 904, 670, term_title,     term_label,     term_draw,     term_key,     0,              0,            0
-    WINDOW 3, 60, 52, 904, 670, canvas_title,   canvas_label,   canvas_draw,   canvas_key,   canvas_mouse,   0,            0
-    WINDOW 2, 60, 52, 904, 670, browser_page_title, browser_label, browser_draw, browser_key, browser_mouse, browser_open, 0
+    WINDOW 4, 56, 44, 912, 640, sysmon_title,   sysmon_label,   sysmon_draw,   sysmon_key,   0,              0,            sysmon_tick
+    WINDOW 1, 56, 44, 912, 640, term_title,     term_label,     term_draw,     term_key,     0,              0,            0
+    WINDOW 3, 56, 44, 912, 640, canvas_title,   canvas_label,   canvas_draw,   canvas_key,   canvas_mouse,   0,            0
+    WINDOW 2, 56, 44, 912, 640, browser_page_title, browser_label, browser_draw, browser_key, browser_mouse, browser_open, 0
 
 wm_zorder:              db WIN_SYSMON, WIN_CANVAS, WIN_BROWSER, WIN_TERM   ; bottom -> top
 wm_zorder_default:      db WIN_SYSMON, WIN_CANVAS, WIN_BROWSER, WIN_TERM
@@ -145,6 +150,7 @@ gui_drag_orig_y:        dd 0
 gui_drag_orig_w:        dd 0
 gui_drag_orig_h:        dd 0
 gui_last_second:        dd 0
+gui_last_minute:        db 0xFF
 align 8
 gui_last_redraw:        dq 0
 gui_last_tick:          dq 0
@@ -201,6 +207,7 @@ gui_run:
 
     call gfx_reset_clip
     call desktop_render_wallpaper
+    call desktop_update_clock
     call canvas_init
     call wm_reset_layout
     call term_reset                 ; clears the terminal, prints the prompt
@@ -336,7 +343,7 @@ gui_idle:
 .ret:
     ret
 
-; gui_ticks: periodic work (window tick callbacks, the footer clock)
+; gui_ticks: periodic work (window tick callbacks, the top bar clock)
 gui_ticks:
     push rax
     push rbx
@@ -348,10 +355,15 @@ gui_ticks:
     mov rax, [timer_ticks]
     mov [gui_last_tick], rax
 
-    call timer_uptime_seconds       ; footer clock changes once per second
-    cmp eax, [gui_last_second]
+    call timer_uptime_seconds       ; the top bar clock: read once a second,
+    cmp eax, [gui_last_second]      ; redrawn when the minute changes
     je .windows
     mov [gui_last_second], eax
+    call desktop_update_clock
+    mov al, [rtc_minute]
+    cmp al, [gui_last_minute]
+    je .windows
+    mov [gui_last_minute], al
     mov byte [gui_dirty], 1
 .windows:
     xor ecx, ecx
@@ -544,8 +556,8 @@ gui_mouse_wheel:
     mov r8d, eax
     cmp edx, TASKBAR_H
     jb .done
-    cmp edx, FOOTER_Y
-    jae .done
+    call desktop_in_dock
+    jc .done
     call wm_hit_test                ; AL = window, AH = hit code
     cmp al, WIN_NONE
     je .done
@@ -624,8 +636,8 @@ gui_mouse_press:
     call desktop_taskbar_click
     jmp .done
 .windows:
-    cmp edx, FOOTER_Y               ; the footer covers the bottom of windows
-    jae .done
+    call desktop_dock_click         ; the dock sits on top of windows
+    jc .done
     call wm_hit_test                ; AL = window, AH = hit code
     cmp al, WIN_NONE
     je .done
@@ -724,9 +736,9 @@ gui_drag_update:
     jge .y_min
     mov eax, TASKBAR_H
 .y_min:
-    cmp eax, FOOTER_Y - TITLE_H
+    cmp eax, GFX_HEIGHT - TITLE_H
     jle .y_max
-    mov eax, FOOTER_Y - TITLE_H
+    mov eax, GFX_HEIGHT - TITLE_H
 .y_max:
     mov [rbx + WIN_Y], eax
     jmp .dirty
@@ -755,7 +767,7 @@ gui_drag_update:
     jge .h_min
     mov eax, WIN_MIN_H
 .h_min:
-    mov ecx, FOOTER_Y
+    mov ecx, GFX_HEIGHT
     sub ecx, [rbx + WIN_Y]
     cmp ecx, WIN_MIN_H
     jge .h_room
@@ -1138,26 +1150,27 @@ wm_hit_test:
     cmp edx, r10d
     jge .loop
 
-    ; Inside window EAX. Title-bar buttons (y+5 .. y+24)
+    ; Inside window EAX. Title-bar buttons: each owns WM_BTN_STEP pixels
+    ; around its circle, 4 pixels above and below it
     mov r10d, edx
     sub r10d, r9d                   ; r10 = y within window
     mov edi, ecx
     sub edi, r8d                    ; edi = x within window
-    cmp r10d, 5
+    cmp r10d, WM_BTN_Y - 4
     jl .not_button
-    cmp r10d, 24
-    jg .not_button
+    cmp r10d, WM_BTN_Y + WM_BTN_SIZE + 4
+    jge .not_button
     mov ah, HIT_CLOSE
-    cmp edi, 8
+    cmp edi, WM_BTN_X - 4
     jl .not_button
-    cmp edi, 24
-    jle .hit
+    cmp edi, WM_BTN_X - 4 + WM_BTN_STEP
+    jl .hit
     mov ah, HIT_MINIMIZE
-    cmp edi, 39
-    jle .hit
+    cmp edi, WM_BTN_X - 4 + 2 * WM_BTN_STEP
+    jl .hit
     mov ah, HIT_MAXIMIZE
-    cmp edi, 56
-    jle .hit
+    cmp edi, WM_BTN_X - 4 + 3 * WM_BTN_STEP
+    jl .hit
 .not_button:
     cmp byte [rbx + WIN_STATE], WIN_STATE_MAXIMIZED
     je .title_or_client
@@ -1189,12 +1202,12 @@ wm_hit_test:
     mov r8d, [rbx + WIN_W]
     cmp r8d, 140                    ; narrow windows have no badge
     jl .hit
-    lea esi, [r8d - 58]
+    lea esi, [r8d - WM_BADGE_RIGHT - WM_BADGE_W]
     cmp edi, esi
     jl .hit
-    lea esi, [r8d - 12]
+    lea esi, [r8d - WM_BADGE_RIGHT]
     cmp edi, esi
-    jg .hit
+    jge .hit
     mov ah, HIT_WS_BADGE
 .hit:
     jmp .done
@@ -1299,11 +1312,11 @@ wm_compose:
     mov rsi, GUI_WALLPAPER_ADDR
     call gfx_copy_frame
 
-    ; Windows, bottom to top, clipped to the area between the two bars
+    ; Windows, bottom to top, below the top bar
     xor ecx, ecx
     mov edx, TASKBAR_H
     mov esi, GFX_WIDTH
-    mov r8d, FOOTER_Y - TASKBAR_H
+    mov r8d, GFX_HEIGHT - TASKBAR_H
     call gfx_push_clip
     xor r12d, r12d
 .loop:
@@ -1319,8 +1332,8 @@ wm_compose:
     jb .loop
     call gfx_pop_clip
 
+    call desktop_draw_dock
     call desktop_draw_taskbar
-    call desktop_draw_footer
 
     pop r12
     pop r8
@@ -1343,6 +1356,7 @@ wm_draw_window:
     call gfx_push_clip
     call wm_call_draw
     call gfx_pop_clip
+    call wm_finish_frame
     pop r8
     pop rsi
     pop rdx
@@ -1350,8 +1364,9 @@ wm_draw_window:
     pop rax
     ret
 
-; wm_draw_frame: RBX = window, EAX = its id. Shadow, border, title bar,
-; traffic-light buttons, title, workspace badge and resize grip.
+; wm_draw_frame: RBX = window, EAX = its id. Shadow, body, title bar with
+; the close / minimize / maximize lights, the title and the workspace badge.
+; Saves what is under the corners: wm_finish_frame rounds them afterwards.
 wm_draw_frame:
     push rax
     push rbx
@@ -1359,145 +1374,133 @@ wm_draw_frame:
     push rdx
     push rsi
     push rdi
+    push rbp
     push r8
     push r9
     push r10
     push r11
     push r12
     push r13
+    push r14
+    push r15
 
-    xor r13d, r13d                  ; r13 = 1 if focused
+    xor ebp, ebp                    ; EBP = 1 if focused
     cmp al, [wm_focus]
     jne .unfocused
-    mov r13d, 1
+    mov ebp, 1
 .unfocused:
-    mov r9d, [rbx + WIN_X]
-    mov r10d, [rbx + WIN_Y]
-    mov r11d, [rbx + WIN_W]
-    mov r12d, [rbx + WIN_H]
+    mov r12d, [rbx + WIN_X]
+    mov r13d, [rbx + WIN_Y]
+    mov r14d, [rbx + WIN_W]
+    mov r15d, [rbx + WIN_H]
 
-    lea ecx, [r9d + 6]              ; drop shadow
-    lea edx, [r10d + 6]
-    mov esi, r11d
-    mov r8d, r12d
-    mov eax, THEME_SHADOW
+    mov ecx, r12d                   ; soft shadow, deeper when focused
+    mov edx, r13d
+    mov esi, r14d
+    mov r8d, r15d
+    mov r9d, WIN_RADIUS
+    mov r10d, 16
+    mov r11d, 4
+    mov edi, 90
+    test ebp, ebp
+    jz .shadow
+    mov r10d, 26
+    mov r11d, 8
+    mov edi, THEME_SHADOW_ALPHA
+.shadow:
+    call gfx_shadow
+    call gfx_corners_save
+
+    mov eax, THEME_WIN_BODY         ; body
     call gfx_fill_rect
-
-    mov ecx, r9d                    ; body
-    mov edx, r10d
-    mov eax, THEME_WIN_BODY
-    call gfx_fill_rect
-
-    mov r8d, TITLE_H                ; title bar
-    mov eax, THEME_PANEL
-    test r13d, r13d
+    mov r8d, TITLE_H - 1            ; title bar and its rule
+    mov eax, THEME_TITLE_IDLE
+    test ebp, ebp
     jz .title_fill
-    mov eax, THEME_TITLE_ACTIVE
+    mov eax, THEME_TITLE
 .title_fill:
     call gfx_fill_rect
-
-    mov edi, THEME_BORDER           ; border colour for accent line + outline
-    test r13d, r13d
-    jz .have_border
-    mov edi, THEME_ACCENT
-.have_border:
-    lea edx, [r10d + TITLE_H - 1]
+    lea edx, [r13d + TITLE_H - 1]
     mov r8d, 1
-    mov eax, edi
-    call gfx_fill_rect
-    mov edx, r10d
-    mov r8d, r12d
-    call gfx_draw_rect
-
-    mov edx, r10d                   ; close / minimize / maximize dots
-    add edx, 9
-    mov esi, 10
-    mov r8d, 10
-    lea ecx, [r9d + 12]
-    mov eax, THEME_RED
-    call gfx_fill_rect
-    lea ecx, [r9d + 27]
-    mov eax, THEME_YELLOW
-    call gfx_fill_rect
-    lea ecx, [r9d + 42]
-    mov eax, THEME_GREEN
+    mov eax, THEME_SEPARATOR
     call gfx_fill_rect
 
-    ; Title text, clipped so it never runs under the badge
-    mov ecx, r9d
-    mov edx, r10d
-    lea esi, [r11d - 64]
+    ; close / minimize / maximize (grey while the window is in the background)
+    lea ecx, [r12d + WM_BTN_X]
+    lea edx, [r13d + WM_BTN_Y]
+    mov esi, WM_BTN_SIZE
+    mov r8d, WM_BTN_SIZE
+    mov r9d, WM_BTN_SIZE / 2
+    lea r10, [wm_lights_idle]
+    test ebp, ebp
+    jz .lights
+    lea r10, [wm_lights]
+.lights:
+    xor r11d, r11d
+.light:
+    mov eax, [r10 + r11 * 4]
+    call gfx_fill_round_rect
+    add ecx, WM_BTN_STEP
+    inc r11d
+    cmp r11d, 3
+    jb .light
+
+    ; title: centred on the window, or left-aligned after the lights when it
+    ; would not fit; clipped so it never runs under the badge
+    lea ecx, [r12d + WM_BTN_X + 3 * WM_BTN_STEP]
+    mov edx, r13d
+    mov esi, r14d
+    sub esi, WM_BTN_X + 3 * WM_BTN_STEP + WM_BADGE_W + WM_BADGE_RIGHT + 8
     mov r8d, TITLE_H
     call gfx_push_clip
-    lea ecx, [r9d + 62]
-    lea edx, [r10d + 10]
     mov rsi, [rbx + WIN_TITLE]
+    call gfx_ui_width_bold
+    mov edx, r14d
+    sub edx, eax
+    sar edx, 1
+    add edx, r12d
+    cmp edx, ecx
+    jge .title_x
+    mov edx, ecx
+.title_x:
+    mov ecx, edx
+    lea edx, [r13d + 8]
     mov eax, THEME_TEXT_MUTED
-    test r13d, r13d
+    test ebp, ebp
     jz .title_text
     mov eax, THEME_TEXT
 .title_text:
-    push rbx
-    mov ebx, -1
-    call gfx_print_string
-    pop rbx
+    call gfx_print_ui_bold
     call gfx_pop_clip
 
-    ; Workspace badge "WS n"
-    cmp r11d, 140
-    jl .no_badge
-    lea ecx, [r9d + r11d - 58]
-    lea edx, [r10d + 5]
-    mov esi, 46
+    ; workspace badge "WS n"
+    cmp r14d, 140
+    jl .done
+    lea ecx, [r12d + r14d - WM_BADGE_RIGHT - WM_BADGE_W]
+    lea edx, [r13d + 7]
+    mov esi, WM_BADGE_W
     mov r8d, 18
-    mov eax, THEME_BADGE_BG
-    call gfx_fill_rect
-    mov eax, THEME_SKY
-    call gfx_draw_rect
-    add ecx, 7
-    add edx, 5
-    push rbx
+    mov r9d, 9
+    mov eax, THEME_HOVER
+    mov edi, 16
+    call gfx_blend_round_rect
+    add ecx, WM_BADGE_W / 2
     mov al, [rbx + WIN_WS]
     add al, '0'
     mov [wm_badge_digit], al
     lea rsi, [wm_badge_text]
-    mov eax, THEME_CYAN
-    mov ebx, -1
-    call gfx_print_string
-    pop rbx
-.no_badge:
-
-    ; Resize grip (not for maximized windows)
-    cmp byte [rbx + WIN_STATE], WIN_STATE_MAXIMIZED
-    je .done
-    mov eax, THEME_BORDER
-    test r13d, r13d
-    jz .grip
-    mov eax, THEME_CYAN
-.grip:
-    mov esi, 2
-    mov r8d, 2
-    lea ecx, [r9d + r11d - 5]
-    lea edx, [r10d + r12d - 5]
-    call gfx_fill_rect
-    sub ecx, 4
-    call gfx_fill_rect
-    sub ecx, 4
-    call gfx_fill_rect
-    add ecx, 4
-    sub edx, 4
-    call gfx_fill_rect
-    add ecx, 4
-    call gfx_fill_rect
-    sub edx, 4
-    call gfx_fill_rect
+    mov eax, THEME_TEXT_MUTED
+    call gfx_print_ui_centered
 .done:
+    pop r15
+    pop r14
     pop r13
     pop r12
     pop r11
     pop r10
     pop r9
     pop r8
+    pop rbp
     pop rdi
     pop rsi
     pop rdx
@@ -1505,6 +1508,58 @@ wm_draw_frame:
     pop rbx
     pop rax
     ret
+
+; wm_finish_frame: RBX = window, EAX = its id, after its client area is
+; drawn: resize grip, the outline, and the rounded corners
+wm_finish_frame:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push r8
+    push r9
+    mov r9d, eax
+    cmp byte [rbx + WIN_STATE], WIN_STATE_MAXIMIZED
+    je .outline
+    mov ecx, [rbx + WIN_X]          ; grip: three dots on a diagonal
+    add ecx, [rbx + WIN_W]
+    sub ecx, 7
+    mov edx, [rbx + WIN_Y]
+    add edx, [rbx + WIN_H]
+    sub edx, 7
+    mov esi, 2
+    mov r8d, 2
+    mov eax, THEME_TEXT_FAINT
+    call gfx_fill_rect
+    sub ecx, 4
+    call gfx_fill_rect
+    add ecx, 4
+    sub edx, 4
+    call gfx_fill_rect
+.outline:
+    mov ecx, [rbx + WIN_X]
+    mov edx, [rbx + WIN_Y]
+    mov esi, [rbx + WIN_W]
+    mov r8d, [rbx + WIN_H]
+    mov eax, THEME_WIN_EDGE
+    cmp r9b, [wm_focus]
+    jne .edge
+    mov eax, THEME_WIN_EDGE_FOCUS
+.edge:
+    mov r9d, WIN_RADIUS
+    call gfx_stroke_round_rect
+    call gfx_corners_cut
+    pop r9
+    pop r8
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+section .rodata
+wm_lights:              dd THEME_LIGHT_RED, THEME_LIGHT_YELLOW, THEME_LIGHT_GREEN
+wm_lights_idle:         dd THEME_LIGHT_IDLE, THEME_LIGHT_IDLE, THEME_LIGHT_IDLE
 
 section .data
 wm_badge_text:          db "WS "

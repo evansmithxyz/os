@@ -1,8 +1,9 @@
 """Desktop: window manager, workspaces, GUI terminal, canvas and browser.
 
-Coordinates below assume the default window geometry (x=60, y=52, 904x670):
-title bar y 52-79 with close/minimize/maximize dots at x 77/92/107, y 66;
-client area starts at (62, 80). Taskbar pills are laid out in gui/desktop.asm.
+Coordinates below assume the default window geometry (x=56, y=44, 912x640):
+title bar y 44-75 with close/minimize/maximize lights centred at x 76/96/116,
+y 60; client area starts at (57, 76). The top bar and the dock are laid out
+in gui/desktop.asm, the browser's toolbar in apps/browser.asm (BR_*).
 """
 
 import os
@@ -10,20 +11,23 @@ import re
 import time
 import unittest
 
-from tests.harness import PROMPT, OSTestCase
+from tests.harness import OUTPUT, PROMPT, ROOT, OSTestCase, agbuild
 from tests.test_net import BIG_HTML, HostWebServer
 
 # Theme colours (kernel/gui/theme.inc)
-ACCENT = 0x0284C7
-RED = 0xEF4444
-CANVAS_BG = 0x0D1117
+EDGE_FOCUS = 0x475681
+RED = 0xF7768E
+CANVAS_BG = 0x0E121B
 
-DOT_Y = 66
-CLOSE_X, MINIMIZE_X, MAXIMIZE_X = 77, 92, 107
-PILL_TERM_X, PILL_WEB_X = 375, 429
-EXIT_X = 966
-BOOKMARK_Y = 118
-BOOKMARK_DEMO_X, BOOKMARK_AFS_X = 178, 347
+DOT_Y = 60
+CLOSE_X, MINIMIZE_X, MAXIMIZE_X = 76, 96, 116
+DOCK_Y = 726                            # centre of the dock icons
+DOCK_TERM_X, DOCK_WEB_X = 425, 483
+POWER_X, POWER_Y = 1008, 14
+WS_BUTTON_X = (144, 172, 200, 228)      # top bar workspace buttons 1-4, y 14
+BOOKMARK_Y = 134
+BOOKMARK_DEMO_X, BOOKMARK_AFS_X = 180, 362
+PAGE_LINE_1, PAGE_LINE_2 = 178, 200     # first two lines of a page (default margins)
 
 
 class DesktopTest(OSTestCase):
@@ -41,7 +45,7 @@ class DesktopTest(OSTestCase):
 
     def test_exit_button(self):
         self.start_gui()
-        self.vm.click(EXIT_X, 17)
+        self.vm.click(POWER_X, POWER_Y)
         self.vm.expect("gui: stopped")
 
     def test_terminal_runs_real_commands(self):
@@ -84,26 +88,54 @@ class DesktopTest(OSTestCase):
         self.vm.mouse_home()
         self.vm.click(MAXIMIZE_X, DOT_Y)
         self.vm.expect("wm: maximize Terminal")
-        self.vm.click(20 + 47, 45 + 14)     # maximized windows sit at (20, 45)
+        self.vm.click(8 + 60, 36 + 16)      # maximized windows sit at (8, 36)
         self.vm.expect("wm: restore Terminal")
         self.vm.click(MINIMIZE_X, DOT_Y)
         self.vm.expect("wm: minimize Terminal")
-        self.vm.click(PILL_TERM_X, 17)
+        self.vm.click(DOCK_TERM_X, DOCK_Y)
         self.vm.expect("wm: open Terminal")
         self.vm.click(CLOSE_X, DOT_Y)
         self.vm.expect("wm: close Terminal")
-        self.vm.click(PILL_TERM_X, 17)
+        self.vm.click(DOCK_TERM_X, DOCK_Y)
         self.vm.expect("wm: open Terminal")
+
+    def test_dock_opens_and_minimizes_apps(self):
+        self.start_gui()
+        self.vm.mouse_home()
+        self.vm.click(DOCK_WEB_X, DOCK_Y)   # on workspace 2: goes there
+        self.vm.expect("wm: open Browser")
+        self.vm.click(DOCK_WEB_X, DOCK_Y)   # focused: minimizes
+        self.vm.expect("wm: minimize Browser")
+        self.vm.click(DOCK_WEB_X, DOCK_Y)
+        self.vm.expect("wm: open Browser")
+
+    def test_top_bar_workspace_buttons(self):
+        self.start_gui()
+        self.vm.mouse_home()
+        self.vm.click(WS_BUTTON_X[2], 14)
+        self.vm.expect("wm: workspace 3")
+        self.vm.click(WS_BUTTON_X[0], 14)
+        self.vm.expect("wm: workspace 1")
+
+    def test_windows_have_rounded_corners(self):
+        self.start_gui()
+        self.vm.mouse_home()
+        shot = self.vm.screenshot("corners")
+        self.assertEqual(shot.pixel_hex(56 + 100, 44), EDGE_FOCUS, "the outline's straight top edge")
+        self.assertEqual(shot.pixel_hex(56, 44 + 100), EDGE_FOCUS, "the outline's straight left edge")
+        self.assertNotEqual(shot.pixel_hex(56, 44), EDGE_FOCUS, "the corner pixel is cut away")
 
     def test_drag_and_resize(self):
         self.start_gui()
         self.vm.mouse_home()
-        self.vm.drag(959, 717, 700, 500)    # resize from the corner grip
-        self.vm.drag(300, 65, 400, 165)     # then move by (+100, +100)
+        self.vm.drag(960, 676, 700, 500)    # resize from the corner grip: 652x464
+        self.vm.drag(300, 60, 400, 160)     # then move by (+100, +100)
         time.sleep(0.4)
         shot = self.vm.screenshot("moved")
-        self.assertEqual(shot.pixel_hex(160, 152), ACCENT, "focused frame at its new position")
-        self.assertEqual(shot.pixel_hex(160 + 645 - 1, 152 + 453 - 1), ACCENT, "new size 645x453")
+        # the outline's straight edges (the corners are rounded)
+        self.assertEqual(shot.pixel_hex(156 + 200, 144), EDGE_FOCUS, "focused frame at its new position")
+        self.assertEqual(shot.pixel_hex(156 + 652 - 1, 144 + 200), EDGE_FOCUS, "new width 652")
+        self.assertEqual(shot.pixel_hex(156 + 200, 144 + 464 - 1), EDGE_FOCUS, "new height 464")
 
     def test_canvas_paints_and_clears(self):
         self.start_gui()
@@ -135,8 +167,8 @@ class DesktopTest(OSTestCase):
         self.vm.key("f2")
         self.vm.expect("wm: workspace 2")
         self.vm.mouse_home()
-        self.vm.drag(300, 65, 140, 65)      # window x: 60 -> -100
-        self.vm.click(20, 231)              # the visible end of the "Showcase Demo" link
+        self.vm.drag(300, 60, 140, 60)      # window x: 56 -> -104
+        self.vm.click(20, 284)              # the visible end of the "Showcase Demo" link
         self.vm.expect("browser: CyberSurf - HTML Showcase Demo")
 
     def test_browser_command_opens_afs_file(self):
@@ -229,7 +261,7 @@ class DesktopTest(OSTestCase):
             self.assertNotIn("VISIBLE UNTIL HIDDEN", line)
             # the first line runs location.href = 'hello.html' when clicked
             self.vm.mouse_home()
-            self.vm.click(100, 148)
+            self.vm.click(100, PAGE_LINE_1)
             self.vm.expect(f"js: navigate -> http://10.0.2.2:{web.port}/hello.html")
             self.vm.expect("browser text: Hello from the host", timeout=20)
 
@@ -271,11 +303,11 @@ class DesktopTest(OSTestCase):
         with HostWebServer() as web:
             self.open_page(web, "click.html")
             self.vm.mouse_home()
-            self.vm.click(100, 148)         # the first line: onclick="" plus listeners
+            self.vm.click(100, PAGE_LINE_1)  # the first line: onclick="" plus listeners
             self.vm.expect("js: listener click big big")
             self.vm.expect("js: bubbled to body big")
             self.vm.expect("browser text: CLICKED 1")
-            self.vm.click(100, 170)         # a link whose handler calls preventDefault()
+            self.vm.click(100, PAGE_LINE_2)  # a link whose handler calls preventDefault()
             self.vm.expect("js: link cancelled")
             time.sleep(1.5)
         self.assertNotIn("Hello from the host", self.vm.output)
@@ -294,11 +326,11 @@ class DesktopTest(OSTestCase):
             self.vm.key("home")
             line = self.vm.expect(r"browser text: [^\r\n]*\r?\n", regex=True)
             self.assertIn("browser text: Collapsed", line)
-            # two wheel notches down over the page: 2 x 3 lines
+            # two wheel notches down over the page: 2 x 3 lines of 18 pixels
             self.vm.mouse_home()
             self.vm.mouse_to(500, 400)
             self.vm.wheel(2)
-            self.vm.expect("browser scroll: 84")
+            self.vm.expect("browser scroll: 108")
             self.vm.wheel(-2)
             self.vm.expect("browser scroll: 0")
 
@@ -307,7 +339,7 @@ class DesktopTest(OSTestCase):
         with HostWebServer() as web:
             self.open_page(web, "links.html")
             self.vm.mouse_home()
-            self.vm.click(100, 148)         # first line of the page: "Go to sub"
+            self.vm.click(100, PAGE_LINE_1)  # first line of the page: "Go to sub"
             self.vm.expect(f"browser: redirect -> http://10.0.2.2:{web.port}/sub/", timeout=20)
             self.vm.expect("browser text: Sub page")
 
@@ -325,6 +357,30 @@ class DesktopTest(OSTestCase):
         line = self.vm.expect(r"browser text: [^\r\n]*\r?\n", regex=True)
         self.assertRegex(line, r"browser text: \S", "something visible was drawn")
         self.assertNotIn("function", line, "script source must not be drawn")
+
+
+class FontTest(unittest.TestCase):
+    """tools/build.py turns kernel/gfx/font.txt into the kernel's font tables."""
+
+    def test_font_tables(self):
+        out = OUTPUT / "font.inc"
+        OUTPUT.mkdir(parents=True, exist_ok=True)
+        agbuild.make_font(ROOT / "kernel" / "gfx" / "font.txt", out)
+        text = out.read_text()
+        glyphs = re.findall(r"^    db (?:0x[0-9A-F]{2}, ){15}0x[0-9A-F]{2}  ; (\d+)$", text, re.M)
+        self.assertEqual([int(c) for c in glyphs], list(range(32, 127)))
+        prop = {int(c): (int(left), int(adv))
+                for left, adv, c in re.findall(r"^    db (\d+), (\d+)  ; (\d+)$", text, re.M)}
+        self.assertEqual(prop[ord(" ")], (0, 4), "a space is 4 pixels")
+        self.assertEqual(prop[ord("i")], (1, 4), "'i' is inked in columns 1-3")
+        self.assertLess(prop[ord("l")][1], prop[ord("m")][1], "proportional widths")
+
+    def test_bad_glyph_is_reported(self):
+        bad = OUTPUT / "bad_font.txt"
+        OUTPUT.mkdir(parents=True, exist_ok=True)
+        bad.write_text("== A\n" + "..#..\n" * 16)
+        with self.assertRaisesRegex(agbuild.BuildError, "glyph 'A' needs 16 rows"):
+            agbuild.make_font(bad, OUTPUT / "bad_font.inc")
 
 
 if __name__ == "__main__":

@@ -4,9 +4,10 @@
 ; Loaded by stage 1 to STAGE2_ADDR, entered in 16-bit real mode with the boot
 ; drive in DL. Steps:
 ;   1. Init COM1 so boot progress is visible on the serial console
-;   2. Load the kernel (s2_kernel_sectors, patched in by tools/mkimage.py)
-;      to KERNEL_ADDR in 32 KB chunks that never cross a 64 KB DMA boundary
-;   3. Enable A20 and collect the BIOS E820 memory map into BOOTINFO
+;   2. Enable A20, then load the kernel (s2_kernel_sectors, patched in by
+;      tools/mkimage.py) to KERNEL_ADDR above 1 MB: each 32 KB chunk is read
+;      into KERNEL_LOAD_BUF and copied up in unreal mode (copy_high)
+;   3. Collect the BIOS E820 memory map into BOOTINFO
 ;   4. Enter 32-bit protected mode, build 4-level identity paging for 0-4 GB
 ;      with 2 MB pages, enable long mode and jump to the 64-bit kernel
 ; ==============================================================================
@@ -36,7 +37,21 @@ s2_start:
     call print
 
     ; ---------------------------------------------------------------------
-    ; 1. Load kernel
+    ; 1. A20 line (BIOS first, then the "fast A20" port). Needed before the
+    ;    kernel load: the kernel lives above 1 MB.
+    ; ---------------------------------------------------------------------
+    mov ax, 0x2401
+    int 0x15
+    in al, 0x92
+    test al, 2
+    jnz .a20_done
+    or al, 2
+    and al, 0xFE
+    out 0x92, al
+.a20_done:
+
+    ; ---------------------------------------------------------------------
+    ; 2. Load kernel
     ; ---------------------------------------------------------------------
     mov cx, [s2_kernel_sectors]
     test cx, cx
@@ -45,7 +60,7 @@ s2_start:
     ja .no_kernel
 
     mov eax, KERNEL_LBA                         ; next LBA to read
-    mov bx, KERNEL_ADDR >> 4                    ; destination segment
+    mov dword [s2_load_dest], KERNEL_ADDR
 .load_loop:
     test cx, cx
     jz .loaded
@@ -55,8 +70,8 @@ s2_start:
     mov dx, KERNEL_CHUNK
 .chunk_ok:
     mov [dap_count], dx
-    mov word [dap_offset], 0
-    mov [dap_segment], bx
+    mov word [dap_offset], KERNEL_LOAD_BUF & 0xF
+    mov word [dap_segment], KERNEL_LOAD_BUF >> 4
     mov [dap_lba], eax
     mov dword [dap_lba + 4], 0
 
@@ -68,11 +83,10 @@ s2_start:
     popad
     jc .disk_error
 
+    call copy_high
     sub cx, dx
     movzx edx, dx
     add eax, edx
-    shl dx, 5                                   ; sectors * 512 / 16 = paragraphs
-    add bx, dx
     push eax
     mov al, '.'
     call putc_both
@@ -82,19 +96,6 @@ s2_start:
 .loaded:
     mov si, msg_crlf
     call print
-
-    ; ---------------------------------------------------------------------
-    ; 2. A20 line (BIOS first, then the "fast A20" port)
-    ; ---------------------------------------------------------------------
-    mov ax, 0x2401
-    int 0x15
-    in al, 0x92
-    test al, 2
-    jnz .a20_done
-    or al, 2
-    and al, 0xFE
-    out 0x92, al
-.a20_done:
 
     ; ---------------------------------------------------------------------
     ; 3. BIOS E820 memory map -> E820_MAP_ADDR, count -> BOOTINFO
@@ -225,6 +226,41 @@ print:                                          ; DS:SI NUL-terminated string
     pop ax
     ret
 
+; copy_high: copy DX sectors from KERNEL_LOAD_BUF to the 32-bit address in
+; s2_load_dest and advance it. Real-mode segments stop at 64 KB, so DS and ES
+; are loaded with the flat 4 GB descriptor in protected mode first ("unreal
+; mode"): the cached limits survive the switch back, and a32 moves reach any
+; address. Done per chunk because a BIOS call may reload the segments.
+copy_high:
+    pushad
+    cli
+    lgdt [gdt_descriptor]
+    mov eax, cr0
+    or al, 1
+    mov cr0, eax
+    jmp short .pm
+.pm:
+    mov bx, DATA_SEG32
+    mov ds, bx
+    mov es, bx
+    and al, 0xFE
+    mov cr0, eax
+    jmp short .rm
+.rm:
+    xor bx, bx                                  ; real-mode bases again (0),
+    mov ds, bx                                  ; the 4 GB limits stay
+    mov es, bx
+    movzx ecx, dx
+    shl ecx, 7                                  ; sectors * 512 / 4 = dwords
+    mov esi, KERNEL_LOAD_BUF
+    mov edi, [s2_load_dest]
+    cld
+    a32 rep movsd
+    mov [s2_load_dest], edi
+    sti
+    popad
+    ret
+
 ; ------------------------------------------------------------------------------
 ; 32-bit protected mode: build page tables, enable long mode
 ; ------------------------------------------------------------------------------
@@ -344,7 +380,9 @@ dap_segment:    dw 0
 dap_lba:        dq 0
 
 s2_boot_drive:  db 0
-msg_stage2:     db "AGOS stage2: loading kernel", 0
+align 4
+s2_load_dest:   dd 0                            ; where copy_high puts the next chunk
+msg_stage2:    db "AGOS stage2: loading kernel", 0
 msg_crlf:       db 13, 10, 0
 msg_pmode:      db "AGOS stage2: entering long mode", 13, 10, 0
 msg_no_kernel:  db 13, 10, "stage2: no kernel (run tools/mkimage.py)", 0
@@ -353,4 +391,7 @@ msg_no_lm:      db "This CPU does not support x86_64 long mode", 0
 
 %if ($ - $$) > STAGE2_SECTORS * SECTOR_SIZE
     %error "stage2 is larger than STAGE2_SECTORS"
+%endif
+%if (KERNEL_LOAD_BUF & 0xFFFF) + KERNEL_CHUNK * SECTOR_SIZE > 0x10000
+    %error "KERNEL_LOAD_BUF + KERNEL_CHUNK crosses a 64 KB DMA boundary"
 %endif

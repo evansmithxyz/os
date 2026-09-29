@@ -41,14 +41,18 @@ windowed desktop with i3-style workspaces.
   number formatting. Run it with `js`; web pages run it too.
 - **Desktop:**
   - 1024×768×32 graphics through the Bochs/QEMU display adapter.
-  - Movable and resizable windows with minimize and maximize, and 4
-    workspaces.
+  - A wallpaper of soft glows, a translucent top bar (workspaces, clock,
+    network, memory, power) and a dock with the apps.
+  - Rounded, anti-aliased windows with soft shadows; movable and resizable,
+    with minimize and maximize, and 4 workspaces.
+  - Its own 8x16 font, drawn as ASCII art in `kernel/gfx/font.txt`:
+    monospace in the terminal and web pages, proportional in the interface.
   - Apps:
     - a terminal that runs the same shell as the text console
     - the CyberSurf web browser: built-in pages, `afs://` files, real HTTP
       and HTTPS with redirects; an HTML parser, a CSS engine (style sheets,
       selectors, the cascade, `@media`), a layout engine drawing with the
-      8x8 font, and page scripts with the DOM and click events; scrolling
+      8x16 font, and page scripts with the DOM and click events; scrolling
       and relative links
     - a paint canvas
     - a live system monitor
@@ -108,11 +112,13 @@ into the browser.
 |---|---|
 | F1–F4, Alt+1–4 | Switch workspace |
 | Shift+F1–F4 | Move the focused window to that workspace |
-| Title bar dots | Close / minimize / maximize |
+| Title bar lights | Close / minimize / maximize |
 | Drag title bar or bottom-right corner | Move / resize |
 | `WS n` badge in the title bar | Send the window to the next workspace |
-| Taskbar `+Term` `+Web` `+Dev` `+Sys` | Open, focus or minimize an app |
-| Esc or `Exit` | Back to the text console |
+| Dock icons | Open, focus or minimize an app |
+| Top bar `1`–`4` | Switch workspace |
+| Top bar logo | Every window back to its default workspace and place |
+| Esc or the power button | Back to the text console |
 
 The terminal window runs the real shell, so every command works there too.
 `ws [n]` and `ws move n` control workspaces from inside it.
@@ -148,8 +154,8 @@ below):
    background colours. It is redone only when the page or the window width
    changes; scrolling just repaints.
 
-Everything is drawn with the 8x8 font, so there are no font sizes, and CSS
-lengths are halved to match it. Not supported: `var()`, attribute
+Everything is drawn with the 8x16 font, so there are no font sizes, and CSS
+lengths are halved to match its 8-pixel width. Not supported: `var()`, attribute
 selectors, `+`/`~`, pseudo-elements, floats, flexbox and grid as layouts
 (they become plain blocks), positioning, images. Scroll with Up/Down,
 PgUp/PgDn, Home/End or the mouse wheel. Pages up to 1 MB are kept.
@@ -417,8 +423,10 @@ kernel/
                         typed (typed arrays), proxy (Proxy), text (URI, base64),
                         jsdom (the DOM API), js (API, printing),
                         prelude.js / dom.js (the library parts written in JavaScript)
-  gfx/                  clipped 2D drawing, font, back buffer, mouse pointer
-  gui/                  window manager + event loop, taskbar/footer, theme colours
+  gfx/                  clipped 2D drawing (alpha blending, anti-aliased rounded
+                        boxes, shadows), font.txt (the font), mouse pointer
+  gui/                  window manager + event loop, wallpaper, top bar, dock,
+                        theme colours
   apps/                 terminal, browser, canvas, sysmon windows
   apps/shell/           line editor + command table + command handlers
 rootfs/                 files copied onto a freshly formatted disk
@@ -437,9 +445,10 @@ docs/                   CONVENTIONS.md, screenshots
    stage 2 to `0x7E00`.
 2. **Stage 2.**
    - Prints its progress to COM1.
-   - Loads the kernel to `0x10000` in 32 KB chunks. `mkimage.py` patches the
-     kernel's sector count into the stage 2 header.
-   - Enables A20, stores the E820 map at `0x600`, switches to protected mode,
+   - Enables A20 and loads the kernel to `0x100000` in 32 KB chunks: each is
+     read into a buffer at `0x10000` and copied above 1 MB in unreal mode.
+     `mkimage.py` patches the kernel's sector count into the stage 2 header.
+   - Stores the E820 map at `0x600`, switches to protected mode,
      builds the page tables at `0x1000`, and jumps to 64-bit `kernel_entry`.
 3. **Kernel.**
    - Zeroes `.bss` (1 MB) and loads its own GDT.
@@ -453,10 +462,10 @@ docs/                   CONVENTIONS.md, screenshots
 |---|---|
 | 0 | stage 1 (MBR) |
 | 1–31 | stage 2 |
-| 32–1055 | kernel slot (512 KB; the kernel uses about 465 KB today) |
-| 1056 | AFS superblock `"AFS1"` |
-| 1057–1058 | inode table (32 × 32 bytes) |
-| 1059–4095 | file data (2 MB image) |
+| 32–2079 | kernel slot (1 MB; the kernel uses about 465 KB today) |
+| 2080 | AFS superblock `"AFS1"` |
+| 2081–2082 | inode table (32 × 32 bytes) |
+| 2083–8191 | file data (4 MB image) |
 
 ### Memory map (`include/memmap.inc`)
 
@@ -465,10 +474,11 @@ docs/                   CONVENTIONS.md, screenshots
 | `0x500` / `0x600` | boot info / E820 map from stage 2 |
 | `0x1000–0x6FFF` | page tables (PML4, PDPT, 4 × PD) |
 | `0x7C00` / `0x7E00` | stage 1 / stage 2 |
-| `0x10000` | kernel image (`.text`, `.rodata`, `.cmdtab`, `.data`) |
-| `0x100000` | kernel `.bss` (zeroed at boot) |
-| `0x200000–0x2FFFFF` | kernel stack |
-| `0x300000` | RTL8139 RX ring and TX buffers |
+| `0x10000` | stage 2's kernel load buffer (32 KB, boot only) |
+| `0x20000` | RTL8139 RX ring and TX buffers |
+| `0x100000` | kernel image (`.text`, `.rodata`, `.cmdtab`, `.data`) |
+| `0x200000` | kernel `.bss` (zeroed at boot) |
+| `0x300000–0x3FFFFF` | kernel stack |
 | `0x400000` / `0x500000` | last HTTP(S) response / the browser's page (1 MB each) |
 | `0x600000` / `0xA00000` / `0xC00000` | DOM nodes / CSS rules / layout display list |
 | `0x1000000` | GUI back buffer, wallpaper, canvas (3 MB each) |

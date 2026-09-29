@@ -123,15 +123,56 @@ def strip_js(source: Path, output: Path) -> None:
     output.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
 
 
+FONT_NAMES = {"space": " ", "hash": "#", "backslash": "\\", "equals": "="}
+
+
+def make_font(source: Path, output: Path) -> None:
+    """kernel/gfx/font.txt (ASCII art, see its header) -> NASM data:
+    font_data (16 bytes per glyph, bit 7 = leftmost pixel) and font_prop
+    (per glyph: first inked column, proportional advance in pixels)."""
+    glyphs: dict[str, list[str]] = {}
+    lines = source.read_text(encoding="utf-8").splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("== "):
+            name = line[3:]
+            ch = FONT_NAMES.get(name, name)
+            rows = lines[i + 1:i + 17]
+            if len(ch) != 1 or len(rows) != 16 or any(len(r) != 8 or set(r) - {"#", "."} for r in rows):
+                raise BuildError(f"{source.relative_to(ROOT)}:{i + 1}: glyph '{name}' needs 16 rows of 8 '#'/'.'")
+            glyphs[ch] = rows
+            i += 17
+        else:
+            i += 1
+    missing = [chr(c) for c in range(32, 127) if chr(c) not in glyphs]
+    if missing:
+        raise BuildError(f"{source.relative_to(ROOT)}: no glyph for {' '.join(missing)}")
+    out = [f"; generated from {source.relative_to(ROOT).as_posix()} by tools/build.py - do not edit",
+           "font_data:"]
+    prop = []
+    for code in range(32, 127):
+        rows = glyphs[chr(code)]
+        out.append("    db " + ", ".join(f"0x{int(r.replace('#', '1').replace('.', '0'), 2):02X}" for r in rows)
+                   + f"  ; {code}")
+        cols = [c for c in range(8) if any(r[c] == "#" for r in rows)]
+        prop.append((cols[0], cols[-1] - cols[0] + 2) if cols else (0, 4))
+    out.append("font_prop:                      ; first inked column, advance")
+    for code, (left, advance) in zip(range(32, 127), prop):
+        out.append(f"    db {left}, {advance}  ; {code}")
+    output.write_text("\n".join(out) + "\n", encoding="utf-8", newline="\n")
+
+
 def build(fresh: bool = False, image: Path = IMAGE, listing: bool = False, quiet: bool = False) -> Path:
     nasm = find_nasm()
     BUILD.mkdir(exist_ok=True)
     include = ROOT / "include"
     for js in (ROOT / "kernel" / "js").glob("*.js"):
         strip_js(js, BUILD / "js" / js.name)
+    make_font(ROOT / "kernel" / "gfx" / "font.txt", BUILD / "font.inc")
     _nasm(nasm, ROOT / "boot" / "stage1.asm", BUILD / "stage1.bin", [include, ROOT / "boot"])
     _nasm(nasm, ROOT / "boot" / "stage2.asm", BUILD / "stage2.bin", [include, ROOT / "boot"])
-    # (BUILD first: incbin "js/prelude.js" is the stripped copy)
+    # (BUILD first: incbin "js/prelude.js" is the stripped copy; font.inc lives there)
     _nasm(nasm, ROOT / "kernel" / "kernel.asm", BUILD / "kernel.bin", [BUILD, include, ROOT / "kernel"],
           BUILD / "kernel.lst" if listing else None)
 
@@ -208,7 +249,8 @@ def cmd_debug(args: argparse.Namespace) -> int:
     cmd = qemu_args(headless=args.headless, extra=["-s", "-S"])
     print("QEMU is paused and waiting for a debugger:")
     print("  gdb -ex 'target remote localhost:1234' -ex 'set architecture i386:x86-64'")
-    print("  (break *0x10000 for kernel_entry; symbols are in build/kernel.map)")
+    kernel_addr = mkimage.parse_inc(ROOT / "include" / "memmap.inc")["KERNEL_ADDR"]
+    print(f"  (break *{kernel_addr:#x} for kernel_entry; symbols are in build/kernel.map)")
     return subprocess.call(cmd)
 
 

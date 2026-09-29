@@ -1,14 +1,15 @@
 /* Antigravity OS browser: the dark look of its own pages (http://antigravity.os/,
-   afs:// files and error pages). Loaded after ua.css for those pages only. */
+   afs:// files and error pages), in the desktop's palette (gui/theme.inc).
+   Loaded after ua.css for those pages only. */
 
-html, body { background-color: #070a0f; color: #cbd5e1 }
-body { margin: 12px 24px }
-h1 { color: #00f0ff }
-h2 { color: #f59e0b }
-h3, h4, h5, h6 { color: #34d399 }
-a { color: #38bdf8 }
-b, strong { color: #fff }
-code, pre { color: #10b981 }
-hr { color: #1e293b }
+html, body { background-color: #0e121b; color: #c0c6d6 }
+body { margin: 8px 12px }
+h1 { color: #7dcfff }
+h2 { color: #e0af68 }
+h3, h4, h5, h6 { color: #9ece6a }
+a { color: #7aa2f7 }
+b, strong { color: #e6e9f2 }
+code, pre { color: #73daca }
+hr { color: #252c3c }
 p { margin-top: .5em; margin-bottom: .5em }
 ul { margin-top: .5em; margin-bottom: .5em; padding-left: 32px }
